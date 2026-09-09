@@ -43,4 +43,48 @@
 
 复用 Kiro bridge，新增 IDE 项目识别和窗口激活。第一版只保证激活正确的 Kiro 窗口/项目。
 
+## Phase 7：Kiro CLI 审批提醒与面板审批
+
+### 调研结论
+
+- [Vibe Island 官网](https://vibeisland.app/) 和公开 changelog 声称 Kiro 支持
+  permission prompts、zero-config agent setup、事件转换、工具名映射和 IDE 自动识别。
+- [Vibe Island 的公开 GitHub 仓库](https://github.com/vibeislandapp/vibe-island)
+  目前是社区 issue、讨论和文档仓库，不包含 macOS 应用的 Kiro 实现源码；公开
+  内容没有给出 Kiro 的 hook payload 或 allow/deny 响应 schema。
+- 公开 issue [#83](https://github.com/vibeislandapp/vibe-island/issues/83)
+  反而记录了 Kiro IDE hook 不生效和卸载状态不一致，说明其 Kiro 支持也存在
+  版本和安装路径差异。
+- [Open Vibe Island](https://github.com/Octane0411/open-vibe-island) 提供了另一套
+  开源实现，但其当前公开源码树没有 Kiro hook/approval 实现，不能直接移植协议。
+
+因此目前不需要安装 Vibe Island。安装闭源竞品只能观察最终行为，不能可靠得到协议；
+只有在本地 Kiro payload 不完整、无法确认审批响应格式时，才考虑一次隔离的黑盒测试，
+并且不覆盖用户现有 hooks。
+
+### 开发分阶段
+
+1. **协议采样**：在 Kiro CLI 的临时 agent 配置中捕获 `agentSpawn`、`preToolUse`、
+   审批相关事件和终端输出，脱敏后确认哪个事件表示“等待用户决定”，以及 Kiro
+   是否要求 hook 返回 allow/deny JSON。没有确认 schema 前，不把所有 `preToolUse`
+   当成审批。
+2. **事件路由**：增加 Kiro 专用事件归一化和 `PermissionRequest` 适配器，仅在事件
+   明确携带审批语义时进入 CodeIsland 审批队列；普通工具调用继续保持 running 状态。
+3. **面板交互**：复用现有审批队列，显示工具名、命令/路径、Kiro 会话和队列位置；
+   支持 Allow、Deny、Always Allow（如果 Kiro 协议提供该能力），并处理重复事件、
+   断开连接和超时。
+4. **提醒与跳转**：审批到达时播放审批声音并按 Smart Suppress / Auto Expand 设置
+   展开；Kiro 自己仍负责最终审批时，面板显示“请在 Kiro 中审批”并提供跳转到
+   Kiro terminal 或 cmux surface 的按钮。
+5. **验证与回归**：为每种 Kiro payload 建 fixture，覆盖普通 `preToolUse` 不弹审批、
+   真实审批自动提醒、Allow/Deny 响应、Kiro 进程退出、cmux 精确跳转和旧版 hook
+   兼容性；在 Kiro CLI 版本升级时重新跑协议采样。
+
+### 完成标准
+
+- Kiro 普通工具调用不会误弹审批卡片。
+- Kiro 真正等待用户决定时，CodeIsland 在设置允许的情况下有声音和可见提醒。
+- 面板内的决定能可靠返回 Kiro；若协议不支持面板决定，则明确提示并跳回正确窗口。
+- Kiro、Claude、Codex 的审批队列互不误消费，socket 断开不会让 CLI 永久阻塞。
+
 Apple Watch、SSH Remote 暂不列入路线。
