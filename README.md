@@ -5,8 +5,8 @@
 <p align="center">
   <b>Real-time AI coding agent status panel for macOS Dynamic Island (Notch)</b><br>
   <a href="#installation">Install</a> •
-  <a href="#features">Features</a> •
-  <a href="#supported-tools">Supported Tools</a> •
+  <a href="#what-this-fork-adds">Fork Additions</a> •
+  <a href="#upstream-baseline">Upstream</a> •
   <a href="#build-from-source">Build</a><br>
   English | <a href="README.zh-CN.md">简体中文</a>
 </p>
@@ -37,6 +37,8 @@ This is a personal public fork maintained by [kbfx1234](https://github.com/kbfx1
 - **Session lifecycle controls** — Adds hidden/restored/clearable sessions, process liveness checks, stale interactive-request expiry, transcript recovery, and safer startup restoration.
 - **macOS utility behavior** — Restores accessory activation and Dock hiding, keeps settings temporarily accessible as a regular window, and improves notch/display re-anchoring.
 - **Release and verification tooling** — Adds macOS CI, local Codex/Kiro/cmux preflight checks, reproducible DMG assembly, Sparkle rpath handling, and fallback behavior when Xcode's icon compiler is unavailable.
+
+## Upstream baseline
 
 The original panel, agent matrix, approvals, questions, mascots, Buddy integrations, and base installation flow are documented in the [upstream CodeIsland README](https://github.com/wxtsky/CodeIsland#readme).
 

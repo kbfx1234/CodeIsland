@@ -5,8 +5,8 @@
 <p align="center">
   <b>macOS 灵动岛（刘海）实时 AI 编码 Agent 状态面板</b><br>
   <a href="#安装">安装</a> •
-  <a href="#功能特性">功能</a> •
-  <a href="#支持的工具">支持的工具</a> •
+  <a href="#这个-fork-新增了什么">新增功能</a> •
+  <a href="#上游基础能力">上游能力</a> •
   <a href="#从源码构建">构建</a><br>
   <a href="README.md">English</a> | 简体中文
 </p>
@@ -17,15 +17,26 @@
   <img src="docs/images/notch-panel.png" width="700" alt="CodeIsland Panel Preview">
 </p>
 
-## CodeIsland 是什么？
+## 这个 Fork 是什么？
 
-CodeIsland 住在你 MacBook 的刘海区域，实时展示 AI 编码 Agent 的工作状态。不用再频繁切窗口去看 Claude 是否在等审批、Codex 是否完成了任务。
+CodeIsland 是一个运行在 macOS 刘海和菜单栏区域的 AI 编码 Agent 状态面板。原项目已经提供面板 UI、Agent 集成、像素角色、审批、问题回答和 Buddy 伴侣端等基础能力，完整功能请查看[上游 CodeIsland 项目](https://github.com/wxtsky/CodeIsland)。
 
-它通过 Unix socket IPC 连接 **15 种 AI 编码工具**，在刘海面板中展示会话状态、工具调用、权限请求等信息——全部呈现在一个紧凑的像素风面板中。
+这个 fork 重点解决 Codex Desktop、Codex CLI、Kiro CLI、cmux 中的 Claude Code，以及长时间运行的 hook 会话在本地使用时的可靠性问题。
 
 ## 关于这个 Fork
 
-这是 [wxtsky/CodeIsland](https://github.com/wxtsky/CodeIsland) 的个人公开 fork，由 [kbfx1234](https://github.com/kbfx1234) 维护，保留原项目的 MIT 许可证和版权声明，并发展自己的产品方向。目前重点覆盖 Codex Desktop 与 CLI、Kiro CLI、cmux 精确跳转、Hook 健康检查和会话生命周期可靠性。Vibe Island 仅作为产品参考，不复制其品牌、文案或素材。首版改动见 [Fork 变更记录](docs/FORK-CHANGES.zh-CN.md)，后续范围见[本地 Hack 路线](docs/LOCAL-HACK-ROADMAP.zh-CN.md)。
+这是由 [kbfx1234](https://github.com/kbfx1234) 维护的个人公开 fork，保留上游 MIT 许可证和版权声明。首版完整改动见 [Fork 变更记录](docs/FORK-CHANGES.zh-CN.md)，后续范围见[本地 Hack 路线](docs/LOCAL-HACK-ROADMAP.zh-CN.md)。
+
+## 这个 Fork 新增了什么
+
+- **Codex Desktop 身份和跳转** — 从 transcript metadata 读取真实 thread ID，支持 `codex://threads/<id>` 深链接，过滤内部 review 线程，并把子 Agent 合并到父会话。
+- **Codex 重复会话保护** — rollout 续接文件名不再生成第二张灵动岛卡片，同时保持 Desktop 和 CLI 会话隔离。
+- **Claude Code + cmux 精确定位** — native bridge 和 shell fallback 都传递 `CMUX_SURFACE_ID` / `CMUX_WORKSPACE_ID`，点击卡片可聚焦准确的 cmux surface。
+- **Kiro CLI 支持** — 新增 v2/v3 hook 安装、会话发现、本地使用量读取和 Kiro 专用健康诊断。
+- **Hook 健康检查和修复** — 检查 bridge、socket、hook script、CLI 和插件状态；修复前创建旁路备份，只修改 CodeIsland 自己管理的配置。
+- **会话生命周期控制** — 支持隐藏、恢复和清理会话，增加进程存活检查、交互请求超时、transcript 恢复和更可靠的启动恢复。
+- **macOS 工具行为** — 恢复 accessory activation 和 Dock 隐藏，设置窗口打开时临时显示 Dock，并改进刘海/外接显示器重新定位。
+- **构建与验证工具** — 增加 macOS CI、Codex/Kiro/cmux 本地预检、DMG 构建、Sparkle rpath 处理，以及 Xcode 图标编译不可用时的 fallback。
 
 ## 上游基础能力
 
