@@ -27,41 +27,9 @@ CodeIsland 住在你 MacBook 的刘海区域，实时展示 AI 编码 Agent 的�
 
 这是 [wxtsky/CodeIsland](https://github.com/wxtsky/CodeIsland) 的个人公开 fork，由 [kbfx1234](https://github.com/kbfx1234) 维护，保留原项目的 MIT 许可证和版权声明，并发展自己的产品方向。目前重点覆盖 Codex Desktop 与 CLI、Kiro CLI、cmux 精确跳转、Hook 健康检查和会话生命周期可靠性。Vibe Island 仅作为产品参考，不复制其品牌、文案或素材。首版改动见 [Fork 变更记录](docs/FORK-CHANGES.zh-CN.md)，后续范围见[本地 Hack 路线](docs/LOCAL-HACK-ROADMAP.zh-CN.md)。
 
-## 功能特性
+## 上游基础能力
 
-- **刘海原生 UI** — 从 MacBook 刘海处展开，空闲时自动收起
-- **支持 15 种 AI 工具** — Claude Code、Codex、Grok CLI、Gemini CLI、Cursor、Copilot、Trae/Traecli、Qoder、Factory、CodeBuddy、OpenCode、Kimi Code CLI、Cline、Pi / Oh My Pi、DeepSeek Harness
-- **实时状态追踪** — 查看活跃会话、工具调用和 AI 回复
-- **权限管理** — 直接在面板上审批/拒绝工具权限请求
-- **问题回答** — 无需离开当前应用即可回答 Agent 的问题
-- **像素风角色** — 每个 AI 工具都有专属的像素动画角色
-- **一键跳转** — 点击会话直接跳转到对应的终端标签页、IDE 窗口或 Herdr Agent 面板
-- **智能通知抑制** — 标签页与 Herdr 面板级检测：只在你正在看该会话时抑制通知，而不是整个终端应用
-- **音效提示** — 可选的 8-bit 风格音效通知
-- **自动安装 Hook** — 自动为所有检测到的 CLI 工具配置 hooks，支持自动修复和版本追踪
-- **iPhone 与 Apple Watch Buddy** — 将会话状态同步到灵动岛、锁屏、StandBy 和 Apple Watch
-- **中英双语** — 支持中文和英文，自动跟随系统语言
-- **多显示器** — 支持外接显示器，自动检测刘海屏幕
-
-## 支持的工具
-
-| | 工具 | 事件 | 跳转 | 状态 |
-|:---:|------|------|------|------|
-| <img src="docs/images/mascots/claude.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/claude.png" width="16"> Claude Code | 13 | 终端标签页 | 完整 |
-| <img src="docs/images/mascots/codex.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/codex.png" width="16"> Codex | 3 | 终端 | 基础 |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/grok.png" width="16"> Grok CLI | 14 | 终端 | 基础 |
-| <img src="docs/images/mascots/gemini.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/gemini.png" width="16"> Gemini CLI | 6 | 终端 | 完整 |
-| <img src="docs/images/mascots/cursor.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/cursor.png" width="16"> Cursor | 10 | IDE | 完整 |
-| <img src="docs/images/mascots/trae.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/traecli.png" width="16"> TraeCli | 10 | 终端 | 完整 |
-| <img src="docs/images/mascots/qoder.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/qoder.png" width="16"> Qoder | 10 | IDE | 完整 |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/copilot.png" width="16"> Copilot | 6 | 终端 | 完整 |
-| <img src="docs/images/mascots/factory.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/factory.png" width="16"> Factory | 10 | IDE | 完整 |
-| <img src="docs/images/mascots/codebuddy.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/codebuddy.png" width="16"> CodeBuddy | 10 | APP/终端 | 完整 |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/kimi.png" width="16"> Kimi Code CLI | 10 | 终端 | 完整 |
-| <img src="docs/images/mascots/opencode.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/opencode.png" width="16"> OpenCode | All | APP/终端 | 完整 |
-| <img src="docs/images/mascots/cline.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/cline.png" width="16"> Cline | 5 | VSCode | 完整 |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/pi.png" width="16"> Pi / Oh My Pi | 8 | 终端 | 完整 |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/dsh.png" width="16"> DeepSeek Harness | 9 | 终端 | 完整 |
+原项目的面板 UI、支持的 Agent 矩阵、审批、问题回答、像素角色、Buddy 伴侣端和基础安装方式，请查看[上游 CodeIsland README](https://github.com/wxtsky/CodeIsland#readme)。
 
 ## 安装
 

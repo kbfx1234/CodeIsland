@@ -17,51 +17,28 @@
   <img src="docs/images/notch-panel.png" width="700" alt="CodeIsland Panel Preview">
 </p>
 
-## What is CodeIsland?
+## What is this fork?
 
-CodeIsland lives in your MacBook's notch area and shows you what your AI coding agents are doing — in real time. No more switching windows to check if Claude is waiting for approval or if Codex finished its task.
+CodeIsland is a macOS notch and menu-bar utility for monitoring AI coding agents. The original project already provides the core panel, agent integrations, mascots, approvals, questions, and Buddy companion features. See the [upstream CodeIsland project](https://github.com/wxtsky/CodeIsland) for that baseline.
 
-It connects to **15 AI coding tools** via Unix socket IPC, displaying session status, tool calls, permission requests, and more — all in a compact, pixel-art styled panel.
+This repository focuses on the additions needed for a more reliable local workflow with Codex Desktop, Codex CLI, Kiro CLI, Claude Code inside cmux, and long-running hook-driven sessions.
 
 ## About This Fork
 
-This repository is a personal public fork of [wxtsky/CodeIsland](https://github.com/wxtsky/CodeIsland), maintained by [kbfx1234](https://github.com/kbfx1234). It retains the upstream MIT license and copyright notice while developing its own product direction, with current work focused on Codex Desktop and CLI, Kiro CLI, cmux navigation, hook health, and session lifecycle reliability. Vibe Island is a product reference, not a source of branding, copy, or assets. See the [fork change log](docs/FORK-CHANGES.zh-CN.md) and [local roadmap](docs/LOCAL-HACK-ROADMAP.zh-CN.md).
+This is a personal public fork maintained by [kbfx1234](https://github.com/kbfx1234). It retains the upstream MIT license and copyright notice. The complete first-version change list is in the [fork change log](docs/FORK-CHANGES.zh-CN.md), with future work tracked in the [local roadmap](docs/LOCAL-HACK-ROADMAP.zh-CN.md).
 
-## Features
+## What this fork adds
 
-- **Notch-native UI** — Expands from the MacBook notch, collapses when idle
-- **15 AI tools supported** — Claude Code, Codex, Grok CLI, Gemini CLI, Cursor, Copilot, Trae/Traecli, Qoder, Factory, CodeBuddy, OpenCode, Kimi Code CLI, Cline, Pi / Oh My Pi, DeepSeek Harness
-- **Live status tracking** — See active sessions, tool calls, and AI responses in real time
-- **Permission management** — Approve/deny tool permissions directly from the panel
-- **Question answering** — Respond to agent questions without leaving your current app
-- **Pixel-art mascots** — Each AI tool has its own animated character
-- **One-click jump** — Click a session to jump to its terminal tab, IDE window, or exact Herdr agent pane
-- **Smart suppress** — Tab-level terminal and Herdr pane detection: only suppresses notifications when you're looking at the specific session, not just the terminal app
-- **Sound effects** — Optional 8-bit sound notifications for session events
-- **Auto hook install** — Automatically configures hooks for all detected CLI tools, with auto-repair and version tracking
-- **iPhone & Apple Watch Buddy** — Mirror session status to Dynamic Island, Lock Screen, StandBy, and Apple Watch
-- **Bilingual UI** — English and Chinese, auto-detects system language
-- **Multi-display** — Works with external monitors, auto-detects notch displays
+- **Codex Desktop identity and routing** — Uses the real thread ID from transcript metadata, supports `codex://threads/<id>` deep links, filters internal review threads, and merges subagents into their parent session.
+- **Codex duplicate-session protection** — Prevents rollout continuation filenames from creating a second island card for the same conversation, while keeping separate Desktop and CLI sessions isolated.
+- **Claude Code + cmux precision** — Carries `CMUX_SURFACE_ID` and `CMUX_WORKSPACE_ID` through the native bridge and shell fallback, then focuses the exact cmux surface when a card is clicked.
+- **Kiro CLI support** — Adds v2/v3 hook installation, session discovery, local usage reporting, and Kiro-specific health diagnostics.
+- **Hook health and repair** — Reports bridge, socket, hook script, CLI, and plugin health; repairs CodeIsland-managed entries and creates side-by-side backups before changing user configuration.
+- **Session lifecycle controls** — Adds hidden/restored/clearable sessions, process liveness checks, stale interactive-request expiry, transcript recovery, and safer startup restoration.
+- **macOS utility behavior** — Restores accessory activation and Dock hiding, keeps settings temporarily accessible as a regular window, and improves notch/display re-anchoring.
+- **Release and verification tooling** — Adds macOS CI, local Codex/Kiro/cmux preflight checks, reproducible DMG assembly, Sparkle rpath handling, and fallback behavior when Xcode's icon compiler is unavailable.
 
-## Supported Tools
-
-| | Tool | Events | Jump | Status |
-|:---:|------|--------|------|--------|
-| <img src="docs/images/mascots/claude.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/claude.png" width="16"> Claude Code | 13 | Terminal tab | Full |
-| <img src="docs/images/mascots/codex.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/codex.png" width="16"> Codex | 3 | Terminal | Basic |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/grok.png" width="16"> Grok CLI | 14 | Terminal | Basic |
-| <img src="docs/images/mascots/gemini.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/gemini.png" width="16"> Gemini CLI | 6 | Terminal | Full |
-| <img src="docs/images/mascots/cursor.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/cursor.png" width="16"> Cursor | 10 | IDE | Full |
-| <img src="docs/images/mascots/trae.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/traecli.png" width="16"> TraeCli | 10 | Terminal | Full |
-| <img src="docs/images/mascots/qoder.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/qoder.png" width="16"> Qoder | 10 | IDE | Full |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/copilot.png" width="16"> Copilot | 6 | Terminal | Full |
-| <img src="docs/images/mascots/factory.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/factory.png" width="16"> Factory | 10 | IDE | Full |
-| <img src="docs/images/mascots/codebuddy.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/codebuddy.png" width="16"> CodeBuddy | 10 | APP/Terminal | Full |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/kimi.png" width="16"> Kimi Code CLI | 10 | Terminal | Full |
-| <img src="docs/images/mascots/opencode.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/opencode.png" width="16"> OpenCode | All | APP/Terminal | Full |
-| <img src="docs/images/mascots/cline.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/cline.png" width="16"> Cline | 5 | VSCode | Full |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/pi.png" width="16"> Pi / Oh My Pi | 8 | Terminal | Full |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/dsh.png" width="16"> DeepSeek Harness | 9 | Terminal | Full |
+The original panel, agent matrix, approvals, questions, mascots, Buddy integrations, and base installation flow are documented in the [upstream CodeIsland README](https://github.com/wxtsky/CodeIsland#readme).
 
 ## Installation
 
