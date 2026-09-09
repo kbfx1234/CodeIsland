@@ -380,6 +380,32 @@ class HookServer {
         return AppState.codexSubagentMetadata(inTranscriptPath: path)
     }
 
+    /// Desktop hooks occasionally arrive without the bridge's native bundle
+    /// marker. Use the rollout's explicit provenance to restore the canonical
+    /// `codexapp:` namespace, while honoring cmux identity and CLI provenance.
+    /// The transformation is pure so it can be regression-tested without a
+    /// live socket or ChatGPT process.
+    nonisolated static func canonicalizeCodexDesktopHookPayload(data: Data) -> Data {
+        guard var raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (raw["_source"] as? String)?.lowercased() == "codex",
+              raw["_term_bundle"] == nil,
+              let sessionId = raw["session_id"] as? String,
+              !sessionId.isEmpty,
+              !sessionId.hasPrefix(AppState.codexAppSessionPrefix),
+              let transcriptPath = raw["transcript_path"] as? String,
+              !transcriptPath.isEmpty,
+              raw["_cmux_surface_id"] == nil,
+              raw["_cmux_workspace_id"] == nil,
+              AppState.codexTranscriptOrigin(path: transcriptPath) == .desktop else {
+            return data
+        }
+        raw["_term_bundle"] = AppState.codexAppBundleId
+        guard let rewritten = try? JSONSerialization.data(withJSONObject: raw) else {
+            return data
+        }
+        return rewritten
+    }
+
     func codexNativeSubsessionParentId(from raw: [String: Any]) -> String? {
         guard (raw["_via_plugin"] as? Bool) != true,
               SessionSnapshot.normalizedSupportedSource(raw["_source"] as? String) == "codex",
@@ -657,7 +683,10 @@ class HookServer {
         // merge into the parent, hide, or keep separate.
         //
         // Cheap byte probes first; avoid JSONSerialization on every PostToolUse.
-        let routed = routeSubsessionPayloadIfNeeded(data: data)
+        // Canonicalize before sub-session routing so Desktop children resolve
+        // parents in the Desktop namespace even when `_term_bundle` was absent.
+        let canonicalData = Self.canonicalizeCodexDesktopHookPayload(data: data)
+        let routed = routeSubsessionPayloadIfNeeded(data: canonicalData)
         if let responseData = routed.responseData {
             sendResponse(connection: connection, data: responseData)
             return
@@ -665,6 +694,7 @@ class HookServer {
         let processedData = routed.processedData
 
         guard let event = HookEvent(from: processedData) else {
+            log.error("hook rejected reason=parse-failed bytes=\(processedData.count, privacy: .public)")
             sendResponse(connection: connection, data: Data("{\"error\":\"parse_failed\"}".utf8))
             return
         }
@@ -701,6 +731,7 @@ class HookServer {
 
         if let rawSource = event.rawJSON["_source"] as? String,
            SessionSnapshot.normalizedSupportedSource(rawSource) == nil {
+            log.warning("hook ignored reason=unsupported-source source=\(rawSource, privacy: .public) event=\(event.eventName, privacy: .public)")
             sendResponse(connection: connection, data: Data("{}".utf8))
             return
         }
@@ -711,6 +742,7 @@ class HookServer {
         if let cwd = event.rawJSON["cwd"] as? String,
            !cwd.isEmpty,
            Self.eventMatchesExcludedCwd(cwd) {
+            log.info("hook ignored reason=excluded-cwd event=\(event.eventName, privacy: .public) cwd=\(cwd, privacy: .public)")
             sendResponse(connection: connection, data: Data("{}".utf8))
             return
         }
@@ -729,6 +761,7 @@ class HookServer {
                sessionId: event.sessionId,
                trackedSessionIds: Set(appState.sessions.keys)
            ) {
+            log.info("hook ignored reason=remote-cwd-filter event=\(event.eventName, privacy: .public) session=\(event.sessionId ?? "nil", privacy: .public)")
             sendResponse(connection: connection, data: Data("{}".utf8))
             return
         }
@@ -859,7 +892,10 @@ class HookServer {
         if let context = connectionContexts[ObjectIdentifier(connection)] {
             context.responded = true
         }
-        connection.send(content: data, completion: .contentProcessed { _ in
+        connection.send(content: data, completion: .contentProcessed { error in
+            if let error {
+                log.error("hook response send failed error=\(error.localizedDescription, privacy: .public)")
+            }
             connection.cancel()
         })
     }

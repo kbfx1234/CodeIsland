@@ -45,6 +45,21 @@ struct PersistedSession: Codable {
 enum SessionPersistence {
     private static let dirPath = FileManager.default.homeDirectoryForCurrentUser.path + "/.codeisland"
     private static let filePath = dirPath + "/sessions.json"
+    private static let hiddenFilePath = dirPath + "/hidden-session-ids.json"
+
+    static func saveHiddenSessionIds(_ ids: Set<String>) {
+        do {
+            try FileManager.default.createDirectory(atPath: dirPath, withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(ids.sorted())
+            try data.write(to: URL(fileURLWithPath: hiddenFilePath), options: .atomic)
+        } catch {}
+    }
+
+    static func loadHiddenSessionIds() -> Set<String> {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: hiddenFilePath)),
+              let ids = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+        return Set(ids.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+    }
 
     static func save(_ sessions: [String: SessionSnapshot]) {
         let persisted: [PersistedSession] = sessions.compactMap { (id, s) in

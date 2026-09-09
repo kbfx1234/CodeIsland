@@ -16,6 +16,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let appState = AppState()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // CodeIsland is a menu-bar/notch utility. Keep ordinary launches out of
+        // the Dock; SettingsWindowController temporarily switches to `.regular`
+        // only while its settings window is open.
+        NSApp.setActivationPolicy(.accessory)
         ProcessInfo.processInfo.disableAutomaticTermination("CodeIsland must stay running")
         ProcessInfo.processInfo.disableSuddenTermination()
         // Pre-set app icon so Dock/menu bar use the packaged bundle icon.

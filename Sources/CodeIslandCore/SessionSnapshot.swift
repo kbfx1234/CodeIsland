@@ -642,6 +642,13 @@ public struct SessionSnapshot: Sendable {
     public var isCodex: Bool { source == "codex" }
     public var isClaude: Bool { source == "claude" }
 
+    /// True for sessions owned by the Codex Desktop app, rather than Codex CLI.
+    /// The bundle ID is inherited by Desktop hook/app-server events; CLI sessions
+    /// normally carry their terminal bundle (for example cmux) or no bundle.
+    public var isCodexDesktop: Bool {
+        source == "codex" && termBundleId?.lowercased() == "com.openai.codex"
+    }
+
     /// True when the session runs inside a native app in APP mode (Cursor agent, Codex APP, etc.)
     /// — the app IS the agent, not just a terminal hosting a CLI.
     /// Requires both bundle ID AND source to match (Claude CLI in Cursor terminal ≠ native app mode).
@@ -749,6 +756,9 @@ public struct SessionSnapshot: Sendable {
     /// Right-hand session badge text: CLI brand when hosted in a foreign IDE,
     /// otherwise the host terminal/app name.
     public var terminalBadgeLabel: String? {
+        if isCodexDesktop {
+            return "Codex Desktop"
+        }
         if isCLIHostedInForeignApp {
             return sourceLabel
         }

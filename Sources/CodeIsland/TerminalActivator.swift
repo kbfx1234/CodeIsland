@@ -1,11 +1,13 @@
 import AppKit
 import ApplicationServices
+import os
 import CodeIslandCore
 
 /// Activates the terminal window/tab running a specific Claude Code session.
 /// Supports tab-level switching for: Ghostty, iTerm2, Terminal.app, WezTerm, kitty.
 /// Falls back to app-level activation for: Alacritty, Warp, Hyper, Tabby, Rio.
 struct TerminalActivator {
+    private static let jumpLog = Logger(subsystem: "com.codeisland", category: "session-jump")
     // Internal (not private) so support tests can assert a terminal is recognized,
     // matching sourceToNativeAppBundleId's visibility. See TeraxSupportTests.
     static let knownTerminals: [(name: String, bundleId: String)] = [
@@ -62,6 +64,50 @@ struct TerminalActivator {
         "workbuddy": "com.workbuddy.workbuddy",
     ]
 
+    /// Build the Codex Desktop deep link for a provider thread identifier.
+    ///
+    /// Desktop discovery can persist either the raw UUID or the legacy
+    /// `codexapp:`-prefixed form. Keep the identifier as one path component so
+    /// malformed values cannot change the deep-link route.
+    static func codexDesktopThreadURL(providerSessionId: String?) -> URL? {
+        guard var identifier = providerSessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !identifier.isEmpty else { return nil }
+        if identifier.hasPrefix("codexapp:") {
+            identifier.removeFirst("codexapp:".count)
+        }
+        guard !identifier.isEmpty,
+              identifier.unicodeScalars.allSatisfy({ scalar in
+                  CharacterSet.alphanumerics.contains(scalar)
+                      || scalar == "-"
+                      || scalar == "_"
+              }) else {
+            return nil
+        }
+
+        var components = URLComponents()
+        components.scheme = "codex"
+        components.host = "threads"
+        components.path = "/\(identifier)"
+        return components.url
+    }
+
+    /// An explicit cmux identity is authoritative for click-to-jump routing.
+    /// cmux shells may inherit stale Codex Desktop process metadata, so this
+    /// check must run before native-app and host-client detection.
+    static func isCmuxSession(_ session: SessionSnapshot) -> Bool {
+        if let surface = session.cmuxSurfaceId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !surface.isEmpty {
+            return true
+        }
+        if let bundle = session.termBundleId?.lowercased(), bundle.contains("cmux") {
+            return true
+        }
+        if let app = session.termApp?.lowercased(), app.contains("cmux") {
+            return true
+        }
+        return false
+    }
+
     /// Bundle IDs of apps that have both APP and CLI modes.
     /// When termBundleId matches, bring that app to front;
     /// otherwise fall through to terminal tab-matching.
@@ -87,9 +133,41 @@ struct TerminalActivator {
         sessionId: String? = nil,
         allowHerdr: Bool = true
     ) {
-        guard !session.isRemote else { return }
-        if allowHerdr && activateHerdrIfAvailable(session: session, sessionId: sessionId) {
+        guard !session.isRemote else {
+            jumpLog.info("jump skipped route=remote session=\(sessionId ?? "-", privacy: .public)")
             return
+        }
+        if allowHerdr && activateHerdrIfAvailable(session: session, sessionId: sessionId) {
+            jumpLog.info("jump route=herdr session=\(sessionId ?? "-", privacy: .public)")
+            return
+        }
+
+        // cmux identity is authoritative even when terminal metadata is stale
+        // or inherited from a Codex Desktop parent. Route before any native-app,
+        // deep-link, or process-ancestry host detection.
+        if isCmuxSession(session) {
+            jumpLog.info("jump route=cmux session=\(sessionId ?? "-", privacy: .public) surface=\(session.cmuxSurfaceId ?? "-", privacy: .public) workspace=\(session.cmuxWorkspaceId ?? "-", privacy: .public)")
+            activateCmux(
+                surfaceId: session.cmuxSurfaceId,
+                workspaceId: session.cmuxWorkspaceId
+            )
+            return
+        }
+
+        // Codex Desktop exposes a thread-level URL route. Prefer it over
+        // window/CWD matching so a click lands on the exact conversation.
+        // Keep the existing window activation as a fallback for older builds
+        // or sessions that do not carry a provider thread id.
+        if session.isCodexDesktop,
+           let threadURL = codexDesktopThreadURL(providerSessionId: session.providerSessionId) {
+            let opened = NSWorkspace.shared.open(threadURL)
+            if opened {
+                jumpLog.info("jump route=codex-desktop result=accepted session=\(sessionId ?? "-", privacy: .public) thread=\(session.providerSessionId ?? "-", privacy: .public)")
+                return
+            }
+            jumpLog.error("jump route=codex-desktop result=rejected session=\(sessionId ?? "-", privacy: .public) thread=\(session.providerSessionId ?? "-", privacy: .public)")
+        } else if session.isCodexDesktop {
+            jumpLog.error("jump route=codex-desktop result=invalid-thread session=\(sessionId ?? "-", privacy: .public) thread=\(session.providerSessionId ?? "-", privacy: .public)")
         }
 
         // Native app by bundle ID (e.g. Codex APP vs Codex CLI). These are IDE-style
@@ -100,6 +178,7 @@ struct TerminalActivator {
         // no cwd or no matching window, so this never regresses single-window apps.
         if let bundleId = session.termBundleId,
            nativeAppBundles[bundleId] != nil {
+            jumpLog.info("jump route=native-app session=\(sessionId ?? "-", privacy: .public) bundle=\(bundleId, privacy: .public)")
             activateIDEWindow(bundleId: bundleId, cwd: session.cwd)
             return
         }
@@ -107,6 +186,7 @@ struct TerminalActivator {
         // IDE integrated terminal: try window-level matching by CWD, fall back to app-level
         if session.isIDETerminal,
            let bundleId = session.termBundleId {
+            jumpLog.info("jump route=ide-terminal session=\(sessionId ?? "-", privacy: .public) bundle=\(bundleId, privacy: .public)")
             activateIDEWindow(bundleId: bundleId, cwd: session.cwd)
             return
         }
@@ -245,16 +325,6 @@ struct TerminalActivator {
             effectiveTty = session.tmuxClientTty  // nil when detached — intentional
         } else {
             effectiveTty = session.ttyPath
-        }
-
-        // --- cmux: surface-level precise jump (workspace + surface) ---
-        // Must be handled before generic tab-switching logic to avoid degrading to bringToFront
-        if lower.contains("cmux") {
-            activateCmux(
-                surfaceId: session.cmuxSurfaceId,
-                workspaceId: session.cmuxWorkspaceId
-            )
-            return
         }
 
         // --- Tab-level switching (5 terminals) ---
@@ -1377,26 +1447,43 @@ struct TerminalActivator {
     /// - Parameters:
     ///   - surfaceId: cmux surface UUID string (from CMUX_SURFACE_ID env var)
     ///   - workspaceId: cmux workspace UUID string (from CMUX_WORKSPACE_ID env var, optional)
+    static func cmuxFocusArguments(surfaceId: String?, workspaceId: String?) -> [String]? {
+        guard let sid = surfaceId?.trimmingCharacters(in: .whitespacesAndNewlines), !sid.isEmpty else {
+            return nil
+        }
+        var args = ["focus-panel", "--panel", sid]
+        if let wid = workspaceId?.trimmingCharacters(in: .whitespacesAndNewlines), !wid.isEmpty {
+            args += ["--workspace", wid]
+        }
+        return args
+    }
+
     private static func activateCmux(surfaceId: String?, workspaceId: String?) {
         // Reuse activateByBundleId: unified handling of Space switching, hidden state, app not running, etc.
         activateByBundleId("com.cmuxterm.app")
 
         // No surface ID — degrade to app-level activation (already done above)
-        guard let sid = surfaceId, !sid.isEmpty else { return }
+        guard let args = cmuxFocusArguments(surfaceId: surfaceId, workspaceId: workspaceId) else {
+            jumpLog.error("jump route=cmux result=missing-surface")
+            return
+        }
 
         // Prefer bundle-embedded binary, then fall back to Homebrew / system paths
         guard let cmuxBin = findBinary("cmux", extraPaths: [
             "/Applications/cmux.app/Contents/Resources/bin/cmux",
             NSHomeDirectory() + "/Applications/cmux.app/Contents/Resources/bin/cmux",
-        ]) else { return }
+        ]) else {
+            jumpLog.error("jump route=cmux result=missing-binary")
+            return
+        }
 
         // Invoke focus-panel CLI asynchronously to avoid blocking the main thread
         DispatchQueue.global(qos: .userInitiated).async {
-            var args = ["focus-panel", "--panel", sid]
-            if let wid = workspaceId, !wid.isEmpty {
-                args += ["--workspace", wid]
+            if runProcess(cmuxBin, args: args) == nil {
+                jumpLog.error("jump route=cmux result=focus-panel-failed binary=\(cmuxBin, privacy: .public) args=\(args.joined(separator: " "), privacy: .public)")
+            } else {
+                jumpLog.info("jump route=cmux result=focus-panel-accepted binary=\(cmuxBin, privacy: .public) args=\(args.joined(separator: " "), privacy: .public)")
             }
-            _ = runProcess(cmuxBin, args: args)
         }
     }
 

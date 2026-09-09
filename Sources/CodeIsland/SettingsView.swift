@@ -613,6 +613,8 @@ private struct BehaviorPage: View {
 private struct HooksPage: View {
     @ObservedObject private var l10n = L10n.shared
     @State private var cliStatuses: [String: Bool] = [:]
+    @State private var healthReport: HookHealthReport?
+    @State private var healthMessage = ""
     @State private var statusMessage = ""
     @State private var statusIsError = false
     @State private var refreshKey = 0
@@ -627,6 +629,14 @@ private struct HooksPage: View {
             cliStatuses[cli.source] = ConfigInstaller.isInstalled(source: cli.source)
         }
         cliStatuses["opencode"] = ConfigInstaller.isInstalled(source: "opencode")
+        healthReport = ConfigInstaller.hookHealthReport()
+    }
+
+    private func runHealthRepair() {
+        let repaired = ConfigInstaller.verifyAndRepair()
+        healthMessage = repaired.isEmpty ? "未发现可自动修复项目" : "已修复：\(repaired.joined(separator: ", "))"
+        refreshCLIStatuses()
+        refreshKey += 1
     }
 
     private func statusText(installed: Bool, exists: Bool) -> String {
@@ -635,6 +645,56 @@ private struct HooksPage: View {
 
     var body: some View {
         Form {
+            Section("Hook Health Check") {
+                if let report = healthReport {
+                    HStack(spacing: 8) {
+                        Image(systemName: report.isHealthy ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(report.isHealthy ? .green : .orange)
+                        Text(report.isHealthy ? "正常" : "需要检查或修复")
+                        Spacer()
+                        Text(report.generatedAt, style: .time)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    ForEach(report.items) { item in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: item.severity == .healthy ? "checkmark" : "exclamationmark.triangle")
+                                .foregroundStyle(item.severity == .healthy ? .green : .orange)
+                                .frame(width: 14)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.title)
+                                Text(item.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                } else {
+                    ProgressView()
+                }
+
+                HStack(spacing: 8) {
+                    Button {
+                        refreshCLIStatuses()
+                    } label: {
+                        Label("重新检查", systemImage: "arrow.clockwise")
+                    }
+                    Button {
+                        runHealthRepair()
+                    } label: {
+                        Label("一键修复", systemImage: "wrench.and.screwdriver")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                if !healthMessage.isEmpty {
+                    Text(healthMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section(l10n["cli_status"]) {
                 ForEach(ConfigInstaller.allCLIs, id: \.source) { cli in
                     let installed = cliStatuses[cli.source] ?? false
@@ -869,6 +929,16 @@ private struct AppearancePage: View {
     @AppStorage(SettingsKey.collapsedWidthScale) private var collapsedWidthScale = SettingsDefaults.collapsedWidthScale
     @AppStorage(SettingsKey.notchHeightMode) private var notchHeightModeRaw = SettingsDefaults.notchHeightMode
     @AppStorage(SettingsKey.customNotchHeight) private var customNotchHeight = SettingsDefaults.customNotchHeight
+    @AppStorage(SettingsKey.displayChoice) private var displayChoice = SettingsDefaults.displayChoice
+
+    private var collapsedWidthMinimum: Int {
+        let panelScreen = ScreenDetector.screen(for: displayChoice)
+        return NotchWidthScale.minimum(hasNotch: ScreenDetector.screenHasNotch(panelScreen))
+    }
+
+    private var effectiveCollapsedWidthScale: Int {
+        max(collapsedWidthMinimum, collapsedWidthScale)
+    }
 
     private var notchHeightMode: Binding<NotchHeightMode> {
         Binding(
@@ -902,14 +972,14 @@ private struct AppearancePage: View {
                     HStack {
                         Text(l10n["collapsed_width_scale"])
                         Spacer()
-                        Text("\(collapsedWidthScale)%")
+                        Text("\(effectiveCollapsedWidthScale)%")
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
                     }
                     Slider(value: Binding(
-                        get: { Double(collapsedWidthScale) },
+                        get: { Double(effectiveCollapsedWidthScale) },
                         set: { collapsedWidthScale = Int($0) }
-                    ), in: Double(NotchWidthScale.min)...Double(NotchWidthScale.max), step: Double(NotchWidthScale.step))
+                    ), in: Double(collapsedWidthMinimum)...Double(NotchWidthScale.max), step: Double(NotchWidthScale.step))
                     Text(l10n["collapsed_width_scale_desc"])
                         .font(.caption)
                         .foregroundStyle(.secondary)

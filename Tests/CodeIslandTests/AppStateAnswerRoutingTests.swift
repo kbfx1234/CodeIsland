@@ -1,5 +1,4 @@
 import XCTest
-import AppKit
 @testable import CodeIsland
 import CodeIslandCore
 
@@ -93,9 +92,10 @@ final class AppStateAnswerRoutingTests: XCTestCase {
         defer { UserDefaults.standard.removeObject(forKey: SettingsKey.smartSuppress) }
 
         let appState = AppState()
+        appState.terminalFrontmostDetector = { _ in true }
         var suppressed = SessionSnapshot()
         suppressed.termApp = "Ghostty"
-        suppressed.termBundleId = try XCTUnwrap(NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+        suppressed.termBundleId = "com.mitchellh.ghostty"
         appState.sessions["s-other"] = suppressed
         XCTAssertFalse(
             appState.shouldAutoOpenPendingSurface(for: "s-other"),
@@ -363,9 +363,10 @@ final class AppStateAnswerRoutingTests: XCTestCase {
         defer { UserDefaults.standard.removeObject(forKey: SettingsKey.smartSuppress) }
 
         let appState = AppState()
+        appState.terminalFrontmostDetector = { _ in true }
         var suppressed = SessionSnapshot()
         suppressed.termApp = "Ghostty"
-        suppressed.termBundleId = try XCTUnwrap(NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+        suppressed.termBundleId = "com.mitchellh.ghostty"
         appState.sessions["s-other"] = suppressed
         XCTAssertFalse(appState.shouldAutoOpenPendingSurface(for: "s-other"))
 

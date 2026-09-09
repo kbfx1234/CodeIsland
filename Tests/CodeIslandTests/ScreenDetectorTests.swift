@@ -68,4 +68,12 @@ final class ScreenDetectorTests: XCTestCase {
 
         XCTAssertEqual(index, 1)
     }
+
+    func testExplicitScreenIndexAcceptsOnlyValidScreenChoices() {
+        XCTAssertEqual(ScreenDetector.explicitScreenIndex(for: "screen_0", screenCount: 2), 0)
+        XCTAssertEqual(ScreenDetector.explicitScreenIndex(for: "screen_1", screenCount: 2), 1)
+        XCTAssertNil(ScreenDetector.explicitScreenIndex(for: "auto", screenCount: 2))
+        XCTAssertNil(ScreenDetector.explicitScreenIndex(for: "screen_2", screenCount: 2))
+        XCTAssertNil(ScreenDetector.explicitScreenIndex(for: "screen_-1", screenCount: 2))
+    }
 }

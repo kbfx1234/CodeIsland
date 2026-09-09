@@ -148,7 +148,9 @@ struct SettingsDefaults {
     static let autoCollapseAfterSessionJump = false
     static let autoExpandOnPermission = true
     static let autoExpandOnCompletion = true
-    static let pluginSessionMode = "separate"
+    // Keep agent sub-sessions inside their parent card by default. This matches
+    // the Vibe Island-style overview while preserving an explicit user choice.
+    static let pluginSessionMode = "merge"
     static let hapticOnHover = false
     static let hapticIntensity = 1          // 1=light
     static let sessionTimeout = 30

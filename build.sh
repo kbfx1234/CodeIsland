@@ -101,7 +101,7 @@ build_mac() {
         "$APP_BUNDLE/Contents/Helpers/codeisland-bridge" 2>/dev/null || true
 
     echo "Compiling app icon assets..."
-    xcrun actool \
+    if ! xcrun actool \
         --output-format human-readable-text \
         --warnings \
         --errors \
@@ -113,7 +113,9 @@ build_mac() {
         --output-partial-info-plist "$ICON_INFO_PLIST" \
         --compile "$APP_BUNDLE/Contents/Resources" \
         "$ICON_CATALOG" \
-        "$ICON_SOURCE"
+        "$ICON_SOURCE"; then
+        echo "WARNING: actool failed; continuing with the bundled AppIcon.icns fallback."
+    fi
     cp "Sources/CodeIsland/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 
     # Copy SPM resource bundles into Contents/Resources/ (required for code signing)

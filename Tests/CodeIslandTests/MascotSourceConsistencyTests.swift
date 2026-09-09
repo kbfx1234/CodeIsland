@@ -37,6 +37,18 @@ final class MascotSourceConsistencyTests: XCTestCase {
         XCTAssertFalse(session.isCLIHostedInForeignApp)
     }
 
+    func testCodexDesktopUsesExplicitBadgeLabel() {
+        let session = makeSession(source: "codex", termBundleId: "com.openai.codex")
+        XCTAssertTrue(session.isCodexDesktop)
+        XCTAssertEqual(session.terminalBadgeLabel, "Codex Desktop")
+    }
+
+    func testCodexCliInCmuxIsNotDesktop() {
+        let session = makeSession(source: "codex", termBundleId: "com.cmuxterm.app")
+        XCTAssertFalse(session.isCodexDesktop)
+        XCTAssertEqual(session.terminalBadgeLabel, "cmux")
+    }
+
     func testSourceForAppBundleIdMapsCursor() {
         XCTAssertEqual(
             SessionSnapshot.sourceForAppBundleId("com.todesktop.230313mzl4w4u92"),

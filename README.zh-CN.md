@@ -21,7 +21,11 @@
 
 CodeIsland 住在你 MacBook 的刘海区域，实时展示 AI 编码 Agent 的工作状态。不用再频繁切窗口去看 Claude 是否在等审批、Codex 是否完成了任务。
 
-它通过 Unix socket IPC 连接 **14 种 AI 编码工具**，在刘海面板中展示会话状态、工具调用、权限请求等信息——全部呈现在一个紧凑的像素风面板中。
+它通过 Unix socket IPC 连接 **15 种 AI 编码工具**，在刘海面板中展示会话状态、工具调用、权限请求等信息——全部呈现在一个紧凑的像素风面板中。
+
+## 关于这个 Fork
+
+这是 [wxtsky/CodeIsland](https://github.com/wxtsky/CodeIsland) 的个人公开 fork，由 [kbfx1234](https://github.com/kbfx1234) 维护，保留原项目的 MIT 许可证和版权声明，并发展自己的产品方向。目前重点覆盖 Codex Desktop 与 CLI、Kiro CLI、cmux 精确跳转、Hook 健康检查和会话生命周期可靠性。Vibe Island 仅作为产品参考，不复制其品牌、文案或素材。首版改动见 [Fork 变更记录](docs/FORK-CHANGES.zh-CN.md)，后续范围见[本地 Hack 路线](docs/LOCAL-HACK-ROADMAP.zh-CN.md)。
 
 ## 功能特性
 
@@ -61,7 +65,7 @@ CodeIsland 住在你 MacBook 的刘海区域，实时展示 AI 编码 Agent 的�
 
 ## 安装
 
-### Homebrew（推荐）
+### Homebrew（上游发布版）
 
 ```bash
 brew tap wxtsky/tap
@@ -70,7 +74,7 @@ brew install --cask codeisland
 
 ### 手动下载
 
-1. 前往 [Releases](https://github.com/wxtsky/CodeIsland/releases) 页面
+1. 前往 [本 Fork 的 Releases](https://github.com/kbfx1234/CodeIsland/releases) 页面
 2. 下载 `CodeIsland.dmg`
 3. 打开 DMG，将 `CodeIsland.app` 拖入「应用程序」文件夹
 4. 启动 CodeIsland — 会自动为所有检测到的 AI 工具安装 hooks
@@ -100,7 +104,7 @@ Code Island Buddy 完全免费，并且开源。它不需要账号，也不依�
 需要 **macOS 14+** 和 **Swift 5.9+**。
 
 ```bash
-git clone https://github.com/wxtsky/CodeIsland.git
+git clone https://github.com/kbfx1234/CodeIsland.git
 cd CodeIsland
 
 # 开发模式（debug 构建 + 启动；Buddy 蓝牙需要下面的 .app）

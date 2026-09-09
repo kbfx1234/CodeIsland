@@ -141,6 +141,29 @@ final class JSONLTailerTests: XCTestCase {
         XCTAssertFalse(result.delta.isEmpty)
     }
 
+    func testScanLinesTracksKiroToolLifecycle() {
+        let lines = [
+            #"{"version":"v1","kind":"Prompt","data":{}}"#,
+            #"{"version":"v1","kind":"AssistantMessage","data":{"content":[{"kind":"toolUse","data":{"name":"read"}}]}}"#,
+            #"{"version":"v1","kind":"ToolResults","data":{}}"#,
+        ].joined(separator: "\n")
+
+        let result = JSONLTailer.scanLines(Data((lines + "\n").utf8))
+
+        XCTAssertTrue(result.delta.hasActivity)
+        XCTAssertEqual(result.delta.turnStatus, .processing)
+    }
+
+    func testScanLinesSettlesKiroFinalAssistantMessage() {
+        let line = #"{"version":"v1","kind":"AssistantMessage","data":{"content":[{"kind":"thinking","data":{"text":"internal"}},{"kind":"text","data":"finished"}]}}"#
+
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertTrue(result.delta.hasActivity)
+        XCTAssertEqual(result.delta.turnStatus, .idle)
+        XCTAssertEqual(result.delta.lastAssistantMessage, "finished")
+    }
+
     func testScanLinesExtractsGrokChatHistoryRows() {
         let lines = [
             #"{"type":"user","content":[{"type":"text","text":"build it"}]}"#,

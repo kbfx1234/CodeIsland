@@ -21,7 +21,11 @@
 
 CodeIsland lives in your MacBook's notch area and shows you what your AI coding agents are doing — in real time. No more switching windows to check if Claude is waiting for approval or if Codex finished its task.
 
-It connects to **14 AI coding tools** via Unix socket IPC, displaying session status, tool calls, permission requests, and more — all in a compact, pixel-art styled panel.
+It connects to **15 AI coding tools** via Unix socket IPC, displaying session status, tool calls, permission requests, and more — all in a compact, pixel-art styled panel.
+
+## About This Fork
+
+This repository is a personal public fork of [wxtsky/CodeIsland](https://github.com/wxtsky/CodeIsland), maintained by [kbfx1234](https://github.com/kbfx1234). It retains the upstream MIT license and copyright notice while developing its own product direction, with current work focused on Codex Desktop and CLI, Kiro CLI, cmux navigation, hook health, and session lifecycle reliability. Vibe Island is a product reference, not a source of branding, copy, or assets. See the [fork change log](docs/FORK-CHANGES.zh-CN.md) and [local roadmap](docs/LOCAL-HACK-ROADMAP.zh-CN.md).
 
 ## Features
 
@@ -61,7 +65,7 @@ It connects to **14 AI coding tools** via Unix socket IPC, displaying session st
 
 ## Installation
 
-### Homebrew (Recommended)
+### Homebrew (Upstream Release)
 
 ```bash
 brew tap wxtsky/tap
@@ -70,7 +74,7 @@ brew install --cask codeisland
 
 ### Manual Download
 
-1. Go to [Releases](https://github.com/wxtsky/CodeIsland/releases)
+1. Go to [this fork's Releases](https://github.com/kbfx1234/CodeIsland/releases)
 2. Download `CodeIsland.dmg`
 3. Open the DMG and drag `CodeIsland.app` to your Applications folder
 4. Launch CodeIsland — it will automatically install hooks for all detected AI tools
@@ -100,7 +104,7 @@ Parts list, firmware flashing, and pairing steps are in **[hardware/README.md](h
 Requires **macOS 14+** and **Swift 5.9+**.
 
 ```bash
-git clone https://github.com/wxtsky/CodeIsland.git
+git clone https://github.com/kbfx1234/CodeIsland.git
 cd CodeIsland
 
 # Development (debug build + launch; Buddy Bluetooth needs the .app below)

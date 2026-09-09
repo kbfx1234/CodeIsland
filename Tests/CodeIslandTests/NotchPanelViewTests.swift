@@ -63,6 +63,30 @@ final class NotchPanelViewTests: XCTestCase {
         XCTAssertTrue(compact.contains("..."))
     }
 
+    func testCompactBarUsesTextLabelsForEveryStatus() {
+        XCTAssertEqual(CompactBarPresentation.statusLocalizationKey(for: .running), "status_running")
+        XCTAssertEqual(CompactBarPresentation.statusLocalizationKey(for: .processing), "status_processing")
+        XCTAssertEqual(CompactBarPresentation.statusLocalizationKey(for: .waitingApproval), "status_waiting")
+        XCTAssertEqual(CompactBarPresentation.statusLocalizationKey(for: .waitingQuestion), "status_waiting")
+        XCTAssertEqual(CompactBarPresentation.statusLocalizationKey(for: .idle), "status_idle")
+    }
+
+    func testCompactBarHidesUninformativeSingleSessionCount() {
+        XCTAssertFalse(CompactBarPresentation.shouldShowSessionCount(total: 0))
+        XCTAssertFalse(CompactBarPresentation.shouldShowSessionCount(total: 1))
+        XCTAssertTrue(CompactBarPresentation.shouldShowSessionCount(total: 2))
+    }
+
+    func testNotchedDetailWidthIsFixedInsteadOfGrowingWithDisplayWidth() {
+        XCTAssertEqual(CompactBarPresentation.detailWidth(hasNotch: true, screenWidth: 1512), 56)
+        XCTAssertEqual(CompactBarPresentation.detailWidth(hasNotch: true, screenWidth: 3456), 56)
+    }
+
+    func testWidthScaleMinimumMatchesPhysicalDisplayConstraint() {
+        XCTAssertEqual(NotchWidthScale.minimum(hasNotch: true), 100)
+        XCTAssertEqual(NotchWidthScale.minimum(hasNotch: false), 50)
+    }
+
     func testShouldTriggerJumpFailureFeedbackWhenAllAttemptsFail() {
         XCTAssertTrue(shouldTriggerJumpFailureFeedback([false, false, false]))
     }

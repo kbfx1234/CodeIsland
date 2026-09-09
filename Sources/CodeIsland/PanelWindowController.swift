@@ -583,17 +583,7 @@ class PanelWindowController: NSObject, NSWindowDelegate {
 
     /// Choose which screen to display on based on displayChoice setting
     private func chosenScreen() -> NSScreen {
-        let choice = SettingsManager.shared.displayChoice
-
-        // Handle specific screen index: "screen_0", "screen_1", etc.
-        if choice.hasPrefix("screen_"),
-           let index = Int(choice.dropFirst(7)),
-           index < NSScreen.screens.count {
-            return NSScreen.screens[index]
-        }
-
-        // "auto" — prefer notch screen, fallback to main
-        return ScreenDetector.preferredScreen
+        ScreenDetector.screen(for: SettingsManager.shared.displayChoice)
     }
 
     /// Poll every 1.5s while in fullscreen; stop when fullscreen ends

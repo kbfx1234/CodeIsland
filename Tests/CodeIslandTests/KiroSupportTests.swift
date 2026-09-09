@@ -12,6 +12,7 @@ final class KiroSupportTests: XCTestCase {
 
     func testEventNormalizerMapsKiroAgentSpawnToSessionStart() {
         XCTAssertEqual(EventNormalizer.normalize("agentSpawn"), "SessionStart")
+        XCTAssertEqual(EventNormalizer.normalize("AgentSpawn"), "SessionStart")
     }
 
     func testEventNormalizerMapsKiroUserPromptSubmitToInternalName() {
@@ -52,6 +53,58 @@ final class KiroSupportTests: XCTestCase {
         XCTAssertEqual(snapshot.sourceLabel, "Kiro")
     }
 
+    func testKiroTranscriptPromptIsProcessing() throws {
+        let path = try writeKiroTranscript(#"{"kind":"Prompt","data":{}}"#)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        guard case .processing = AppState.kiroTranscriptStatus(path: path) else {
+            return XCTFail("Prompt must represent an active turn")
+        }
+    }
+
+    func testKiroTranscriptToolResultsIsProcessing() throws {
+        let path = try writeKiroTranscript(#"{"kind":"ToolResults","data":{}}"#)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        guard case .processing = AppState.kiroTranscriptStatus(path: path) else {
+            return XCTFail("ToolResults must represent an active turn")
+        }
+    }
+
+    func testKiroTranscriptFinalAssistantMessageIsIdle() throws {
+        let line = #"{"kind":"AssistantMessage","data":{"content":[{"kind":"text","data":"done"}]}}"#
+        let path = try writeKiroTranscript(line)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        guard case .idle = AppState.kiroTranscriptStatus(path: path) else {
+            return XCTFail("A final assistant message must settle the turn")
+        }
+    }
+
+    @MainActor
+    func testKiroTranscriptDeltaRefreshesAggregateStatus() {
+        let appState = AppState()
+        var session = SessionSnapshot()
+        session.source = "kiro"
+        session.status = .idle
+        appState.sessions["kiro-session"] = session
+        appState.refreshDerivedState()
+
+        appState.applyTranscriptDelta(ConversationTailDelta(
+            sessionId: "kiro-session",
+            lastUserPrompt: nil,
+            lastAssistantMessage: nil,
+            turnStatus: .processing,
+            hasActivity: true
+        ))
+
+        XCTAssertEqual(appState.status, .processing)
+        XCTAssertEqual(appState.activeSessionCount, 1)
+    }
+
+    private func writeKiroTranscript(_ line: String) throws -> String {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".jsonl")
+        try Data((line + "\n").utf8).write(to: url)
+        return url.path
+    }
+
     // MARK: - ConfigInstaller — Kiro CLIConfig + default events
 
     func testKiroDefaultEventsAreCamelCaseAndComplete() {
@@ -69,4 +122,60 @@ final class KiroSupportTests: XCTestCase {
         XCTAssertEqual(HookFormat(storageValue: "kiroAgent"), .kiroAgent)
         XCTAssertEqual(HookFormat(storageValue: "kiroagent"), .kiroAgent)  // case-insensitive
     }
+
+    func testKiroHookMatcherIsValidCatchAllRegex() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let configPath = tempDir.appendingPathComponent("agent.json").path
+        let cli = CLIConfig(
+            name: "Kiro",
+            source: "kiro",
+            configPath: configPath,
+            configKey: "hooks",
+            format: .kiroAgent,
+            events: [("userPromptSubmit", 5, true)]
+        )
+
+        XCTAssertTrue(ConfigInstaller.installExternalHooks(cli: cli, fm: fm))
+        let data = try XCTUnwrap(fm.contents(atPath: configPath))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let hooks = try XCTUnwrap(root["hooks"] as? [String: Any])
+        let entry = try XCTUnwrap((hooks["userPromptSubmit"] as? [[String: Any]])?.first)
+        XCTAssertEqual(entry["matcher"] as? String, ".*")
+    }
+
+    func testKiroV3UsesStandalonePascalCaseSchema() {
+        XCTAssertEqual(ConfigInstaller.kiroV3EventNames, [
+            "AgentSpawn", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"
+        ])
+
+        let toolEntry = ConfigInstaller.kiroV3HookEntry(
+            trigger: "PreToolUse", name: "pre-tool-use",
+            command: "/tmp/codeisland-bridge --source kiro", timeout: 5
+        )
+        XCTAssertEqual(toolEntry["name"] as? String, "codeisland-pre-tool-use")
+        XCTAssertEqual(toolEntry["trigger"] as? String, "PreToolUse")
+        XCTAssertEqual(toolEntry["matcher"] as? String, ".*")
+        XCTAssertEqual(toolEntry["timeout"] as? Int, 5)
+        XCTAssertEqual(toolEntry["enabled"] as? Bool, true)
+        let action = toolEntry["action"] as? [String: Any]
+        XCTAssertEqual(action?["type"] as? String, "command")
+        XCTAssertEqual(action?["command"] as? String, "/tmp/codeisland-bridge --source kiro")
+
+        let lifecycleEntry = ConfigInstaller.kiroV3HookEntry(
+            trigger: "Stop", name: "stop",
+            command: "/tmp/codeisland-bridge --source kiro", timeout: 5
+        )
+        XCTAssertNil(lifecycleEntry["matcher"])
+    }
+
+    func testKiroV2AndV3EventNamesStayDistinct() {
+        let v2 = ConfigInstaller.defaultEvents(for: .kiroAgent).map { $0.0 }
+        XCTAssertEqual(v2, ["agentSpawn", "userPromptSubmit", "preToolUse", "postToolUse", "stop"])
+        XCTAssertNotEqual(v2, ConfigInstaller.kiroV3EventNames)
+    }
+
 }

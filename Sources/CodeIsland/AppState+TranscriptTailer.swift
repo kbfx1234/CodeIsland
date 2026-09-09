@@ -268,8 +268,9 @@ extension AppState {
         if mutated {
             session.lastActivity = Date()
             sessions[delta.sessionId] = session
+            refreshDerivedState()
         }
-        if questionStateChanged {
+        if questionStateChanged && !mutated {
             // Hooks stay silent while Cursor waits on its question, so nothing
             // else recomputes the aggregated pill/mascot state for this flip.
             refreshDerivedState()

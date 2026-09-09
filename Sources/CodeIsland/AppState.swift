@@ -116,6 +116,9 @@ final class AppState {
     }
 
     var sessions: [String: SessionSnapshot] = [:]
+    /// Session IDs hidden from the panel. This is display state only; hidden
+    /// sessions remain tracked so hooks, monitors, and transcript handling continue.
+    var hiddenSessionIds: Set<String> = []
     var activeSessionId: String?
     var permissionQueue: [PermissionRequest] = []
     var questionQueue: [QuestionRequest] = []
@@ -124,6 +127,9 @@ final class AppState {
     private(set) var recentHookEvents: [DiagnosticHookEvent] = []
     @ObservationIgnored
     private let maxRecentHookEvents = 100
+    @ObservationIgnored
+    var terminalFrontmostDetector: (SessionSnapshot) -> Bool =
+        TerminalVisibilityDetector.isTerminalFrontmostForSession
     @ObservationIgnored
     var questionTerminalFrontmostDetector: (SessionSnapshot) -> Bool =
         TerminalVisibilityDetector.isTerminalFrontmostForSession
@@ -231,6 +237,8 @@ final class AppState {
     /// Local-transcript token usage shown in the session-list footer.
     /// Refreshed lazily on panel expansion (no resident timer, no API calls).
     var claudeUsage: ClaudeUsageScanner.Snapshot?
+    /// Local Kiro session credits, explicitly not account quota.
+    var kiroUsage: KiroUsageScanner.Snapshot?
     private var usageScanInFlight = false
     /// Incremental parse state — round-trips through each detached scan so
     /// growing transcripts are only read past their last consumed offset.
@@ -329,12 +337,18 @@ final class AppState {
     /// `pre_tool_call`) never flickers the card to idle.
     nonisolated static let daemonTurnSettleTimeout: TimeInterval = 20
 
+    /// Interactive hooks must not keep a CLI blocked forever when the socket
+    /// remains open but the UI/request lifecycle has been lost. HookServer has
+    /// the same upper bound for its connection watchdog.
+    nonisolated static let interactiveRequestTimeout: TimeInterval = 300
+
     nonisolated static func isDaemonBackedSource(_ source: String?) -> Bool {
         guard let normalized = SessionSnapshot.normalizedSupportedSource(source) else { return false }
         return daemonBackedSources.contains(normalized)
     }
 
     private func cleanupIdleSessions() {
+        expireStaleInteractiveRequests(now: Date())
         // 1. Verify monitored PIDs are still alive (DispatchSource can silently miss exits)
         //    Also kill orphaned processes (ppid <= 1, terminal closed but process survived).
         var deadMonitors: [(String, ProcessIdentity)] = []
@@ -383,6 +397,16 @@ final class AppState {
             where processMonitors[key] == nil
             && session.status != .idle
             && !session.isRemote {
+            // A foreground tool can legitimately run for many minutes without
+            // emitting another hook event. If the provider process is still
+            // alive, this is not a stale session: keep it active and restore
+            // exit monitoring so a real process exit can settle it.
+            if session.currentTool != nil,
+               let process = currentSessionProcessIdentity(for: key),
+               Self.isLiveProcess(process) {
+                monitorProcess(sessionId: key, process: process)
+                continue
+            }
             let elapsed = -session.lastActivity.timeIntervalSinceNow
             let threshold: TimeInterval
             switch session.status {
@@ -511,6 +535,86 @@ final class AppState {
         prunePendingToolUses()
 
         refreshDerivedState()
+    }
+
+    /// Resolve requests whose peer connection stayed open past the watchdog.
+    /// This is deliberately separate from idle-session cleanup: changing a
+    /// session's status alone would leave the hook continuation suspended and
+    /// the provider waiting indefinitely.
+    @discardableResult
+    func expireStaleInteractiveRequests(now: Date) -> Int {
+        let cutoff = now.addingTimeInterval(-Self.interactiveRequestTimeout)
+        var expiredCount = 0
+        let denyResponse = Data(
+            #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8
+        )
+
+        var permissionIndex = permissionQueue.count - 1
+        while permissionIndex >= 0 {
+            let pending = permissionQueue[permissionIndex]
+            guard pending.enqueuedAt <= cutoff else {
+                permissionIndex -= 1
+                continue
+            }
+            permissionQueue.remove(at: permissionIndex)
+            let sessionId = pending.event.sessionId ?? "default"
+            log.error("interactive request expired kind=permission session=\(sessionId, privacy: .public) tool=\(pending.event.toolName ?? "nil", privacy: .public)")
+            pending.continuation.resume(returning: denyResponse)
+            resolveMergedSubagentAfterUI(
+                sessionId: sessionId,
+                agentId: pending.event.agentId,
+                subagentStatus: .processing,
+                keepSubagentTool: nil,
+                idleParentWhenNoAgent: false
+            )
+            if sessions[sessionId]?.status == .waitingApproval {
+                sessions[sessionId]?.status = .processing
+                sessions[sessionId]?.currentTool = nil
+                sessions[sessionId]?.toolDescription = nil
+                sessions[sessionId]?.lastActivity = now
+            }
+            expiredCount += 1
+            permissionIndex -= 1
+        }
+
+        var questionIndex = questionQueue.count - 1
+        while questionIndex >= 0 {
+            let pending = questionQueue[questionIndex]
+            guard pending.enqueuedAt <= cutoff else {
+                questionIndex -= 1
+                continue
+            }
+            questionQueue.remove(at: questionIndex)
+            let sessionId = pending.event.sessionId ?? "default"
+            log.error("interactive request expired kind=question session=\(sessionId, privacy: .public)")
+            if pending.isCodexAppServer {
+                pending.resolveCodexAppServer(nil)
+            } else if pending.isFromPermission {
+                pending.resolution.resumeHook(returning: denyResponse)
+            } else {
+                pending.resolution.resumeHook(returning: Data("{}".utf8))
+            }
+            resolveMergedSubagentAfterUI(
+                sessionId: sessionId,
+                agentId: pending.event.agentId,
+                subagentStatus: .processing,
+                keepSubagentTool: nil,
+                idleParentWhenNoAgent: false
+            )
+            if sessions[sessionId]?.status == .waitingQuestion {
+                sessions[sessionId]?.status = .processing
+                sessions[sessionId]?.currentTool = nil
+                sessions[sessionId]?.toolDescription = nil
+                sessions[sessionId]?.lastActivity = now
+            }
+            expiredCount += 1
+            questionIndex -= 1
+        }
+
+        guard expiredCount > 0 else { return 0 }
+        showNextPending()
+        refreshDerivedState()
+        return expiredCount
     }
 
     private nonisolated static func currentPluginSessionMode() -> String {
@@ -802,6 +906,7 @@ final class AppState {
             }
         }
         sessions.removeValue(forKey: sessionId)
+        hiddenSessionIds.remove(sessionId)
         stopMonitor(sessionId)
         detachTranscriptTailer(sessionId: sessionId)
         exitingSessions.removeValue(forKey: sessionId)
@@ -974,6 +1079,7 @@ final class AppState {
 
     private nonisolated static func findPids(forSource source: String, candidatePids: [pid_t]? = nil) -> [pid_t] {
         switch source {
+        case "kiro":       return findKiroPids(candidatePids: candidatePids)
         case "claude":     return findClaudePids(candidatePids: candidatePids)
         case "codex":      return findCodexPids(candidatePids: candidatePids)
         case "gemini":     return findGeminiPids(candidatePids: candidatePids)
@@ -1063,8 +1169,19 @@ final class AppState {
             await MainActor.run { [weak self] in
                 self?.claudeUsage = snapshot
                 self?.usageFileCache = cache
+                self?.refreshKiroUsageIfStale()
                 self?.usageScanInFlight = false
             }
+        }
+    }
+
+    func refreshKiroUsageIfStale() {
+        guard UserDefaults.standard.bool(forKey: SettingsKey.showUsageStats) else { return }
+        if let scannedAt = kiroUsage?.scannedAt, Date().timeIntervalSince(scannedAt) < 120 { return }
+        let now = Date()
+        Task.detached(priority: .utility) { [weak self] in
+            let snapshot = KiroUsageScanner.scan(now: now)
+            await MainActor.run { self?.kiroUsage = snapshot }
         }
     }
 
@@ -1134,12 +1251,12 @@ final class AppState {
 
     func shouldAutoOpenPendingSurface(
         for sessionId: String,
-        isTerminalFrontmost: (SessionSnapshot) -> Bool = TerminalVisibilityDetector.isTerminalFrontmostForSession
+        isTerminalFrontmost: ((SessionSnapshot) -> Bool)? = nil
     ) -> Bool {
         guard UserDefaults.standard.bool(forKey: SettingsKey.smartSuppress) else { return true }
         guard let session = sessions[sessionId],
               (session.termApp != nil || session.termBundleId != nil) else { return true }
-        return !isTerminalFrontmost(session)
+        return !(isTerminalFrontmost ?? terminalFrontmostDetector)(session)
     }
 
     private func shouldAutoOpenQuestionSurface(for event: HookEvent) -> Bool {
@@ -2799,9 +2916,37 @@ final class AppState {
 
     func saveSessions() {
         SessionPersistence.save(sessions)
+        SessionPersistence.saveHiddenSessionIds(hiddenSessionIds)
+    }
+
+    /// Hide a session from the panel without stopping or deleting its source data.
+    func hideSession(_ sessionId: String) {
+        guard sessions[sessionId] != nil else { return }
+        hiddenSessionIds.insert(sessionId)
+        scheduleSave()
+    }
+
+    func unhideSession(_ sessionId: String) {
+        guard hiddenSessionIds.remove(sessionId) != nil else { return }
+        scheduleSave()
+    }
+
+    /// Remove only idle, non-interactive sessions from CodeIsland's local state.
+    /// Original CLI/IDE transcripts and credentials are never touched.
+    @discardableResult
+    func clearCompletedSessions() -> Int {
+        let ids = sessions.compactMap { id, session -> String? in
+            guard session.status == .idle,
+                  !permissionQueue.contains(where: { ($0.event.sessionId ?? "default") == id }),
+                  !questionQueue.contains(where: { ($0.event.sessionId ?? "default") == id }) else { return nil }
+            return id
+        }
+        ids.forEach { removeSession($0) }
+        return ids.count
     }
 
     private func restoreSessions() {
+        hiddenSessionIds = SessionPersistence.loadHiddenSessionIds()
         let persisted = SessionPersistence.load()
         let cutoff = Date().addingTimeInterval(-30 * 60) // 30 minutes
         for p in persisted where p.lastActivity > cutoff {
@@ -2883,6 +3028,7 @@ final class AppState {
             tryMonitorSession(restoredSessionId)
         }
         SessionPersistence.clear()
+        _ = coalesceCodexDesktopTwinSessions()
         _ = applyCodexSubsessionModeToKnownSessions()
         _ = applyCursorSubsessionModeToKnownSessions()
         if activeSessionId == nil {
@@ -2912,6 +3058,9 @@ final class AppState {
         var discovered: [DiscoveredSession] = []
         if ConfigInstaller.isEnabled(source: "claude") {
             discovered.append(contentsOf: findActiveClaudeSessions(candidatePids: candidatePids))
+        }
+        if ConfigInstaller.isEnabled(source: "kiro") {
+            discovered.append(contentsOf: findActiveKiroSessions(candidatePids: candidatePids))
         }
         if ConfigInstaller.isEnabled(source: "codex") {
             discovered.append(contentsOf: findActiveCodexSessions(candidatePids: candidatePids))
@@ -2953,6 +3102,7 @@ final class AppState {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let candidates: [(String, String)] = [
             ("claude", ClaudeConfigPaths.projectsDir()),
+            ("kiro", "\(home)/.kiro/sessions/cli"),
             ("codex", "\(home)/.codex/sessions"),
             ("gemini", "\(home)/.gemini/tmp"),
             ("qoder", "\(home)/.qoder/projects"),
@@ -3128,6 +3278,189 @@ final class AppState {
         existingIsNativeAppMode == (discoveredTermBundleId != nil)
     }
 
+    /// Strong identity used only to reconcile a Codex Desktop card with a raw
+    /// hook card created when Desktop omitted `_term_bundle`. Provider ids are
+    /// not sufficient on their own because a CLI and Desktop rollout can share
+    /// a project; the backing transcript must be the exact same file too.
+    nonisolated static func codexSessionsHaveStrongDesktopIdentity(
+        existingProviderSessionId: String?,
+        existingTranscriptPath: String?,
+        discoveredProviderSessionId: String?,
+        discoveredTranscriptPath: String?
+    ) -> Bool {
+        guard let existingProviderSessionId,
+              !existingProviderSessionId.isEmpty,
+              let discoveredProviderSessionId,
+              !discoveredProviderSessionId.isEmpty,
+              existingProviderSessionId == discoveredProviderSessionId,
+              let existingTranscriptPath,
+              !existingTranscriptPath.isEmpty,
+              let discoveredTranscriptPath,
+              !discoveredTranscriptPath.isEmpty else {
+            return false
+        }
+        let existingURL = URL(fileURLWithPath: existingTranscriptPath).standardizedFileURL
+        let discoveredURL = URL(fileURLWithPath: discoveredTranscriptPath).standardizedFileURL
+        return existingURL.path == discoveredURL.path
+    }
+
+    /// Codex Desktop can emit a new provider id after an app restart while
+    /// continuing to use the same rollout transcript. The transcript path is
+    /// therefore an authoritative identity when both sessions are Desktop
+    /// sessions, even if their provider ids differ.
+    nonisolated static func codexDesktopTranscriptsMatch(
+        existingTranscriptPath: String?,
+        discoveredTranscriptPath: String?
+    ) -> Bool {
+        guard let existingTranscriptPath, !existingTranscriptPath.isEmpty,
+              let discoveredTranscriptPath, !discoveredTranscriptPath.isEmpty else {
+            return false
+        }
+        return URL(fileURLWithPath: existingTranscriptPath).standardizedFileURL.path
+            == URL(fileURLWithPath: discoveredTranscriptPath).standardizedFileURL.path
+    }
+
+    /// Return the canonical Desktop tracking key for a raw Codex discovery.
+    /// This is intentionally gated by transcript provenance so a CLI rollout
+    /// with a coincidentally similar id is never re-keyed.
+    private func codexDesktopCanonicalKey(for info: DiscoveredSession) -> String? {
+        guard info.source == "codex",
+              let transcriptPath = info.transcriptPath,
+              Self.codexTranscriptOrigin(path: transcriptPath) == .desktop else {
+            return nil
+        }
+        let providerId: String
+        if let explicit = info.providerSessionId, !explicit.isEmpty {
+            providerId = explicit.hasPrefix(Self.codexAppSessionPrefix)
+                ? String(explicit.dropFirst(Self.codexAppSessionPrefix.count))
+                : explicit
+        } else if info.sessionId.hasPrefix(Self.codexAppSessionPrefix) {
+            providerId = String(info.sessionId.dropFirst(Self.codexAppSessionPrefix.count))
+        } else {
+            providerId = info.sessionId
+        }
+        guard !providerId.isEmpty else { return nil }
+        return Self.codexAppSessionPrefix + providerId
+    }
+
+    /// Reconcile a raw Desktop twin into the namespaced Desktop card. The raw
+    /// helper PID is deliberately discarded; it is ChatGPT's shared app-server
+    /// process, not a terminal process belonging to this session.
+    @discardableResult
+    private func reconcileCodexDesktopTwin(
+        rawKey: String,
+        canonicalKey: String,
+        incoming: DiscoveredSession
+    ) -> Bool {
+        guard rawKey != canonicalKey,
+              let raw = sessions[rawKey],
+              raw.source == "codex",
+              let providerId = incoming.providerSessionId ?? raw.providerSessionId,
+              let incomingPath = incoming.transcriptPath,
+              (Self.codexDesktopTranscriptsMatch(
+                    existingTranscriptPath: raw.transcriptPath,
+                    discoveredTranscriptPath: incomingPath
+                ) || Self.codexSessionsHaveStrongDesktopIdentity(
+                    existingProviderSessionId: raw.providerSessionId ?? rawKey,
+                    existingTranscriptPath: raw.transcriptPath,
+                    discoveredProviderSessionId: providerId,
+                    discoveredTranscriptPath: incomingPath
+                )),
+              Self.codexTranscriptOrigin(path: incomingPath) == .desktop else {
+            return false
+        }
+
+        var merged = sessions[canonicalKey] ?? raw
+        let rawIsNewer = raw.lastActivity > merged.lastActivity
+        if rawIsNewer {
+            merged.lastActivity = raw.lastActivity
+            merged.status = raw.status
+            merged.cwd = raw.cwd ?? merged.cwd
+            merged.model = raw.model ?? merged.model
+            merged.recentMessages = raw.recentMessages.isEmpty ? merged.recentMessages : raw.recentMessages
+            merged.lastUserPrompt = raw.lastUserPrompt ?? merged.lastUserPrompt
+            merged.lastAssistantMessage = raw.lastAssistantMessage ?? merged.lastAssistantMessage
+        }
+        for (id, state) in raw.subagents {
+            if let current = merged.subagents[id], current.lastActivity >= state.lastActivity {
+                continue
+            }
+            merged.subagents[id] = state
+        }
+        for id in raw.closedSubagentIds {
+            merged.recordClosedSubagentId(id)
+        }
+        merged.source = "codex"
+        merged.termBundleId = Self.codexAppBundleId
+        merged.providerSessionId = providerId
+        merged.transcriptPath = incomingPath
+        merged.cliPid = nil
+        merged.cliStartTime = nil
+        sessions[canonicalKey] = merged
+
+        let wasActive = activeSessionId == rawKey
+        removeSession(rawKey)
+        if wasActive || activeSessionId == nil {
+            activeSessionId = canonicalKey
+        }
+        return true
+    }
+
+    /// Remove persisted/live raw twins left by Desktop hooks that lacked a
+    /// bundle marker. This runs before normal subagent folding on every restore
+    /// and discovery pass, so an old duplicate cannot keep reappearing.
+    @discardableResult
+    private func coalesceCodexDesktopTwinSessions() -> Bool {
+        var didMutate = false
+        let canonicalKeys = sessions.keys.filter { $0.hasPrefix(Self.codexAppSessionPrefix) }
+        for canonicalKey in canonicalKeys {
+            guard let canonical = sessions[canonicalKey],
+                  canonical.source == "codex",
+                  canonical.termBundleId == Self.codexAppBundleId,
+                  let providerId = canonical.providerSessionId,
+                  let transcriptPath = canonical.transcriptPath,
+                  Self.codexTranscriptOrigin(path: transcriptPath) == .desktop else {
+                continue
+            }
+            let rawCandidates = sessions.keys.filter { key in
+                guard key != canonicalKey,
+                      key == providerId || !key.hasPrefix(Self.codexAppSessionPrefix),
+                      let candidate = sessions[key],
+                      candidate.source == "codex",
+                      !candidate.isNativeAppMode else { return false }
+                return Self.codexDesktopTranscriptsMatch(
+                    existingTranscriptPath: candidate.transcriptPath,
+                    discoveredTranscriptPath: transcriptPath
+                ) || Self.codexSessionsHaveStrongDesktopIdentity(
+                    existingProviderSessionId: candidate.providerSessionId ?? key,
+                    existingTranscriptPath: candidate.transcriptPath,
+                    discoveredProviderSessionId: providerId,
+                    discoveredTranscriptPath: transcriptPath
+                )
+            }
+            for rawKey in rawCandidates {
+                let info = DiscoveredSession(
+                    sessionId: canonicalKey,
+                    cwd: canonical.cwd ?? sessions[rawKey]?.cwd ?? "",
+                    tty: nil,
+                    model: canonical.model,
+                    pid: nil,
+                    modifiedAt: canonical.lastActivity,
+                    recentMessages: canonical.recentMessages,
+                    source: "codex",
+                    transcriptPath: transcriptPath,
+                    status: canonical.status,
+                    termBundleId: Self.codexAppBundleId,
+                    providerSessionId: providerId
+                )
+                if reconcileCodexDesktopTwin(rawKey: rawKey, canonicalKey: canonicalKey, incoming: info) {
+                    didMutate = true
+                }
+            }
+        }
+        return didMutate
+    }
+
     /// Completed Codex subagents are transient workers, not idle top-level
     /// sessions. Their spawn-edge row may remain `open`, so transcript lifecycle
     /// is the reliable signal for removing them from the island.
@@ -3172,7 +3505,7 @@ final class AppState {
 
     /// Merge discovered sessions into current state (skip already-known ones)
     func integrateDiscovered(_ discovered: [DiscoveredSession]) {
-        var didMutate = false
+        var didMutate = coalesceCodexDesktopTwinSessions()
         for info in discovered {
             if shouldSuppressClosedCodexDesktopDiscovery(info) {
                 continue
@@ -3192,6 +3525,65 @@ final class AppState {
                     didMutate = true
                 }
                 continue
+            }
+
+            // A Desktop rollout can arrive through the hook path without the
+            // native bundle marker. Once its transcript proves Desktop origin,
+            // reconcile it into the namespaced card before the normal fast path.
+            if let canonicalKey = codexDesktopCanonicalKey(for: info) {
+                if canonicalKey != info.sessionId, sessions[canonicalKey] != nil {
+                    if reconcileCodexDesktopTwin(
+                        rawKey: info.sessionId,
+                        canonicalKey: canonicalKey,
+                        incoming: info
+                    ) {
+                        didMutate = true
+                    }
+                    // Raw discovery may not have been persisted as a session yet.
+                    // Keep the canonical card authoritative and never create raw.
+                    if applyDiscoveredRuntimeState(info, to: canonicalKey) {
+                        didMutate = true
+                    }
+                    if backfillSessionMessages(sessionId: canonicalKey, from: info) {
+                        didMutate = true
+                    }
+                    if applyDiscoveredMetadata(info, to: canonicalKey) {
+                        didMutate = true
+                    }
+                    attachTranscriptTailerIfNeeded(sessionId: canonicalKey)
+                    tryMonitorSession(canonicalKey)
+                    refreshProviderTitle(
+                        for: canonicalKey,
+                        providerSessionId: info.providerSessionId ?? canonicalKey
+                    )
+                    continue
+                } else if canonicalKey == info.sessionId,
+                          let rawProviderId = info.providerSessionId,
+                          sessions[rawProviderId] != nil,
+                          reconcileCodexDesktopTwin(
+                            rawKey: rawProviderId,
+                            canonicalKey: canonicalKey,
+                            incoming: info
+                          ) {
+                    didMutate = true
+                } else if canonicalKey == info.sessionId, sessions[canonicalKey] != nil {
+                    if applyDiscoveredRuntimeState(info, to: canonicalKey) {
+                        didMutate = true
+                    }
+                    if backfillSessionMessages(sessionId: canonicalKey, from: info) {
+                        didMutate = true
+                    }
+                    if applyDiscoveredMetadata(info, to: canonicalKey) {
+                        didMutate = true
+                    }
+                    attachTranscriptTailerIfNeeded(sessionId: canonicalKey)
+                    tryMonitorSession(canonicalKey)
+                    refreshProviderTitle(
+                        for: canonicalKey,
+                        providerSessionId: info.providerSessionId ?? canonicalKey
+                    )
+                    continue
+                }
             }
 
             // Session already known — try to update PID and attach monitor.
@@ -3436,8 +3828,21 @@ final class AppState {
         let candidates = sessions.map { (sessionId: $0.key, session: $0.value) }
         var transcriptMetadata: [String: CodexSubagentMetadata] = [:]
         var databaseLookupIds: Set<String> = []
+        var didMutate = false
+
+        // Remove internal Guardian review cards that may have been persisted by
+        // an older build before discovery filtering was added.
+        for candidate in candidates where candidate.session.source == "codex" {
+            if let transcriptPath = candidate.session.transcriptPath,
+               Self.isCodexInternalTranscript(path: transcriptPath),
+               sessions[candidate.sessionId] != nil {
+                removeSession(candidate.sessionId)
+                didMutate = true
+            }
+        }
 
         for candidate in candidates where candidate.session.source == "codex" {
+            guard sessions[candidate.sessionId] != nil else { continue }
             let providerSessionId = candidate.session.providerSessionId ?? candidate.sessionId
             if let transcriptPath = candidate.session.transcriptPath {
                 switch Self.inspectCodexSubagentMetadata(inTranscriptPath: transcriptPath) {
@@ -3462,8 +3867,6 @@ final class AppState {
             threadIds: databaseLookupIds,
             statePath: statePath
         )
-        var didMutate = false
-
         for candidate in candidates where candidate.session.source == "codex" {
             let providerSessionId = candidate.session.providerSessionId ?? candidate.sessionId
             guard let metadata = transcriptMetadata[candidate.sessionId]
@@ -4400,6 +4803,14 @@ final class AppState {
         return matched
     }
 
+    private nonisolated static func findKiroPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
+        findPids(
+            matchingPathSubstrings: ["/kiro-cli", "/kiro/"],
+            argSubstrings: ["kiro-cli"],
+            candidatePids: candidatePids
+        )
+    }
+
     /// Get PIDs of running Claude Code processes
     /// Claude's binary is named by version (e.g. "2.1.91") under ~/.local/share/claude/versions/
     private nonisolated static func findClaudePids(candidatePids: [pid_t]? = nil) -> [pid_t] {
@@ -4746,6 +5157,74 @@ final class AppState {
     private nonisolated static func md5Hash(of string: String) -> String {
         let digest = Insecure.MD5.hash(data: Data(string.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Recover Kiro sessions when hook delivery was interrupted. Kiro keeps one
+    /// JSONL file per CLI session; only files written recently and tied to a
+    /// live kiro-cli process are eligible, so old transcripts stay invisible.
+    private nonisolated static func findActiveKiroSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
+        let kiroPids = findKiroPids(candidatePids: candidatePids)
+        guard !kiroPids.isEmpty else { return [] }
+
+        let base = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".kiro/sessions/cli")
+        guard let files = try? FileManager.default.contentsOfDirectory(at: base,
+                                                                         includingPropertiesForKeys: [.contentModificationDateKey],
+                                                                         options: [.skipsHiddenFiles]) else { return [] }
+        let now = Date()
+        var results: [DiscoveredSession] = []
+        var seen: Set<String> = []
+        for pid in kiroPids {
+            guard let cwd = getCwd(for: pid), !cwd.isEmpty else { continue }
+            let matches = files.filter { $0.pathExtension == "json" && $0.lastPathComponent != "" }
+            for metadataURL in matches {
+                let sessionId = metadataURL.deletingPathExtension().lastPathComponent
+                guard !sessionId.isEmpty, !seen.contains(sessionId) else { continue }
+                let transcriptURL = base.appendingPathComponent(sessionId + ".jsonl")
+                guard let attrs = try? FileManager.default.attributesOfItem(atPath: transcriptURL.path),
+                      let modified = attrs[.modificationDate] as? Date,
+                      now.timeIntervalSince(modified) <= 300,
+                      let data = try? Data(contentsOf: metadataURL),
+                      let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      (metadata["cwd"] as? String) == cwd else { continue }
+                let status = kiroTranscriptStatus(path: transcriptURL.path)
+                seen.insert(sessionId)
+                results.append(DiscoveredSession(
+                    sessionId: sessionId,
+                    cwd: cwd,
+                    tty: nil,
+                    model: nil,
+                    pid: pid,
+                    modifiedAt: modified,
+                    recentMessages: [],
+                    source: "kiro",
+                    transcriptPath: transcriptURL.path,
+                    status: status
+                ))
+            }
+        }
+        return results
+    }
+
+    internal nonisolated static func kiroTranscriptStatus(path: String) -> AgentStatus {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return .idle }
+        defer { try? handle.close() }
+        let size = handle.seekToEndOfFile()
+        let readSize = min(size, 64 * 1024)
+        handle.seek(toFileOffset: size - readSize)
+        guard let text = String(data: handle.readDataToEndOfFile(), encoding: .utf8),
+              let line = text.split(separator: "\n").last,
+              let data = line.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let kind = object["kind"] as? String else { return .idle }
+        if kind == "Prompt" || kind == "ToolResults" { return .processing }
+        guard kind == "AssistantMessage",
+              let payload = object["data"] as? [String: Any],
+              let content = payload["content"] as? [[String: Any]],
+              content.contains(where: { ($0["kind"] as? String) == "toolUse" }) else {
+            return .idle
+        }
+        return .processing
     }
 
     private nonisolated static func findActiveKimiSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
@@ -6077,6 +6556,22 @@ final class AppState {
         )
     }
 
+    /// Rollout filenames may contain a generated continuation id, while the
+    /// transcript metadata retains the real Codex thread id. Prefer that
+    /// authoritative value for Desktop discovery so one conversation cannot
+    /// become two island cards.
+    nonisolated static func codexTranscriptSessionId(path: String, fallback: String) -> String {
+        guard let line = readFirstLine(path: path),
+              let data = line.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let payload = root["payload"] as? [String: Any],
+              let id = payload["session_id"] as? String,
+              !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return fallback
+        }
+        return id
+    }
+
     /// Upgrade pre-namespace persisted Desktop hook cards without touching raw
     /// Codex CLI ids. `termBundleId` is the reliable discriminator retained by
     /// #267-era snapshots.
@@ -6117,6 +6612,25 @@ final class AppState {
             return .cli
         }
         return .unknown
+    }
+
+    /// Guardian review rollouts are internal Codex Desktop bookkeeping threads,
+    /// not user-visible conversations. Keep them out of the island entirely.
+    nonisolated static func isCodexInternalTranscript(path: String) -> Bool {
+        guard let firstLine = readFirstLine(path: path),
+              let data = firstLine.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let payload = json["payload"] as? [String: Any] else {
+            return false
+        }
+        if (payload["thread_source"] as? String)?.lowercased() == "guardian_review" {
+            return true
+        }
+        guard let source = payload["source"] as? [String: Any],
+              let subagent = source["subagent"] as? [String: Any] else {
+            return false
+        }
+        return (subagent["other"] as? String)?.lowercased() == "guardian"
     }
 
     private nonisolated static func findCodexPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
@@ -6329,6 +6843,7 @@ final class AppState {
                       let transcriptPath = sqliteColumnString(statement, index: 1),
                       let cwd = sqliteColumnString(statement, index: 2),
                       fileManager.fileExists(atPath: transcriptPath) else { continue }
+                guard !isCodexInternalTranscript(path: transcriptPath) else { continue }
                 // JSON `source` rows can also belong to a concurrent Codex CLI
                 // subagent. Never re-key an explicitly CLI-origin rollout into
                 // the Desktop namespace merely because the Desktop host is open.
@@ -6456,11 +6971,15 @@ final class AppState {
             }
 
             for file in files {
+                guard !isCodexInternalTranscript(path: file) else { continue }
                 let fileName = (file as NSString).lastPathComponent
                 let rawSessionId = extractCodexSessionId(from: fileName)
                 guard !rawSessionId.isEmpty else { continue }
+                let canonicalRawSessionId = process.isDesktop
+                    ? codexTranscriptSessionId(path: file, fallback: rawSessionId)
+                    : rawSessionId
                 let identity = codexDiscoveryIdentity(
-                    rawSessionId: rawSessionId,
+                    rawSessionId: canonicalRawSessionId,
                     isDesktop: process.isDesktop
                 )
                 guard !seenDiscoveryIds.contains(identity.sessionId) else { continue }

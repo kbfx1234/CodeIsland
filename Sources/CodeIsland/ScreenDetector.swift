@@ -71,6 +71,26 @@ struct ScreenDetector {
         return mainScreen ?? screens.first ?? NSScreen()
     }
 
+    /// Resolve the screen used by the panel for a persisted display choice.
+    /// Keeping this in one place prevents settings from inspecting a different
+    /// screen than the panel when an explicit display is selected.
+    static func screen(for displayChoice: String, screens: [NSScreen] = NSScreen.screens) -> NSScreen {
+        if let index = explicitScreenIndex(for: displayChoice, screenCount: screens.count) {
+            return screens[index]
+        }
+        return preferredScreen
+    }
+
+    static func explicitScreenIndex(for displayChoice: String, screenCount: Int) -> Int? {
+        guard displayChoice.hasPrefix("screen_"),
+              let index = Int(displayChoice.dropFirst("screen_".count)),
+              index >= 0,
+              index < screenCount else {
+            return nil
+        }
+        return index
+    }
+
     static var hasNotch: Bool {
         screenHasNotch(preferredScreen)
     }

@@ -4,6 +4,14 @@ import CodeIslandCore
 import Yams
 
 final class ConfigInstallerTests: XCTestCase {
+    func testClaudeHookFallbackCarriesCmuxIdentity() {
+        let script = ConfigInstaller.hookScriptForTesting
+        XCTAssertTrue(script.contains("CMUX_SURFACE_ID"))
+        XCTAssertTrue(script.contains("CMUX_WORKSPACE_ID"))
+        XCTAssertTrue(script.contains("_cmux_surface_id"))
+        XCTAssertTrue(script.contains("_cmux_workspace_id"))
+    }
+
     private func yamlRootDict(_ yaml: String, file: StaticString = #filePath, line: UInt = #line) throws -> [String: Any] {
         let any = try XCTUnwrap(try Yams.load(yaml: yaml), file: file, line: line)
         if let d = any as? [String: Any] { return d }

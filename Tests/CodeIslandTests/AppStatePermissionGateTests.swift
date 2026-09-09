@@ -159,6 +159,41 @@ final class AppStatePermissionGateTests: XCTestCase {
         _ = await secondTask.value
     }
 
+    func testStalePermissionIsDeniedAndRemovedInsteadOfWaitingForever() async throws {
+        let appState = AppState()
+        let task = Task<Data, Never> {
+            await withCheckedContinuation {
+                appState.handlePermissionRequest(try! self.perm("s-expired", "Bash"), continuation: $0)
+            }
+        }
+        await Task.yield()
+        XCTAssertEqual(appState.permissionQueue.count, 1)
+        appState.permissionQueue[0].enqueuedAt = Date().addingTimeInterval(-AppState.interactiveRequestTimeout - 1)
+
+        XCTAssertEqual(appState.expireStaleInteractiveRequests(now: Date()), 1)
+        let response = await task.value
+        XCTAssertEqual(try extractBehavior(from: response), "deny")
+        XCTAssertTrue(appState.permissionQueue.isEmpty)
+        XCTAssertNotEqual(appState.sessions["s-expired"]?.status, .waitingApproval)
+    }
+
+    func testStaleQuestionIsResolvedAndRemovedInsteadOfWaitingForever() async throws {
+        let appState = AppState()
+        let task = Task<Data, Never> {
+            await withCheckedContinuation {
+                appState.handleQuestion(try! self.question("s-expired-question"), continuation: $0)
+            }
+        }
+        await Task.yield()
+        XCTAssertEqual(appState.questionQueue.count, 1)
+        appState.questionQueue[0].enqueuedAt = Date().addingTimeInterval(-AppState.interactiveRequestTimeout - 1)
+
+        XCTAssertEqual(appState.expireStaleInteractiveRequests(now: Date()), 1)
+        _ = await task.value
+        XCTAssertTrue(appState.questionQueue.isEmpty)
+        XCTAssertNotEqual(appState.sessions["s-expired-question"]?.status, .waitingQuestion)
+    }
+
     // MARK: - Helpers
 
     private func perm(_ sessionId: String, _ toolName: String) throws -> HookEvent {

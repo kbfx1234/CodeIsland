@@ -7,6 +7,10 @@ enum NotchWidthScale {
     static let min = 50
     static let max = 150
     static let step = 1
+
+    static func minimum(hasNotch: Bool) -> Int {
+        hasNotch ? 100 : min
+    }
 }
 
 enum NotchWidthMetrics {
@@ -85,6 +89,27 @@ enum ToolNameDisplay {
     }
 }
 
+enum CompactBarPresentation {
+    static let notchedDetailWidth: CGFloat = 56
+
+    static func statusLocalizationKey(for status: AgentStatus) -> String {
+        switch status {
+        case .running: return "status_running"
+        case .processing: return "status_processing"
+        case .waitingApproval, .waitingQuestion: return "status_waiting"
+        case .idle: return "status_idle"
+        }
+    }
+
+    static func shouldShowSessionCount(total: Int) -> Bool {
+        total > 1
+    }
+
+    static func detailWidth(hasNotch: Bool, screenWidth: CGFloat) -> CGFloat {
+        hasNotch ? notchedDetailWidth : screenWidth * 0.04
+    }
+}
+
 struct NotchPanelView: View {
     var appState: AppState
     let hasNotch: Bool
@@ -100,6 +125,7 @@ struct NotchPanelView: View {
     @AppStorage(SettingsKey.collapsedWidthScale) private var collapsedWidthScale = SettingsDefaults.collapsedWidthScale
     @AppStorage(SettingsKey.hapticOnHover) private var hapticOnHover = SettingsDefaults.hapticOnHover
     @AppStorage(SettingsKey.hapticIntensity) private var hapticIntensity = SettingsDefaults.hapticIntensity
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Delayed hover: prevents accidental expansion when mouse passes through
     @State private var hoverTimer: Timer?
@@ -154,12 +180,12 @@ struct NotchPanelView: View {
         if !isActive { return hasNotch ? nw - 20 : nw }
         if shouldShowExpanded { return min(max(nw + 200, 580), maxWidth) }
         let wing = compactWingWidth
-        let extra: CGFloat = appState.status == .idle ? 0 : 20
-        // Reserve space for tool status — proportional to screen width
-        let toolExtra: CGFloat = displayedToolStatus ? (hasNotch ? screenWidth * 0.03 : screenWidth * 0.04) : 0
+        let toolExtra = displayedToolStatus
+            ? CompactBarPresentation.detailWidth(hasNotch: hasNotch, screenWidth: screenWidth)
+            : 0
         // Immediate hover acknowledgement: a slight widen while the expand delay runs
         let prehoverExtra: CGFloat = shouldShowPrehover ? NotchHoverInteraction.prehoverWidthDelta : 0
-        return nw + wing * 2 + extra + toolExtra + prehoverExtra
+        return nw + wing * 2 + toolExtra + prehoverExtra
     }
 
     var body: some View {
@@ -424,6 +450,9 @@ struct NotchPanelView: View {
                 .allowsHitTesting(false)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .transaction { transaction in
+            if reduceMotion { transaction.animation = nil }
+        }
         .animation(NotchAnimation.open, value: appState.surface)
     }
 }
@@ -442,6 +471,8 @@ private struct CompactLeftWing: View {
     // Bound via @AppStorage so flipping the default mascot in Settings rerenders this view
     // even when AppState.primarySource wasn't recomputed (no session mutations in flight).
     @AppStorage(SettingsKey.defaultSource) private var settingsDefaultSource = SettingsDefaults.defaultSource
+    @ObservedObject private var l10n = L10n.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var displaySession: SessionSnapshot? {
         let sid = appState.rotatingSessionId ?? appState.activeSessionId ?? appState.sessions.keys.sorted().first
@@ -465,6 +496,15 @@ private struct CompactLeftWing: View {
     }
     private var displayStatus: AgentStatus { displaySession?.status ?? .idle }
     private var liveTool: String? { displaySession?.currentTool }
+    private var compactLabel: String {
+        if let shownTool {
+            return ToolNameDisplay.compact(shownTool)
+        }
+        return l10n[CompactBarPresentation.statusLocalizationKey(for: displayStatus)]
+    }
+    private var compactLabelColor: Color {
+        shownTool.map(toolStatusColor) ?? .white.opacity(0.72)
+    }
     @State private var shownTool: String?
     @State private var lingerTimer: Timer?
 
@@ -502,16 +542,15 @@ private struct CompactLeftWing: View {
                     .transition(.opacity)
                     .animation(.easeInOut(duration: 0.3), value: displaySource)
 
-                // On notch screens, show tool name only (no description, space is tight)
-                if hasNotch, showToolStatus, let tool = shownTool {
-                    Text(ToolNameDisplay.compact(tool))
+                if hasNotch, showToolStatus {
+                    Text(compactLabel)
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(toolStatusColor(tool))
+                        .foregroundStyle(compactLabelColor)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .frame(maxWidth: ToolNameDisplay.compactMaxWidth, alignment: .leading)
                         .transition(.opacity)
-                        .help(tool)
+                        .help(shownTool ?? compactLabel)
                 }
             }
         }
@@ -520,11 +559,11 @@ private struct CompactLeftWing: View {
         .onChange(of: liveTool) { _, newTool in
             lingerTimer?.invalidate()
             if let newTool {
-                withAnimation(.easeInOut(duration: 0.2)) { shownTool = newTool }
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { shownTool = newTool }
             } else {
                 lingerTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { _ in
                     DispatchQueue.main.async {
-                        withAnimation(.easeOut(duration: 0.3)) { shownTool = nil }
+                        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.3)) { shownTool = nil }
                     }
                 }
             }
@@ -533,8 +572,10 @@ private struct CompactLeftWing: View {
         .onChange(of: appState.rotatingSessionId) { _, _ in
             lingerTimer?.invalidate()
             let newTool = liveTool
-            withAnimation(.easeInOut(duration: 0.2)) { shownTool = newTool }
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { shownTool = newTool }
         }
+        .onAppear { shownTool = liveTool }
+        .onDisappear { lingerTimer?.invalidate() }
     }
 }
 
@@ -549,6 +590,7 @@ private struct CompactRightWing: View {
     @AppStorage(SettingsKey.quietHoursEnabled) private var quietHoursEnabled = SettingsDefaults.quietHoursEnabled
     @AppStorage(SettingsKey.quietHoursStart) private var quietHoursStart = SettingsDefaults.quietHoursStart
     @AppStorage(SettingsKey.quietHoursEnd) private var quietHoursEnd = SettingsDefaults.quietHoursEnd
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Re-evaluated on every re-render; the compact bar redraws often enough
     /// that the moon appears/disappears close to the window edges.
@@ -566,8 +608,11 @@ private struct CompactRightWing: View {
         appState.rotatingSessionId ?? appState.activeSessionId ?? appState.sessions.keys.sorted().first
     }
     private var projectName: String? {
-        guard let sid = displaySessionId, let cwd = appState.sessions[sid]?.cwd, !cwd.isEmpty else { return nil }
-        return (cwd as NSString).lastPathComponent
+        guard let sid = displaySessionId,
+              let session = appState.sessions[sid],
+              let cwd = session.cwd,
+              !cwd.isEmpty else { return nil }
+        return session.projectDisplayName
     }
 
     var body: some View {
@@ -594,22 +639,33 @@ private struct CompactRightWing: View {
                 // Glance completion dot — an agent finished while collapsed;
                 // cleared as soon as the panel expands.
                 if appState.glanceCompletionActive {
-                    Circle()
-                        .fill(Color(red: 0.4, green: 1.0, blue: 0.5))
-                        .frame(width: 7, height: 7)
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.5))
                         .shadow(color: Color(red: 0.4, green: 1.0, blue: 0.5).opacity(0.7), radius: 3)
+                        .help(l10n["task_complete"])
                 }
 
                 // Pending approval/question badge
                 if appState.status == .waitingApproval || appState.status == .waitingQuestion {
-                    Image(systemName: "bell.fill")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(Color(red: 1.0, green: 0.7, blue: 0.28))
-                        .symbolEffect(.pulse, options: .repeating)
+                    if reduceMotion {
+                        pendingBadge
+                    } else {
+                        pendingBadge.symbolEffect(.pulse, options: .repeating)
+                    }
                 }
 
-                if showToolStatus {
-                    // Detailed mode: session count (project name is shown in center on non-notch)
+                if let projectName {
+                    Text(projectName)
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.78))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 92, alignment: .trailing)
+                        .help(projectName)
+                }
+
+                if CompactBarPresentation.shouldShowSessionCount(total: appState.totalSessionCount) {
                     HStack(spacing: 1) {
                         let active = appState.activeSessionCount
                         let total = appState.totalSessionCount
@@ -622,26 +678,18 @@ private struct CompactRightWing: View {
                         Text("\(total)")
                             .foregroundStyle(.white.opacity(0.9))
                     }
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                } else {
-                    // Simple mode: original session count only
-                    HStack(spacing: 1) {
-                        let active = appState.activeSessionCount
-                        let total = appState.totalSessionCount
-                        if active > 0 {
-                            Text("\(active)")
-                                .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.5))
-                            Text("/")
-                                .foregroundStyle(.white.opacity(0.4))
-                        }
-                        Text("\(total)")
-                            .foregroundStyle(.white.opacity(0.9))
-                    }
-                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .font(.system(size: showToolStatus ? 12 : 13, weight: .semibold, design: .monospaced))
                 }
             }
         }
         .padding(.trailing, 6)
+    }
+
+    private var pendingBadge: some View {
+        Image(systemName: "bell.fill")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(Color(red: 1.0, green: 0.7, blue: 0.28))
+            .help(l10n["status_waiting"])
     }
 }
 
@@ -677,10 +725,6 @@ private struct CompactToolStatus: View {
     private var liveTool: String? { displaySession?.currentTool }
     private var liveDesc: String? { displaySession?.toolDescription }
     private var displayStatus: AgentStatus { displaySession?.status ?? .idle }
-    private var projectName: String? {
-        guard let cwd = displaySession?.cwd, !cwd.isEmpty else { return nil }
-        return (cwd as NSString).lastPathComponent
-    }
 
     @State private var shownTool: String?
     @State private var shownDesc: String?
@@ -695,19 +739,8 @@ private struct CompactToolStatus: View {
         return trimmed
     }
 
-    /// Whether the current session is doing any work (not idle)
-    private var isWorking: Bool { displayStatus != .idle }
-
     var body: some View {
         HStack(spacing: 5) {
-            // Project name — shown whenever the session is not idle
-            if isWorking, let project = projectName {
-                Text(project)
-                    .foregroundStyle(.white.opacity(0.8))
-                    .id("center-project-\(displaySessionId ?? "")")
-                    .transition(.opacity)
-            }
-
             // Tool status or thinking indicator
             if let tool = shownTool {
                 TypingIndicator(fontSize: 11, label: ToolNameDisplay.compact(tool, maxCharacters: 32), bright: true, color: toolStatusColor(tool))
@@ -1765,13 +1798,29 @@ private struct SessionListView: View {
     @AppStorage(SettingsKey.sessionGroupingMode) private var groupingMode = SettingsDefaults.sessionGroupingMode
     @AppStorage(SettingsKey.maxVisibleSessions) private var maxVisibleSessions = SettingsDefaults.maxVisibleSessions
     @AppStorage(SettingsKey.showUsageStats) private var showUsageStats = SettingsDefaults.showUsageStats
+    @State private var filterText = ""
+    @State private var showHiddenSessions = false
+    @State private var confirmClearCompleted = false
+
+    private var filteredSessionIds: [String] {
+        let query = filterText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return appState.sessions.keys.sorted().filter { id in
+            if !showHiddenSessions && appState.hiddenSessionIds.contains(id) { return false }
+            guard !query.isEmpty, let session = appState.sessions[id] else { return true }
+            let haystack = [
+                id, session.projectDisplayName, session.sessionLabel ?? "",
+                session.source, session.cwd ?? "", session.providerSessionId ?? ""
+            ].joined(separator: " ").lowercased()
+            return haystack.contains(query)
+        }
+    }
 
     private var groupedSessions: [(header: String, source: String?, ids: [String])] {
         if let only = onlySessionId, appState.sessions[only] != nil {
             return [("", nil, [only])]
         }
 
-        let sorted = appState.sessions.keys.sorted()
+        let sorted = filteredSessionIds
 
         switch groupingMode {
         case "status":
@@ -1899,6 +1948,43 @@ private struct SessionListView: View {
         .padding(.vertical, 4)
 
         VStack(spacing: 0) {
+            if onlySessionId == nil {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.4))
+                    TextField("Filter sessions", text: $filterText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .frame(minWidth: 100)
+                    if !appState.hiddenSessionIds.isEmpty {
+                        Button {
+                            showHiddenSessions.toggle()
+                        } label: {
+                            Image(systemName: showHiddenSessions ? "eye" : "eye.slash")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(showHiddenSessions ? .white.opacity(0.8) : .white.opacity(0.4))
+                        }
+                        .buttonStyle(.plain)
+                        .help(showHiddenSessions ? "Hide hidden sessions" : "Show hidden sessions")
+                    }
+                    Button {
+                        confirmClearCompleted = true
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.45))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear completed sessions")
+                    .disabled(!appState.sessions.values.contains(where: { $0.status == .idle }))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(.white.opacity(0.04))
+            }
+
             if needsScroll {
                 ThinScrollView(maxHeight: CGFloat(maxVisibleSessions) * 90) {
                     content
@@ -1920,6 +2006,20 @@ private struct SessionListView: View {
                !(usage.last5h.isEmpty && usage.today.isEmpty) {
                 UsageFooterLine(usage: usage)
             }
+            if showUsageStats, onlySessionId == nil, let usage = appState.kiroUsage,
+               !(usage.last5h.isEmpty && usage.today.isEmpty) {
+                KiroUsageFooterLine(usage: usage)
+            }
+        }
+        .confirmationDialog(
+            "Clear completed sessions?",
+            isPresented: $confirmClearCompleted,
+            titleVisibility: .visible
+        ) {
+            Button("Clear", role: .destructive) { _ = appState.clearCompletedSessions() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Only idle sessions are removed from CodeIsland. Original transcripts are kept.")
         }
     }
 }
@@ -1959,6 +2059,26 @@ private struct UsageFooterLine: View {
             "\(label): in \(ClaudeUsageScanner.formatTokens(t.inputTokens)) · out \(ClaudeUsageScanner.formatTokens(t.outputTokens)) · cache write \(ClaudeUsageScanner.formatTokens(t.cacheCreationTokens)) · cache read \(ClaudeUsageScanner.formatTokens(t.cacheReadTokens))"
         }
         return line("5h", usage.last5h) + "\n" + line(l10n["usage_today"], usage.today)
+    }
+}
+
+private struct KiroUsageFooterLine: View {
+    let usage: KiroUsageScanner.Snapshot
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "gauge.with.needle")
+            Text("Kiro").fontWeight(.semibold)
+            Text("本地 credits 5h \(KiroUsageScanner.formatCredits(usage.last5h.credits))")
+            Text("·").foregroundStyle(.white.opacity(0.25))
+            Text("今日 \(KiroUsageScanner.formatCredits(usage.today.credits))")
+            Spacer()
+        }
+        .font(.system(size: 10, weight: .medium, design: .monospaced))
+        .foregroundStyle(.white.opacity(0.45))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 5)
+        .help("Kiro 本地 session credits 估算；不代表套餐总额或 /usage 配额")
     }
 }
 
@@ -2581,6 +2701,17 @@ private struct SessionCard: View {
         .offset(x: failureShakeOffset)
         .contentShape(Rectangle())
         .onTapGesture { handleSessionClick() }
+        .contextMenu {
+            if session.status == .idle {
+                Button(appState.hiddenSessionIds.contains(sessionId) ? "Show session" : "Hide session") {
+                    if appState.hiddenSessionIds.contains(sessionId) {
+                        appState.unhideSession(sessionId)
+                    } else {
+                        appState.hideSession(sessionId)
+                    }
+                }
+            }
+        }
         .onHover { h in withAnimation(NotchAnimation.micro) { hovering = h } }
         .onDisappear {
             jumpValidationTask?.cancel()

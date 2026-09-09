@@ -27,8 +27,8 @@ public enum EventNormalizer {
         case "preToolUse":            return "PreToolUse"
         case "postToolUse":           return "PostToolUse"
         case "errorOccurred":         return "Notification"
-        // Kiro CLI (camelCase, agent-scoped)
-        case "agentSpawn":            return "SessionStart"
+        // Kiro CLI v2 (camelCase, agent-scoped) and v3 standalone CLI event.
+        case "agentSpawn", "AgentSpawn": return "SessionStart"
         case "userPromptSubmit":      return "UserPromptSubmit"
         // Traecli (snake_case)
         case "session_start":         return "SessionStart"

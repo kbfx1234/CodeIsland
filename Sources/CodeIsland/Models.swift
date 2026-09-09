@@ -4,6 +4,17 @@ import CodeIslandCore
 struct PermissionRequest {
     let event: HookEvent
     let continuation: CheckedContinuation<Data, Never>
+    var enqueuedAt: Date
+
+    init(
+        event: HookEvent,
+        continuation: CheckedContinuation<Data, Never>,
+        enqueuedAt: Date = Date()
+    ) {
+        self.event = event
+        self.continuation = continuation
+        self.enqueuedAt = enqueuedAt
+    }
 
     var toolUseId: String? { event.toolUseId }
 }
@@ -65,19 +76,22 @@ struct QuestionRequest {
     /// true when converted from AskUserQuestion PermissionRequest
     let isFromPermission: Bool
     var askUserQuestionState: AskUserQuestionState?
+    var enqueuedAt: Date
 
     init(
         event: HookEvent,
         question: QuestionPayload,
         resolution: QuestionResolution,
         isFromPermission: Bool = false,
-        askUserQuestionState: AskUserQuestionState? = nil
+        askUserQuestionState: AskUserQuestionState? = nil,
+        enqueuedAt: Date = Date()
     ) {
         self.event = event
         self.question = askUserQuestionState?.items.first?.payload ?? question
         self.resolution = resolution
         self.isFromPermission = isFromPermission
         self.askUserQuestionState = askUserQuestionState
+        self.enqueuedAt = enqueuedAt
     }
 
     /// Back-compat convenience for hook-originated questions.
