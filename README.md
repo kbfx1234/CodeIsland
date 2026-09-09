@@ -81,6 +81,8 @@ brew install --cask codeisland
 
 > **Note:** On first launch, macOS may show a security warning. Go to **System Settings → Privacy & Security** and click **Open Anyway**.
 
+> **Signing note:** `v1.1.0` is ad-hoc signed and is not yet Apple-notarized. After downloading, Control-click CodeIsland.app in Finder and choose **Open**. If macOS still blocks it, allow it under **System Settings → Privacy & Security**. You do not need to disable Gatekeeper.
+
 ### iPhone & Apple Watch Buddy
 
 Code Island Buddy is available on the App Store:

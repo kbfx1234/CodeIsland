@@ -13,7 +13,7 @@ set -euo pipefail
 #   - A prior `swift build -c release` has populated .build/artifacts so
 #     Sparkle's sign_update binary is on disk.
 #   - The DMG is uploaded to
-#       https://github.com/wxtsky/CodeIsland/releases/download/v<version>/CodeIsland.dmg
+#       https://github.com/kbfx1234/CodeIsland/releases/download/v<version>/CodeIsland.dmg
 #     (the default asset URL from build-dmg.sh + `gh release create`).
 
 VERSION="${1:-}"
@@ -40,7 +40,7 @@ fi
 # ---------------------------------------------------------------------------
 # Collect fields for the <enclosure> tag
 # ---------------------------------------------------------------------------
-DOWNLOAD_URL="https://github.com/wxtsky/CodeIsland/releases/download/v${VERSION}/CodeIsland.dmg"
+DOWNLOAD_URL="https://github.com/kbfx1234/CodeIsland/releases/download/v${VERSION}/CodeIsland.dmg"
 PUB_DATE="$(LC_TIME=en_US.UTF-8 date -u "+%a, %d %b %Y %H:%M:%S +0000")"
 LENGTH="$(stat -f%z "$DMG_PATH")"
 MIN_OS="14.0"
@@ -60,7 +60,7 @@ fi
 # ---------------------------------------------------------------------------
 NEW_ITEM="    <item>
       <title>Version ${VERSION}</title>
-      <link>https://github.com/wxtsky/CodeIsland/releases/tag/v${VERSION}</link>
+      <link>https://github.com/kbfx1234/CodeIsland/releases/tag/v${VERSION}</link>
       <sparkle:version>${VERSION}</sparkle:version>
       <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>${MIN_OS}</sparkle:minimumSystemVersion>
@@ -84,7 +84,7 @@ if [[ ! -f "$APPCAST" ]]; then
      version="2.0">
   <channel>
     <title>CodeIsland</title>
-    <link>https://raw.githubusercontent.com/wxtsky/CodeIsland/main/appcast.xml</link>
+    <link>https://raw.githubusercontent.com/kbfx1234/CodeIsland/main/appcast.xml</link>
     <description>Most recent CodeIsland updates</description>
     <language>en</language>
 ${NEW_ITEM}

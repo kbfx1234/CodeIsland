@@ -81,6 +81,8 @@ brew install --cask codeisland
 
 > **提示：** 首次启动时 macOS 可能弹出安全提示，前往 **系统设置 → 隐私与安全性** 点击 **仍要打开** 即可。
 
+> **首版签名说明：** `v1.1.0` 使用 ad-hoc 签名，尚未经过 Apple 公证。下载后请在 Finder 中右键 CodeIsland.app 选择“打开”；若仍被拦截，请前往 **系统设置 → 隐私与安全性** 允许打开。本项目不会要求关闭 Gatekeeper。
+
 ### iPhone 与 Apple Watch Buddy
 
 Code Island Buddy 已在 App Store 上架：

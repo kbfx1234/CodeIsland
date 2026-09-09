@@ -79,8 +79,9 @@ CURRENT_VER=$(defaults read "$REPO_ROOT/Info.plist" CFBundleShortVersionString)
 sed -e "s/<string>${CURRENT_VER}<\/string>/<string>${VERSION}<\/string>/g" \
     "$REPO_ROOT/Info.plist" > "$CONTENTS_DIR/Info.plist"
 
-# Compile app icon and asset catalog
-xcrun actool \
+# Compile app icon and asset catalog. Fall back to the checked-in ICNS when
+# the local Xcode actool plug-in cannot load.
+if ! xcrun actool \
     --output-format human-readable-text \
     --notices --warnings --errors \
     --platform macosx \
@@ -90,7 +91,9 @@ xcrun actool \
     --output-partial-info-plist /dev/null \
     --compile "$CONTENTS_DIR/Resources" \
     "$REPO_ROOT/Assets.xcassets" \
-    "$REPO_ROOT/AppIcon.icon"
+    "$REPO_ROOT/AppIcon.icon"; then
+    echo "WARNING: actool failed; using the bundled AppIcon.icns fallback."
+fi
 
 # Finder still relies on CFBundleIconFile/AppIcon.icns for some copied or
 # unsigned bundles. Keep a checked-in fallback so CI artifacts do not regress to
@@ -172,20 +175,20 @@ adhoc_sign_app_for_local_permissions() {
 
     for xpc in "$SPARKLE_B"/XPCServices/*.xpc; do
         [ -e "$xpc" ] || continue
-        codesign --force --options runtime --sign - "$xpc"
+        codesign --force --sign - "$xpc"
     done
     [ -e "$SPARKLE_B/Autoupdate" ] && \
-        codesign --force --options runtime --sign - "$SPARKLE_B/Autoupdate"
+        codesign --force --sign - "$SPARKLE_B/Autoupdate"
     [ -d "$SPARKLE_B/Updater.app" ] && \
-        codesign --force --options runtime --sign - "$SPARKLE_B/Updater.app"
-    codesign --force --options runtime --sign - "$SPARKLE_FW"
+        codesign --force --sign - "$SPARKLE_B/Updater.app"
+    codesign --force --sign - "$SPARKLE_FW"
 
     for helper in "$CONTENTS_DIR"/Helpers/*; do
         [ -f "$helper" ] || continue
-        codesign --force --options runtime --sign - "$helper"
+        codesign --force --sign - "$helper"
     done
 
-    codesign --force --options runtime \
+    codesign --force \
         --entitlements "$REPO_ROOT/CodeIsland.entitlements" \
         --sign - \
         "$APP_DIR"

@@ -17,9 +17,9 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.33</string>
+	<string>1.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>1.0.33</string>
+	<string>1.1.0</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
@@ -38,9 +38,9 @@
 	<key>SUAutomaticallyUpdate</key>
 	<false/>
 	<key>SUEnableAutomaticChecks</key>
-	<true/>
+	<false/>
 	<key>SUFeedURL</key>
-	<string>https://raw.githubusercontent.com/wxtsky/CodeIsland/main/appcast.xml</string>
+	<string>https://raw.githubusercontent.com/kbfx1234/CodeIsland/main/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>oqLtx5s2hc8Xgsp4rEuTwnQ8UGRT4ma4tjlf+1i3YHA=</string>
 	<key>SUScheduledCheckInterval</key>

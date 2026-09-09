@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [v1.1.0] - 2026-09-09
+
+- Publish the first stable `kbfx1234/CodeIsland` fork release based on upstream v1.0.33.
+- Add reliable Codex Desktop/CLI identity, transcript recovery, deep links, and duplicate-session folding.
+- Add Kiro CLI hooks, session discovery, usage display, and health diagnostics.
+- Fix Claude Code identity and precise focus when running inside cmux.
+- Add hook repair, session lifecycle controls, Dock accessory behavior, macOS CI, and release packaging fixes.
+
 ## [v1.0.33] - 2026-09-01
 
 ### English
