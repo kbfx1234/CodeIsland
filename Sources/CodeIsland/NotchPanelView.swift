@@ -2824,7 +2824,7 @@ private struct SessionListView: View {
     @AppStorage(SettingsKey.sessionGroupingMode) private var groupingMode = SettingsDefaults.sessionGroupingMode
     @AppStorage(SettingsKey.maxVisibleSessions) private var maxVisibleSessions = SettingsDefaults.maxVisibleSessions
     @AppStorage(SettingsKey.showUsageStats) private var showUsageStats = SettingsDefaults.showUsageStats
-    @AppStorage(SettingsKey.showClaudeQuota) private var showClaudeQuota = SettingsDefaults.showClaudeQuota
+   @AppStorage(SettingsKey.showClaudeQuota) private var showClaudeQuota = SettingsDefaults.showClaudeQuota
     @AppStorage(SettingsKey.sessionListDensity) private var densityRaw = SettingsDefaults.sessionListDensity
     @AppStorage(SettingsKey.contentFontSize) private var contentFontSize = SettingsDefaults.contentFontSize
     @AppStorage(SettingsKey.showProjectName) private var showProjectName = SettingsDefaults.showProjectName
@@ -2839,6 +2839,12 @@ private struct SessionListView: View {
         // The completion card is one full card whatever the setting.
         onlySessionId == nil ? SessionListDensity(storedValue: densityRaw) : .comfortable
     }
+    @ObservedObject private var codexQuota = CodexQuotaStore.shared
+    @ObservedObject private var kiroAccount = KiroAccountUsageStore.shared
+    @State private var filterText = ""
+    @State private var showHiddenSessions = false
+    @State private var confirmClearCompleted = false
+
 
     /// Needs-you first, then working, then the rest by recent activity —
     /// held in place while the pointer is over the list.
@@ -3443,8 +3449,17 @@ private struct SessionListFooter: View {
     var appState: AppState
     let showUsageStats: Bool
     let showClaudeQuota: Bool
+    @ObservedObject private var codexQuota = CodexQuotaStore.shared
+    @ObservedObject private var kiroAccount = KiroAccountUsageStore.shared
+
+    private var shouldShowKiroUsage: Bool {
+        if kiroAccount.snapshot != nil { return true }
+        guard let usage = appState.kiroUsage else { return false }
+        return !(usage.last5h.isEmpty && usage.today.isEmpty) || usage.unreadableFiles > 0
+    }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
         let usage = UsageFooterText.shownUsage(appState.claudeUsage, enabled: showUsageStats)
         let snapshot = appState.claudeQuota.snapshot
         let error = appState.claudeQuota.lastError
@@ -3462,6 +3477,28 @@ private struct SessionListFooter: View {
         }
         if content.quotaMessage, let error {
             QuotaFooterMessage(error: error)
+        }
+        if showUsageStats, shouldShowKiroUsage {
+            KiroUsageFooterLine(usage: appState.kiroUsage, account: kiroAccount.snapshot)
+        }
+        if showUsageStats, codexQuota.profile.accessKind != .unknown {
+            CodexQuotaFooterLine(store: codexQuota)
+        }
+        }
+        .onAppear {
+            if showUsageStats {
+                codexQuota.startAutoRefresh()
+                kiroAccount.startAutoRefresh()
+            }
+        }
+        .onChange(of: showUsageStats) { _, enabled in
+            if enabled {
+                codexQuota.startAutoRefresh()
+                kiroAccount.startAutoRefresh()
+            } else {
+                codexQuota.stopAutoRefresh()
+                kiroAccount.stopAutoRefresh()
+            }
         }
     }
 }
@@ -3541,7 +3578,7 @@ private struct QuotaFooterLine: View {
                         .offset(x: Self.barWidth * elapsed - 0.5)
                 }
             }
-            .frame(width: Self.barWidth, height: 5)
+           .frame(width: Self.barWidth, height: 5)
             Text(ClaudeQuotaFormat.percent(limit.percent))
                 .fontWeight(.semibold)
                 .foregroundStyle(color)
@@ -3586,7 +3623,7 @@ private struct QuotaFooterMessage: View {
     }
 }
 
-/// Token totals from the local Claude transcripts, in words: "Claude · last
+// Token totals from the local Claude transcripts, in words: "Claude · last
 /// 5h: 422K in · 96K out   Today: 922K in · 233K out". "In" is billed input
 /// (new input + cache writes); the tooltip breaks it down.
 private struct UsageFooterLine: View {
@@ -3599,7 +3636,7 @@ private struct UsageFooterLine: View {
         let tooltip = UsageFooterText.usageTooltip(usage, l10n: l10n)
         HStack(alignment: .firstTextBaseline, spacing: 5) {
             Image(systemName: "gauge.with.needle")
-                .font(.system(size: 9, weight: .semibold))
+               .font(.system(size: 9, weight: .semibold))
             // A long translation ("Eingabe" / "Ausgabe") sheds the "Claude ·"
             // lead, then takes a second line rather than cut a number off.
             ViewThatFits(in: .horizontal) {
@@ -3627,7 +3664,7 @@ private struct UsageFooterLine: View {
         .font(.system(size: 10, weight: .medium, design: .monospaced))
         .foregroundStyle(.white.opacity(0.6))
         .padding(.horizontal, 14)
-        .padding(.top, 5)
+       .padding(.top, 5)
         .padding(.bottom, 8)
         .contentShape(Rectangle())
         .help(tooltip)
@@ -3649,6 +3686,157 @@ private struct UsageFooterLine: View {
         }
     }
 }
+
+private struct KiroUsageFooterLine: View {
+    let usage: KiroUsageScanner.Snapshot?
+    let account: KiroAccountUsageSnapshot?
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "gauge.with.needle")
+            Text("Kiro").fontWeight(.semibold)
+            if let account {
+                Text("本周期 \(exact(account.currentUsage))/\(exact(account.usageLimit)) credits")
+                Text("·").foregroundStyle(.white.opacity(0.25))
+                Text("\(String(format: "%.1f", account.percentageUsed))%")
+                    .foregroundStyle(account.currentUsage > account.usageLimit ? .orange.opacity(0.8) : .white.opacity(0.45))
+                Text("·").foregroundStyle(.white.opacity(0.25))
+                Text("今日 \(todayCredits) credits")
+                if accountAgeMinutes(account) > 12 * 60 {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange.opacity(0.8))
+                        .help("Kiro 账户额度缓存已超过 12 小时；打开 Kiro IDE 或运行 /usage 刷新")
+                }
+            } else if let usage {
+                Text("本地 credits 5h \(KiroUsageScanner.formatCredits(usage.last5h.credits))")
+                Text("·").foregroundStyle(.white.opacity(0.25))
+                Text("今日 \(exact(usage.today.credits)) credits")
+            }
+            Spacer()
+            if let notice = usage?.notice {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange.opacity(0.8))
+                    .help(notice)
+            }
+        }
+        .font(.system(size: 10, weight: .medium, design: .monospaced))
+        .foregroundStyle(.white.opacity(0.45))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 5)
+        .help(detail)
+    }
+
+    private func exact(_ credits: Double) -> String {
+        String(format: "%.2f", credits)
+    }
+
+    private var todayCredits: String {
+        guard let usage else { return "—" }
+        return exact(usage.today.credits)
+    }
+
+    private func accountAgeMinutes(_ snapshot: KiroAccountUsageSnapshot) -> Int {
+        guard let updated = snapshot.sourceUpdatedAt else { return Int.max }
+        return max(0, Int(Date().timeIntervalSince(updated) / 60))
+    }
+
+    private var detail: String {
+        var lines: [String] = []
+        if let account {
+            let age = account.sourceUpdatedAt.map { max(0, Int(Date().timeIntervalSince($0) / 60)) }
+            let freshness = age.map { minutes in
+                minutes > 12 * 60 ? "缓存已过期（\(minutes / 60)h 前）" : "缓存 \(minutes)m 前"
+            } ?? "缓存时间未知"
+            lines.append("账户周期: \(exact(account.currentUsage)) / \(exact(account.usageLimit)) credits · 超额 \(exact(max(0, account.currentOverages))) · \(freshness)")
+        }
+        if let usage {
+            lines.append("本地 IDE + CLI: 5h \(KiroUsageScanner.formatCredits(usage.last5h.credits)) · 今日 \(KiroUsageScanner.formatCredits(usage.today.credits))")
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+private struct CodexQuotaFooterLine: View {
+    @ObservedObject var store: CodexQuotaStore
+    @ObservedObject private var l10n = L10n.shared
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "chart.bar.xaxis")
+                .font(.system(size: 9, weight: .semibold))
+            Text(displayText)
+                .lineLimit(1)
+            Spacer()
+        }
+        .font(.system(size: 10, weight: .medium, design: .monospaced))
+        .foregroundStyle(.white.opacity(0.45))
+        .padding(.horizontal, 14)
+        .padding(.vertical, 5)
+        .help(helpText)
+    }
+
+    private var displayText: String {
+        if store.isLoading, store.snapshot == nil { return l10n["codex_quota_loading"] }
+        switch store.profile.accessKind {
+        case .apiRouter:
+            let provider = store.displayProvider ?? "router"
+            return String(format: l10n["codex_quota_router"], "\(provider) · \(localSummary)")
+        case .apiKey:
+            let label = l10n["codex_quota_api_key"]
+            return String(format: label, localSummary)
+        case .officialSubscription:
+            if let snapshot = store.snapshot {
+                return String(format: l10n["codex_quota_official"],
+                              windowSummary(snapshot.fiveHour), windowSummary(snapshot.weekly))
+            }
+            if store.error == .authenticationRequired { return l10n["codex_quota_auth_required"] }
+            return l10n["codex_quota_unavailable"]
+        case .unknown:
+            return l10n["codex_quota_unavailable"]
+        }
+    }
+
+    private var helpText: String {
+        switch store.profile.accessKind {
+        case .apiRouter, .apiKey:
+            return "Codex quota is controlled by the configured provider; only local usage is available."
+        case .officialSubscription:
+            if let error = store.error {
+                return "Codex official subscription quota; last refresh failed: \(String(describing: error))"
+            }
+            return "Codex official subscription quota when the usage endpoint is available."
+        case .unknown:
+            return "Codex runtime source could not be identified."
+        }
+    }
+
+    private func percent(_ window: CodexQuotaWindow) -> String {
+        guard let used = window.usedPercent else { return "—" }
+        return "\(Int((used * 100).rounded()))%"
+    }
+
+    private func windowSummary(_ window: CodexQuotaWindow) -> String {
+        guard let resetAt = window.resetAt else { return percent(window) }
+        let seconds = max(0, Int(resetAt.timeIntervalSinceNow.rounded()))
+        let days = seconds / 86_400
+        let hours = (seconds % 86_400) / 3_600
+        let minutes = (seconds % 3_600) / 60
+        let reset = days > 0 ? "\(days)d \(hours)h" : "\(hours)h \(minutes)m"
+        return "\(percent(window)) · \(reset)"
+    }
+
+    private var localSummary: String {
+        guard let usage = store.localUsage?.usage(for: store.profile.accessKind) else {
+            return store.localUsageLoading ? "local syncing" : "local 0"
+        }
+        return "local 5h \(compact(usage.last5h))"
+    }
+
+    private func compact(_ totals: CodexUsageTotals) -> String {
+        "\(CodexUsageScanner.formatTokens(totals.totalTokens)) tok"
+    }
+}
+
 
 /// Trailing-hours output-token activity, one 2.5pt bar per hour (right = now).
 private struct UsageSparkline: View {
