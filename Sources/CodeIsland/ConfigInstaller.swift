@@ -1225,9 +1225,9 @@ struct ConfigInstaller {
                     id: "cli-kiro-v3",
                     title: "Kiro v3 standalone",
                     detail: v3Configured
-                        ? "配置已安装；当前 kiro-cli 2.21.0 --v3 未触发 hook，待运行时支持"
+                        ? "配置已安装（仅每轮开始和结束）"
                         : "配置缺失：~/.kiro/hooks/codeisland.json",
-                    severity: v3Configured ? .manual : .needsRepair
+                    severity: v3Configured ? .healthy : .needsRepair
                 ))
             }
         }
@@ -1461,30 +1461,36 @@ struct ConfigInstaller {
     // MARK: - Kiro CLI v3 standalone hooks
 
     private static let kiroV3Events: [(String, String, Int)] = [
-        // Kiro CLI's standalone hook reference uses AgentSpawn for the CLI
-        // startup event (SessionStart is the IDE-facing spelling).
-        ("AgentSpawn", "agent-spawn", 5),
+        // Kiro IDE renders every command hook in chat, so keep only turn boundaries.
         ("UserPromptSubmit", "user-prompt-submit", 5),
-        ("PreToolUse", "pre-tool-use", 5),
-        ("PostToolUse", "post-tool-use", 5),
         ("Stop", "stop", 5),
     ]
 
     /// The v3 event contract is kept internal so unit tests can lock the
     /// schema without writing into the user's home directory.
     static var kiroV3EventNames: [String] { kiroV3Events.map(\.0) }
+
     static func kiroV3HookEntry(trigger: String, name: String, command: String, timeout: Int) -> [String: Any] {
-        var entry: [String: Any] = [
+        [
             "name": "codeisland-\(name)",
             "trigger": trigger,
             "action": ["type": "command", "command": command],
             "timeout": timeout,
             "enabled": true,
         ]
-        if trigger == "PreToolUse" || trigger == "PostToolUse" {
-            entry["matcher"] = ".*"
-        }
-        return entry
+    }
+
+    private static func isManagedKiroV3Hook(_ entry: [String: Any]) -> Bool {
+        guard let action = entry["action"] as? [String: Any],
+              let command = action["command"] as? String else { return false }
+        return command.contains("codeisland-bridge") && command.contains("--source kiro")
+    }
+
+    static func kiroV3Hooks(replacingManaged hooks: [[String: Any]], command: String) -> [[String: Any]] {
+        hooks.filter { !isManagedKiroV3Hook($0) }
+            + kiroV3Events.map { trigger, name, timeout in
+                kiroV3HookEntry(trigger: trigger, name: name, command: command, timeout: timeout)
+            }
     }
 
     @discardableResult
@@ -1506,18 +1512,8 @@ struct ConfigInstaller {
         root["name"] = root["name"] ?? "codeisland"
         root["version"] = root["version"] ?? "v1"
         guard (root["version"] as? String) == "v1" else { return false }
-        var hooks = root["hooks"] as? [[String: Any]] ?? []
-        hooks.removeAll { entry in
-            guard let action = entry["action"] as? [String: Any],
-                  let command = action["command"] as? String else { return false }
-            return command.contains("codeisland-bridge") && command.contains("--source kiro")
-        }
-
         let command = "\(bridgeCommand) --source kiro"
-        for (trigger, name, timeout) in kiroV3Events {
-            hooks.append(kiroV3HookEntry(trigger: trigger, name: name, command: command, timeout: timeout))
-        }
-        root["hooks"] = hooks
+        root["hooks"] = kiroV3Hooks(replacingManaged: root["hooks"] as? [[String: Any]] ?? [], command: command)
         guard JSONSerialization.isValidJSONObject(root),
               let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]) else {
             return false
@@ -1535,18 +1531,20 @@ struct ConfigInstaller {
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               (root["version"] as? String) == "v1",
               let hooks = root["hooks"] as? [[String: Any]] else { return false }
-        let command = "\(bridgeCommand) --source kiro"
+        return kiroV3HooksInstalled(hooks, command: "\(bridgeCommand) --source kiro")
+    }
+
+    static func kiroV3HooksInstalled(_ hooks: [[String: Any]], command: String) -> Bool {
+        let managed = hooks.filter { isManagedKiroV3Hook($0) }
+        guard managed.count == kiroV3Events.count else { return false }
         return kiroV3Events.allSatisfy { trigger, _, _ in
-            hooks.contains { entry in
+            managed.contains { entry in
                 guard entry["trigger"] as? String == trigger,
                       let action = entry["action"] as? [String: Any],
                       action["type"] as? String == "command",
                       action["command"] as? String == command,
                       (entry["enabled"] as? Bool) != false else { return false }
-                if trigger == "PreToolUse" || trigger == "PostToolUse" {
-                    return entry["matcher"] as? String == ".*"
-                }
-                return true
+                return entry["matcher"] == nil
             }
         }
     }
@@ -1560,11 +1558,7 @@ struct ConfigInstaller {
         guard let data = fm.contents(atPath: kiroV3HooksPath),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let hooks = root["hooks"] as? [[String: Any]] else { return }
-        let remaining = hooks.filter { entry in
-            guard let action = entry["action"] as? [String: Any],
-                  let command = action["command"] as? String else { return true }
-            return !(command.contains("codeisland-bridge") && command.contains("--source kiro"))
-        }
+        let remaining = hooks.filter { !isManagedKiroV3Hook($0) }
         var updated = root
         updated["hooks"] = remaining
         if let output = try? JSONSerialization.data(withJSONObject: updated, options: [.prettyPrinted, .sortedKeys]) {

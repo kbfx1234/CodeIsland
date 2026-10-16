@@ -74,6 +74,12 @@ public struct SessionSnapshot: Sendable {
         "stepfun",
         "antigravity",
         "google-antigravity",
+        // Kiro is an Electron IDE whose helper processes sit in the ancestry of
+        // anything launched from its integrated terminal, and the loose
+        // `/<source>` default rule matches every one of them via "/kiro". It
+        // reports itself through `--source kiro` from its own hooks, so it never
+        // needs ancestry inference either.
+        "kiro",
     ]
 
     public var status: AgentStatus = .idle
@@ -362,6 +368,18 @@ public struct SessionSnapshot: Sendable {
     }
 
     public mutating func addRecentMessage(_ msg: ChatMessage, maxCount: Int = 3) {
+        // A single logical reply can arrive through more than one provider
+        // channel (for example Codex's Stop hook and JSONL transcript). Keep
+        // the append operation idempotent for an immediately repeated row,
+        // while still allowing the same text in a later turn.
+        if let last = recentMessages.last,
+           last.isUser == msg.isUser,
+           last.text == msg.text {
+            if recentMessages.count > maxCount {
+                recentMessages.removeFirst(recentMessages.count - maxCount)
+            }
+            return
+        }
         recentMessages.append(msg)
         if recentMessages.count > maxCount {
             recentMessages.removeFirst(recentMessages.count - maxCount)

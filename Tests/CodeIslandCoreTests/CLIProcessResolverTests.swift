@@ -84,6 +84,103 @@ final class CLIProcessResolverTests: XCTestCase {
         XCTAssertEqual(pid, 12345)
     }
 
+    // MARK: - fallbackSessionPID (GUI host ghost cards)
+
+    /// Real repro: a `--source kiro` event with no session_id. Kiro is an
+    /// Electron IDE, so the loose `/<source>` rule matches its GUI binary, and
+    /// `ancestry.last` deliberately picks the root-most one — which is the app's
+    /// main process (ppid 1, alive across every window and workspace). Keying a
+    /// session on that PID produced one global ghost card that every
+    /// session-id-less Kiro event landed on, sitting beside the real cards.
+    func testFallbackSessionPIDRefusesGUIHostAncestry() {
+        let ancestry: [(pid: Int32, executablePath: String?)] = [
+            (69036, "/Applications/Kiro.app/Contents/Frameworks/Kiro Helper (Plugin).app/Contents/MacOS/Kiro Helper (Plugin)"),
+            (2360, "/Applications/Kiro.app/Contents/MacOS/Kiro"),
+        ]
+        XCTAssertNil(
+            CLIProcessResolver.fallbackSessionPID(
+                immediateParentPID: 69036, source: "kiro", ancestry: ancestry
+            ),
+            "A GUI host PID cannot identify a session — the event must be dropped"
+        )
+    }
+
+    /// Refusing must not degrade to the immediate parent: that mints a fresh id
+    /// per invoking shell, trading one persistent ghost for an endless trickle
+    /// of orphans.
+    func testFallbackSessionPIDDoesNotDegradeToShellForGUIHost() {
+        let ancestry: [(pid: Int32, executablePath: String?)] = [
+            (99999, "/bin/zsh"),
+            (2861, "/Applications/Kiro.app/Contents/Frameworks/Kiro Helper.app/Contents/MacOS/Kiro Helper"),
+            (2360, "/Applications/Kiro.app/Contents/MacOS/Kiro"),
+        ]
+        XCTAssertNil(CLIProcessResolver.fallbackSessionPID(
+            immediateParentPID: 99999, source: "kiro", ancestry: ancestry
+        ))
+    }
+
+    /// #148 must not regress: `cursor-agent` is a real CLI binary (one process
+    /// per session), so its PID stays a valid identity even though Cursor is
+    /// also a desktop IDE.
+    func testFallbackSessionPIDStillCollapsesRealCLISubAgents() {
+        let ancestry: [(pid: Int32, executablePath: String?)] = [
+            (12345, "/Users/u/.cursor/agent/sub-agent"),
+            (5000, "/Users/u/.local/share/cursor-agent/versions/1.0/cursor-agent"),
+        ]
+        XCTAssertEqual(
+            CLIProcessResolver.fallbackSessionPID(
+                immediateParentPID: 12345, source: "cursor-cli", ancestry: ancestry
+            ),
+            5000
+        )
+    }
+
+    /// No source match at all — keep the historical degradation to the immediate
+    /// parent. Non-IDE CLIs without a stable session id depend on it.
+    func testFallbackSessionPIDKeepsImmediateParentWhenNoSourceMatch() {
+        let ancestry: [(pid: Int32, executablePath: String?)] = [
+            (12345, "/bin/sh"),
+            (5000, "/usr/bin/login"),
+        ]
+        XCTAssertEqual(
+            CLIProcessResolver.fallbackSessionPID(
+                immediateParentPID: 12345, source: "cursor-cli", ancestry: ancestry
+            ),
+            12345
+        )
+    }
+
+    /// A CLI shipped inside an app bundle's Resources (Codex Desktop) is still
+    /// one process per session — only MacOS/ and Frameworks/ are GUI hosts.
+    func testGUIHostDetectionSpareBundledCLIBinaries() {
+        XCTAssertTrue(CLIProcessResolver.isGUIApplicationHostPath(
+            "/Applications/Kiro.app/Contents/MacOS/Kiro"))
+        XCTAssertTrue(CLIProcessResolver.isGUIApplicationHostPath(
+            "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper"))
+
+        XCTAssertFalse(CLIProcessResolver.isGUIApplicationHostPath(
+            "/Applications/ChatGPT.app/Contents/Resources/codex"))
+        XCTAssertFalse(CLIProcessResolver.isGUIApplicationHostPath(
+            "/Users/u/.local/share/cursor-agent/versions/1.0/cursor-agent"))
+        XCTAssertFalse(CLIProcessResolver.isGUIApplicationHostPath("/bin/zsh"))
+        XCTAssertFalse(CLIProcessResolver.isGUIApplicationHostPath(nil))
+    }
+
+    /// Kiro belongs in `ideHostSources`: its helper processes sit in the
+    /// ancestry of anything started from its integrated terminal, and the
+    /// default `/<source>` rule matches all of them via "/kiro". Without this,
+    /// a source-less CLI run from Kiro's terminal is attributed to kiro (#220).
+    func testInferSourceIgnoresKiroIDEHostForSourcelessCLI() {
+        XCTAssertTrue(SessionSnapshot.ideHostSources.contains("kiro"))
+
+        let ancestry: [(pid: Int32, executablePath: String?)] = [
+            (4321, "/opt/homebrew/bin/node"),
+            (2861, "/Applications/Kiro.app/Contents/Frameworks/Kiro Helper.app/Contents/MacOS/Kiro Helper"),
+            (2360, "/Applications/Kiro.app/Contents/MacOS/Kiro"),
+        ]
+        XCTAssertNil(CLIProcessResolver.inferSource(ancestry: ancestry))
+    }
+
     // MARK: - inferSource (#220 / #95)
 
     /// #220: Claude Code launched inside Cursor's integrated terminal fires the
