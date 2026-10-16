@@ -1351,6 +1351,9 @@ final class AppState {
     }
 
     func refreshKiroUsageIfStale() {
+        // Test-created AppStates must never scan the user's session store.
+        // Scanner tests supply their own temporary kiroHome explicitly.
+        guard !RuntimeEnvironment.isRunningTests else { return }
         guard UserDefaults.standard.bool(forKey: SettingsKey.showUsageStats) else { return }
         guard !kiroUsageScanInFlight else { return }
         if let scannedAt = kiroUsage?.scannedAt, Date().timeIntervalSince(scannedAt) < 120 { return }

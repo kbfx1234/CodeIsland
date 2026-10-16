@@ -78,6 +78,24 @@ struct TerminalActivator {
         return false
     }
 
+    static func codexDesktopThreadURL(providerSessionId: String?) -> URL? {
+        guard var identifier = providerSessionId?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return nil
+        }
+        if identifier.hasPrefix("codexapp:") {
+            identifier.removeFirst("codexapp:".count)
+        }
+        guard !identifier.isEmpty,
+              identifier.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_"
+              }) else { return nil }
+        var components = URLComponents()
+        components.scheme = "codex"
+        components.host = "threads"
+        components.path = "/\(identifier)"
+        return components.url
+    }
+
     /// Bundle IDs of apps that have both APP and CLI modes.
     /// When termBundleId matches, bring that app to front;
     /// otherwise fall through to terminal tab-matching.
@@ -156,6 +174,12 @@ struct TerminalActivator {
             return
         }
         if allowHerdr && activateHerdrIfAvailable(session: session, sessionId: sessionId) {
+            return
+        }
+
+        if session.source == "codex", session.termBundleId == AppState.codexAppBundleId,
+           let url = codexDesktopThreadURL(providerSessionId: session.providerSessionId),
+           NSWorkspace.shared.open(url) {
             return
         }
 

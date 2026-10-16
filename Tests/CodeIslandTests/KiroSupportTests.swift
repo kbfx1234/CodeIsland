@@ -8,6 +8,22 @@ import CodeIslandCore
 /// supported-source recognition, and the new `.kiroAgent` HookFormat.
 final class KiroSupportTests: XCTestCase {
 
+    func testStandaloneHooksInstallAndUpgradeInATemporaryKiroHome() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        XCTAssertTrue(ConfigInstaller.installKiroV3Hooks(fm: fm, kiroRoot: root.path))
+        let file = root.appendingPathComponent("hooks/codeisland.json")
+        let data = try Data(contentsOf: file)
+        XCTAssertTrue(ConfigInstaller.installKiroV3Hooks(fm: fm, kiroRoot: root.path))
+        let upgraded = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any]
+        let original = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        XCTAssertEqual((upgraded?["hooks"] as? [[String: Any]])?.count, 2)
+        XCTAssertEqual(upgraded?["version"] as? String, original?["version"] as? String)
+        XCTAssertFalse(fm.fileExists(atPath: root.appendingPathComponent("agents/cmux.json").path))
+    }
+
     // MARK: - EventNormalizer
 
     func testEventNormalizerMapsKiroAgentSpawnToSessionStart() {

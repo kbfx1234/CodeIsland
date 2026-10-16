@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.38</string>
+	<string>1.2.0-beta.1</string>
 	<key>CFBundleVersion</key>
-	<string>1.0.38</string>
+	<string>2026101601</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppTransportSecurity</key>
@@ -38,9 +38,9 @@
 	<key>SUAutomaticallyUpdate</key>
 	<false/>
 	<key>SUEnableAutomaticChecks</key>
-	<true/>
+	<false/>
 	<key>SUFeedURL</key>
-	<string>https://raw.githubusercontent.com/wxtsky/CodeIsland/main/appcast.xml</string>
+	<string>https://raw.githubusercontent.com/kbfx1234/CodeIsland/main/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>oqLtx5s2hc8Xgsp4rEuTwnQ8UGRT4ma4tjlf+1i3YHA=</string>
 	<key>SUScheduledCheckInterval</key>

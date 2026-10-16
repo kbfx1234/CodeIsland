@@ -587,6 +587,7 @@ class HookServer {
     }
 
     private func routeSubsessionPayloadIfNeeded(data: Data) -> (processedData: Data, responseData: Data?) {
+        let data = Self.canonicalizeCodexDesktopHookPayload(data: data)
         let mayNeedPluginOrCodex = data.range(of: Self.pluginMarkerBytes) != nil
             || (data.range(of: Self.sourceMarkerBytes) != nil && data.range(of: Self.codexMarkerBytes) != nil)
         let mayNeedCursorTranscript = Self.mayNeedCursorSubsessionRouting(data: data)

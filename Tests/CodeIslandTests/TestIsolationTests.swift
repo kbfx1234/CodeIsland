@@ -51,6 +51,23 @@ final class TestIsolationTests: XCTestCase {
         XCTAssertEqual(AppState.discoveryScanner().count, 0)
     }
 
+    @MainActor
+    func testAutomaticKiroRefreshDoesNotReadTheUsersSessionStore() async {
+        let previous = UserDefaults.standard.object(forKey: SettingsKey.showUsageStats)
+        UserDefaults.standard.set(true, forKey: SettingsKey.showUsageStats)
+        defer {
+            if let previous {
+                UserDefaults.standard.set(previous, forKey: SettingsKey.showUsageStats)
+            } else {
+                UserDefaults.standard.removeObject(forKey: SettingsKey.showUsageStats)
+            }
+        }
+        let state = AppState()
+        state.refreshKiroUsageIfStale()
+        await Task.yield()
+        XCTAssertNil(state.kiroUsage)
+    }
+
     func testHookInstallsNeverStartTheUsersClaude() {
         // Installing Claude Code hooks asks for its version, which the app
         // gets by running `claude --version`.

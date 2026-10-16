@@ -16,6 +16,19 @@ final class HookServerCodexCanonicalizationTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: rewritten) as? [String: Any])
     }
 
+    func testRequestRoutingAppliesDesktopCanonicalization() throws {
+        let transcript = try makeTranscript(firstLine: #"{"type":"session_meta","payload":{"originator":"Codex Desktop","source":"vscode"}}"#)
+        defer { try? FileManager.default.removeItem(at: transcript) }
+        let server = HookServer(appState: AppState())
+        let data = try JSONSerialization.data(withJSONObject: [
+            "hook_event_name": "SessionStart", "session_id": "desktop-thread",
+            "_source": "codex", "transcript_path": transcript.path,
+        ])
+        let routed = server.routeSubsessionPayloadIfNeededForTesting(data: data)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: routed.processedData) as? [String: Any])
+        XCTAssertEqual(payload["_term_bundle"] as? String, AppState.codexAppBundleId)
+    }
+
     func testDesktopTranscriptWithoutTerminalMarkerGetsCodexAppBundle() throws {
         let transcript = try makeTranscript(firstLine: #"{"type":"session_meta","payload":{"originator":"Codex Desktop","source":"vscode"}}"#)
         defer { try? FileManager.default.removeItem(at: transcript) }

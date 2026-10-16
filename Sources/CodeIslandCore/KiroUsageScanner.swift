@@ -103,7 +103,9 @@ public enum KiroUsageScanner {
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
         let files = FileManager.default.enumerator(
             at: sessions, includingPropertiesForKeys: Array(keys),
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            // Package classification consults LaunchServices and can block all
+            // concurrent scans. This tree contains plain session records.
+            options: [.skipsHiddenFiles]
         )
         while let url = files?.nextObject() as? URL {
             let isCLI = url.pathExtension == "json"

@@ -37,10 +37,7 @@ final class KiroAccountUsageStoreTests: XCTestCase {
         ])
         let store = KiroAccountUsageStore(dataReader: { data })
         store.refresh()
-        for _ in 0..<1000 {
-            if store.snapshot != nil { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        await waitUntil("Kiro cache refresh did not finish") { !store.isLoading }
         XCTAssertNotNil(store.snapshot)
         XCTAssertEqual(store.snapshot?.currentUsage ?? 0, 5316.10, accuracy: 0.0001)
         XCTAssertEqual(store.snapshot?.usageLimit ?? 0, 5000, accuracy: 0.0001)
@@ -50,10 +47,7 @@ final class KiroAccountUsageStoreTests: XCTestCase {
     func testRefreshDoesNotKeepStaleSnapshotWhenCacheIsUnavailable() async throws {
         let store = KiroAccountUsageStore(dataReader: { nil })
         store.refresh()
-        for _ in 0..<1000 {
-            if !store.isLoading { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        await waitUntil("Kiro cache refresh did not finish") { !store.isLoading }
         XCTAssertNil(store.snapshot)
         XCTAssertEqual(store.error, "Kiro account usage cache unavailable")
     }
@@ -64,10 +58,7 @@ final class KiroAccountUsageStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: path) }
         let store = KiroAccountUsageStore(databasePathProvider: { path })
         store.refresh()
-        for _ in 0..<1000 {
-            if store.snapshot != nil { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        await waitUntil("Kiro cache refresh did not finish") { !store.isLoading }
         XCTAssertEqual(store.snapshot?.currentUsage ?? 0, 5415.95, accuracy: 0.0001)
         XCTAssertNil(store.error)
     }

@@ -1130,6 +1130,9 @@ struct ConfigInstaller {
             }
         }
 
+        // Kiro v3 reads standalone hooks separately from the v2 agent profile.
+        if isEnabled(source: "kiro"), !installKiroV3Hooks(fm: fm) { ok = false }
+
         // Extra config roots registered in Settings → Hooks. A root that is gone
         // or no longer looks like the CLI's is skipped (its row says why) and
         // does not fail the reinstall; only a failed write does.
@@ -1174,6 +1177,7 @@ struct ConfigInstaller {
 
     static func uninstall() {
         let fm = FileManager.default
+        uninstallKiroV3Hooks(fm: fm)
         try? fm.removeItem(atPath: hookScriptPath)
         try? fm.removeItem(atPath: bridgePath)
         // Also clean up legacy paths (#32)
@@ -1527,6 +1531,10 @@ struct ConfigInstaller {
     /// Check all installed CLIs and repair missing hooks. Returns names of repaired CLIs.
     static func verifyAndRepair() -> [String] {
         let fm = FileManager.default
+        backupHookConfigsForRepair(fm: fm)
+        if isEnabled(source: "kiro"), !isKiroV3HooksInstalled(fm: fm) {
+            _ = installKiroV3Hooks(fm: fm)
+        }
         // Ensure bridge binary and hook script are current
         installBridgeBinary(fm: fm)
         installHookScript(fm: fm)
@@ -1716,9 +1724,10 @@ struct ConfigInstaller {
     }
 
     @discardableResult
-    private static func installKiroV3Hooks(fm: FileManager) -> Bool {
-        let kiroRoot = NSHomeDirectory() + "/.kiro"
+    static func installKiroV3Hooks(fm: FileManager, kiroRoot: String = NSHomeDirectory() + "/.kiro") -> Bool {
         guard fm.fileExists(atPath: kiroRoot) else { return true }
+        let kiroV3HooksDir = kiroRoot + "/hooks"
+        let kiroV3HooksPath = kiroV3HooksDir + "/codeisland.json"
         try? fm.createDirectory(atPath: kiroV3HooksDir, withIntermediateDirectories: true)
 
         if fm.fileExists(atPath: kiroV3HooksPath) {

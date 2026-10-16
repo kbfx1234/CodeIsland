@@ -61,13 +61,13 @@ final class KiroAccountUsageStore: ObservableObject {
         lastAttempt = Date()
         isLoading = true
         refreshTask = Task { [weak self] in
-            let result: (KiroAccountUsageSnapshot?, String?) = {
+            let result: (KiroAccountUsageSnapshot?, String?) = await Task.detached(priority: .utility) {
                 guard let data = reader() else { return (nil, "Kiro account usage cache unavailable") }
                 guard let snapshot = KiroAccountUsageParser.parse(data: data) else {
                     return (nil, "Kiro account usage cache format not recognized")
                 }
                 return (snapshot, nil)
-            }()
+            }.value
             guard !Task.isCancelled, let self else { return }
             self.snapshot = result.0
             self.error = result.1
