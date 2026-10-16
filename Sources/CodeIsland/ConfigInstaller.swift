@@ -169,6 +169,34 @@ struct CustomCLIConfig: Codable, Identifiable, Equatable {
     let configKey: String
 }
 
+// MARK: - Hook health diagnostics
+
+enum HookHealthSeverity: String, Codable, Equatable {
+    case healthy
+    case needsRepair
+    case manual
+}
+
+struct HookHealthItem: Identifiable, Codable, Equatable {
+    let id: String
+    let title: String
+    let detail: String
+    let severity: HookHealthSeverity
+}
+
+struct HookHealthReport: Codable, Equatable {
+    let generatedAt: Date
+    let items: [HookHealthItem]
+
+    var overallSeverity: HookHealthSeverity {
+        if items.contains(where: { $0.severity == .manual }) { return .manual }
+        if items.contains(where: { $0.severity == .needsRepair }) { return .needsRepair }
+        return .healthy
+    }
+
+    var isHealthy: Bool { overallSeverity == .healthy }
+}
+
 struct ConfigInstaller {
     private static let codeislandDir = NSHomeDirectory() + "/.codeisland"
     private static let bridgePath = codeislandDir + "/codeisland-bridge"
@@ -177,6 +205,8 @@ struct ConfigInstaller {
     private static let customCLIConfigsKey = SessionSnapshot.customCLIConfigsKey
     /// Absolute path for external CLI hooks — avoids tilde expansion issues in IDE environments
     private static let bridgeCommand = codeislandDir + "/codeisland-bridge"
+    private static let kiroV3HooksDir = NSHomeDirectory() + "/.kiro/hooks"
+    private static let kiroV3HooksPath = kiroV3HooksDir + "/codeisland.json"
     private static let traecliConfigPath = NSHomeDirectory() + "/.trae/traecli.yaml"
     private static let hermesConfigPath = NSHomeDirectory() + "/.hermes/config.yaml"
     private static let zcodeConfigPath = NSHomeDirectory() + "/.zcode/cli/config.json"
