@@ -146,6 +146,11 @@ final class AppState {
     @ObservationIgnored
     var displayOnlyWaitAsks: [String: PushContent] = [:]
 
+    /// Direct Codex child threads are removed after merge. Keep their resolved
+    /// root relationship so nested subagents can still fold into that root.
+    @ObservationIgnored
+    private var codexMergedSubagentRoots: [String: String] = [:]
+
     @ObservationIgnored
     private(set) var recentHookEvents: [DiagnosticHookEvent] = []
     @ObservationIgnored
@@ -343,15 +348,15 @@ final class AppState {
     /// Subscription rate limits (5h / weekly) from Anthropic — opt-in, network.
     let claudeQuota = ClaudeQuotaMonitor()
     /// Process-wide, not per-instance: the scan reads one shared history
-    /// (`~/.claude`), so two concurrent runs are always duplicate work. Production
-    /// has a single AppState and never noticed, but anything constructing several —
-    /// the test bundle does — otherwise starts N cold scans at once on the shared
-    /// `.utility` cooperative pool and starves every other detached probe on it
-    /// (git-branch resolution among them).
+    /// (`~/.claude`), so two concurrent runs are always duplicate work.
     private static var usageScanInFlight = false
+    /// Local Kiro session credits, explicitly not account quota.
+    var kiroUsage: KiroUsageScanner.Snapshot?
+    private var kiroUsageScanInFlight = false
     /// Incremental parse state — round-trips through each detached scan so
     /// growing transcripts are only read past their last consumed offset.
     private var usageFileCache = ClaudeUsageScanner.FileCache()
+    private var kiroUsageFileCache = KiroUsageScanner.FileCache()
 
     /// Glance completion mode: an agent finished while the pill was collapsed —
     /// light the dot instead of expanding. Cleared when the user expands the
@@ -1335,14 +1340,33 @@ final class AppState {
         Task.detached(priority: .utility) {
             var cache = cacheCopy
             let snapshot = ClaudeUsageScanner.scan(claudeHomes: ClaudeConfigPaths.allConfigDirs(), cache: &cache)
-            // Bound to a `let` before the hop: capturing the `var` in the
-            // concurrently-executing closure is an error under Swift 6.
             let scannedCache = cache
             await MainActor.run { [weak self] in
                 self?.claudeUsage = snapshot
                 self?.usageFileCache = scannedCache
                 AppState.usageScanInFlight = false
+                self?.refreshKiroUsageIfStale()
             }
+        }
+    }
+
+    func refreshKiroUsageIfStale() {
+        guard UserDefaults.standard.bool(forKey: SettingsKey.showUsageStats) else { return }
+        guard !kiroUsageScanInFlight else { return }
+        if let scannedAt = kiroUsage?.scannedAt, Date().timeIntervalSince(scannedAt) < 120 { return }
+        let now = Date()
+        let cacheCopy = kiroUsageFileCache
+        kiroUsageScanInFlight = true
+        Task { [weak self] in
+            let result = await Task.detached(priority: .utility) {
+                var cache = cacheCopy
+                let snapshot = KiroUsageScanner.scan(now: now, cache: &cache)
+                return (snapshot, cache)
+            }.value
+            guard !Task.isCancelled else { return }
+            self?.kiroUsage = result.0
+            self?.kiroUsageFileCache = result.1
+            self?.kiroUsageScanInFlight = false
         }
     }
 
@@ -2376,9 +2400,17 @@ final class AppState {
         childTermBundleId: String?
     ) -> String? {
         let childIsDesktop = childTermBundleId == Self.codexAppBundleId
+        let namespace = childIsDesktop ? "desktop" : "cli"
+        var resolvedProviderId = providerSessionId
+        var visited: Set<String> = []
+        while let root = codexMergedSubagentRoots["\(namespace):\(resolvedProviderId)"],
+              root != resolvedProviderId,
+              visited.insert(resolvedProviderId).inserted {
+            resolvedProviderId = root
+        }
         let canonicalId = childIsDesktop
-            ? Self.codexAppSessionPrefix + providerSessionId
-            : providerSessionId
+            ? Self.codexAppSessionPrefix + resolvedProviderId
+            : resolvedProviderId
         if let session = sessions[canonicalId],
            session.source == "codex",
            session.isNativeAppMode == childIsDesktop {
@@ -2386,9 +2418,18 @@ final class AppState {
         }
         return sessions.first(where: { _, snapshot in
             snapshot.source == "codex"
-                && snapshot.providerSessionId == providerSessionId
+                && snapshot.providerSessionId == resolvedProviderId
                 && snapshot.isNativeAppMode == childIsDesktop
         })?.key
+    }
+
+    private func rememberCodexMergedSubagent(
+        providerSessionId: String,
+        rootProviderSessionId: String,
+        isDesktop: Bool
+    ) {
+        let namespace = isDesktop ? "desktop" : "cli"
+        codexMergedSubagentRoots["\(namespace):\(providerSessionId)"] = rootProviderSessionId
     }
 
     func denyPermission(expectedSessionId: String? = nil) {
@@ -3858,8 +3899,39 @@ final class AppState {
 
     /// Merge discovered sessions into current state (skip already-known ones)
     func integrateDiscovered(_ discovered: [DiscoveredSession]) {
-        var didMutate = false
-        for info in discovered {
+        var didMutate = coalesceCodexDesktopTwinSessions()
+        didMutate = removeStaleCodexDesktopSessions(from: discovered) || didMutate
+        var discoveredParents: [String: String] = [:]
+        for info in discovered where info.source == "codex" {
+            guard let parent = info.parentSessionId, !parent.isEmpty else { continue }
+            let child = info.providerSessionId ?? info.sessionId
+            discoveredParents["\(info.termBundleId == Self.codexAppBundleId ? "desktop" : "cli"):\(child)"] = parent
+        }
+        for info in discovered where info.source == "codex" {
+            let child = info.providerSessionId ?? info.sessionId
+            let namespace = info.termBundleId == Self.codexAppBundleId ? "desktop" : "cli"
+            guard var root = discoveredParents["\(namespace):\(child)"] else { continue }
+            var visited: Set<String> = []
+            while let next = discoveredParents["\(namespace):\(root)"],
+                  next != root,
+                  visited.insert(root).inserted {
+                root = next
+            }
+            rememberCodexMergedSubagent(
+                providerSessionId: child,
+                rootProviderSessionId: root,
+                isDesktop: namespace == "desktop"
+            )
+        }
+        let orderedDiscovered = discovered.sorted { lhs, rhs in
+            if lhs.source == "codex", rhs.source == "codex" {
+                let lhsIsSubagent = lhs.parentSessionId?.isEmpty == false
+                let rhsIsSubagent = rhs.parentSessionId?.isEmpty == false
+                if lhsIsSubagent != rhsIsSubagent { return !lhsIsSubagent }
+            }
+            return lhs.modifiedAt < rhs.modifiedAt
+        }
+        for info in orderedDiscovered {
             if shouldSuppressClosedCodexDesktopDiscovery(info) {
                 continue
             }
@@ -4052,6 +4124,41 @@ final class AppState {
         return false
     }
 
+    /// A metadata-only rollout touch can leave an old Desktop card in memory
+    /// after discovery stops returning it. Reconcile those restored cards when
+    /// a full discovery result is available so they do not linger until the
+    /// generic idle timeout.
+    @discardableResult
+    private func removeStaleCodexDesktopSessions(from discovered: [DiscoveredSession]) -> Bool {
+        let discoveredDesktopIds = Set(discovered.compactMap { info -> String? in
+            guard info.source == "codex", info.termBundleId == Self.codexAppBundleId else { return nil }
+            return info.sessionId
+        })
+        // A generic rollout scan may contain only raw/unknown Codex entries;
+        // it cannot establish that Desktop discovery completed, so leave the
+        // existing card alone in that case.
+        guard !discoveredDesktopIds.isEmpty,
+              discovered.contains(where: {
+                  $0.source == "codex"
+                      && $0.termBundleId == Self.codexAppBundleId
+                      && $0.parentSessionId?.isEmpty != false
+              }) else {
+            return false
+        }
+
+        var removed = false
+        for (sessionId, session) in sessions where session.isCodexDesktop {
+            guard session.status == .idle,
+                  processMonitors[sessionId] == nil,
+                  !permissionQueue.contains(where: { ($0.event.sessionId ?? "default") == sessionId }),
+                  !questionQueue.contains(where: { ($0.event.sessionId ?? "default") == sessionId }),
+                  !discoveredDesktopIds.contains(sessionId) else { continue }
+            removeSession(sessionId)
+            removed = true
+        }
+        return removed
+    }
+
     /// Apply runtime fields that filesystem/state-DB discovery can know more
     /// accurately than a stale restored snapshot. Interactive approval/question
     /// states remain authoritative until their owning channel resolves them.
@@ -4153,6 +4260,43 @@ final class AppState {
         )
         var didMutate = false
 
+        // Resolve the complete spawn graph before removing any child cards.
+        // This makes nested subagents independent of discovery order.
+        var metadataByNamespaceAndProvider: [String: CodexSubagentMetadata] = [:]
+        for (sessionId, metadata) in transcriptMetadata {
+            guard let candidate = candidates.first(where: { $0.sessionId == sessionId }) else { continue }
+            let providerId = candidate.session.providerSessionId ?? sessionId
+            let namespace = candidate.session.isNativeAppMode ? "desktop" : "cli"
+            metadataByNamespaceAndProvider["\(namespace):\(providerId)"] = metadata
+        }
+        for (providerId, record) in databaseRecords {
+            metadataByNamespaceAndProvider["desktop:\(providerId)"] = record.metadata
+            metadataByNamespaceAndProvider["cli:\(providerId)"] = record.metadata
+        }
+        for candidate in candidates where candidate.session.source == "codex" {
+            let childProviderId = candidate.session.providerSessionId ?? candidate.sessionId
+            guard let metadata = metadataByNamespaceAndProvider[
+                "\(candidate.session.isNativeAppMode ? "desktop" : "cli"):\(childProviderId)"
+            ] else { continue }
+            var rootProviderId = metadata.parentThreadId
+            var visited: Set<String> = []
+            let namespace = candidate.session.isNativeAppMode ? "desktop" : "cli"
+            while let parentMetadata = metadataByNamespaceAndProvider["\(namespace):\(rootProviderId)"],
+                  parentMetadata.parentThreadId != rootProviderId,
+                  visited.insert(rootProviderId).inserted {
+                rootProviderId = parentMetadata.parentThreadId
+            }
+            rememberCodexMergedSubagent(
+                providerSessionId: metadata.parentThreadId,
+                rootProviderSessionId: rootProviderId,
+                isDesktop: candidate.session.isNativeAppMode
+            )
+            rememberCodexMergedSubagent(
+                providerSessionId: childProviderId,
+                rootProviderSessionId: rootProviderId,
+                isDesktop: candidate.session.isNativeAppMode
+            )
+        }
         for candidate in candidates where candidate.session.source == "codex" {
             let providerSessionId = candidate.session.providerSessionId ?? candidate.sessionId
             guard let metadata = transcriptMetadata[candidate.sessionId]
@@ -4169,13 +4313,28 @@ final class AppState {
                 continue
             }
 
+            var resolvedParentProviderId = metadata.parentThreadId
+            var parentVisited: Set<String> = []
+            let namespace = candidate.session.isNativeAppMode ? "desktop" : "cli"
+            while let parentMetadata = metadataByNamespaceAndProvider[
+                "\(namespace):\(resolvedParentProviderId)"
+            ], parentMetadata.parentThreadId != resolvedParentProviderId,
+                  parentVisited.insert(resolvedParentProviderId).inserted {
+                resolvedParentProviderId = parentMetadata.parentThreadId
+            }
             guard let parentKey = findCodexParentSessionId(
-                providerSessionId: metadata.parentThreadId,
+                providerSessionId: resolvedParentProviderId,
                 childTermBundleId: candidate.session.termBundleId
             ),
                   parentKey != candidate.sessionId else {
                 continue
             }
+
+            rememberCodexMergedSubagent(
+                providerSessionId: providerSessionId,
+                rootProviderSessionId: sessions[parentKey]?.providerSessionId ?? parentKey,
+                isDesktop: candidate.session.isNativeAppMode
+            )
 
             // Preserve the terminal snapshot before removeSession tears down the
             // child card. Transcript lifecycle is authoritative even when the
@@ -4264,6 +4423,13 @@ final class AppState {
             // (child wrongly reused the parent's providerSessionId).
             var parentKey = findSessionId(providerSessionId: parentId) ?? parentId
             if parentKey == candidate.sessionId {
+                // Provider/session identity collision means this card is already
+                // the resolved parent. Do not synthesize a second card under the
+                // raw transcript id; that is what causes main + subagent to show
+                // as duplicate tasks after repeated rounds.
+                if parentId == candidate.sessionId {
+                    continue
+                }
                 parentKey = parentId
             }
             if parentKey == candidate.sessionId { continue }
@@ -4840,6 +5006,12 @@ final class AppState {
         ) else {
             return false
         }
+
+        rememberCodexMergedSubagent(
+            providerSessionId: info.providerSessionId ?? info.sessionId,
+            rootProviderSessionId: sessions[parentKey]?.providerSessionId ?? parentKey,
+            isDesktop: info.termBundleId == Self.codexAppBundleId
+        )
 
         if sessions[info.sessionId] != nil {
             removeSession(info.sessionId)
@@ -7057,6 +7229,24 @@ final class AppState {
         )
     }
 
+    /// Rollout filenames may contain a generated continuation id, while the
+    /// transcript metadata retains the real Codex thread id. Prefer that
+    /// authoritative value for Desktop discovery so one conversation cannot
+    /// become two island cards.
+    nonisolated static func codexTranscriptSessionId(path: String, fallback: String) -> String {
+        guard let line = readFirstLine(path: path),
+              let data = line.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let payload = root["payload"] as? [String: Any],
+              let id = ((payload["source"] as? [String: Any])?["subagent"] != nil
+                ? payload["id"] as? String
+                : payload["session_id"] as? String),
+              !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return fallback
+        }
+        return id
+    }
+
     /// Upgrade pre-namespace persisted Desktop hook cards without touching raw
     /// Codex CLI ids. `termBundleId` is the reliable discriminator retained by
     /// #267-era snapshots.
@@ -7320,6 +7510,23 @@ final class AppState {
             } else {
                 return []
             }
+            // Codex updates `updated_at` and the rollout mtime for metadata-only
+            // writes (for example thread settings). `recency_at` is the user
+            // activity timestamp and must gate whether an idle historical thread
+            // is eligible for discovery.
+            let recencyAtExpression: String?
+            if columns.contains("recency_at_ms"), columns.contains("recency_at") {
+                recencyAtExpression = "COALESCE(NULLIF(recency_at_ms, 0) / 1000.0, recency_at)"
+            } else if columns.contains("recency_at_ms") {
+                recencyAtExpression = "recency_at_ms / 1000.0"
+            } else if columns.contains("recency_at") {
+                recencyAtExpression = "recency_at"
+            } else {
+                // Older state databases have no recency column. Keep their
+                // existing updated_at behavior until they are migrated.
+                recencyAtExpression = nil
+            }
+            let eligibilityExpression = recencyAtExpression ?? updatedAtExpression
             let modelExpression = columns.contains("model") ? "model" : "NULL"
             let spawnColumns = sqliteTableColumns(db: db, tableName: "thread_spawn_edges")
             let hasSpawnStatus = Set(["child_thread_id", "status"]).isSubset(of: spawnColumns)
@@ -7333,17 +7540,18 @@ final class AppState {
                 sql: """
                     SELECT thread.id, thread.rollout_path, thread.cwd,
                            \(updatedAtExpression), \(modelExpression),
-                           \(spawnStatusExpression), thread.source
+                           \(spawnStatusExpression), thread.source,
+                           \(recencyAtExpression ?? "NULL")
                     FROM threads AS thread
                     \(spawnJoin)
                     WHERE thread.archived = 0
-                      AND \(updatedAtExpression) >= ?
+                      AND \(eligibilityExpression) >= ?
                       AND (
                         thread.source = 'vscode'
                         OR thread.source = 'appServer'
                         OR thread.source LIKE '{"subagent"%'
                       )
-                      ORDER BY \(updatedAtExpression) DESC
+                      ORDER BY \(eligibilityExpression) DESC
                       LIMIT 50;
                     """
             ) else { return [] }
@@ -7370,15 +7578,30 @@ final class AppState {
                 }
 
                 let dbUpdatedAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 3))
+                let userActivityAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 7))
                 let fileModifiedAt = (try? fileManager.attributesOfItem(atPath: transcriptPath))?[.modificationDate] as? Date
-                let modifiedAt = max(dbUpdatedAt, fileModifiedAt ?? dbUpdatedAt)
+                let hasUserRecency = recencyAtExpression != nil
+                let activityAt = hasUserRecency ? userActivityAt : dbUpdatedAt
+                let turnStatus = latestCodexTurnStatus(path: transcriptPath)
+                let fileActivityAt = fileModifiedAt ?? dbUpdatedAt
+                let legacyModifiedAt = max(activityAt, fileActivityAt)
+                let isActive: Bool
+                if hasUserRecency {
+                    // A rollout can be touched by settings/metadata writes. It
+                    // is active only when a fresh user-recency value also exists.
+                    guard activityAt >= now.addingTimeInterval(-freshnessWindow) else { continue }
+                    isActive = turnStatus == .processing
+                        && now.timeIntervalSince(fileActivityAt) <= 300
+                } else {
+                    // Pre-recency databases retain the previous behavior.
+                    isActive = turnStatus == .processing
+                        && now.timeIntervalSince(legacyModifiedAt) <= 300
+                }
+                let modifiedAt = isActive ? legacyModifiedAt : activityAt
                 guard modifiedAt >= now.addingTimeInterval(-freshnessWindow) else { continue }
 
                 let dbModel = sqliteColumnString(statement, index: 4)
                 let (transcriptModel, messages) = readRecentFromCodexTranscript(path: transcriptPath)
-                let turnStatus = latestCodexTurnStatus(path: transcriptPath)
-                let isFresh = now.timeIntervalSince(modifiedAt) <= 300
-                let isActive = isFresh && turnStatus == .processing
                 if !isActive,
                    now.timeIntervalSince(modifiedAt) > completionSettleWindow {
                     continue
@@ -7398,6 +7621,19 @@ final class AppState {
             }
             return records
         } ?? []
+    }
+
+    /// Whether a Codex state database has the user-activity timestamp used to
+    /// distinguish a real turn from metadata-only rollout writes.
+    private nonisolated static func codexStateDatabaseHasRecency(
+        statePath: String,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        guard fileManager.fileExists(atPath: statePath) else { return false }
+        return withSQLiteDatabase(at: statePath) { db in
+            let columns = sqliteTableColumns(db: db, tableName: "threads")
+            return columns.contains("recency_at") || columns.contains("recency_at_ms")
+        } ?? false
     }
 
     /// Find active Codex sessions by matching running processes to session files
@@ -7452,6 +7688,17 @@ final class AppState {
         var seenDiscoveryIds: Set<String> = []
         var seenDesktopSessionIds: Set<String> = []
         var claimedUnknownSessionIds: Set<String> = []
+        let hasDesktopProcess = processes.contains(where: { $0.isDesktop })
+        let desktopSessions = hasDesktopProcess ? findRecentCodexDesktopSessions(
+            statePath: statePath,
+            now: now,
+            fileManager: fm
+        ) : []
+        let desktopRecencyIds: Set<String>? = {
+            guard hasDesktopProcess,
+                  codexStateDatabaseHasRecency(statePath: statePath, fileManager: fm) else { return nil }
+            return Set(desktopSessions.compactMap(\.providerSessionId))
+        }()
 
         // Prefer the native host for unknown-origin root rollouts. Explicit CLI
         // and Desktop metadata is filtered below, so concurrent modes remain
@@ -7504,6 +7751,15 @@ final class AppState {
                     rawSessionId: rawSessionId,
                     isDesktop: process.isDesktop
                 )
+                // The process/file scan can see a rollout touched by thread
+                // metadata even when the user has not reopened it. On newer
+                // state DBs, require the same recency-qualified identity used
+                // by the DB discovery path.
+                if process.isDesktop,
+                   let desktopRecencyIds,
+                   !desktopRecencyIds.contains(canonicalRawSessionId) {
+                    continue
+                }
                 guard !seenDiscoveryIds.contains(identity.sessionId) else { continue }
                 let transcriptOrigin = codexTranscriptOrigin(path: file)
                 if transcriptOrigin == .unknown,
@@ -7574,14 +7830,9 @@ final class AppState {
         // Native Codex Desktop / ChatGPT sessions cannot be mapped by process
         // CWD because its app-server runs from `/`. Hydrate recent threads from
         // state_5.sqlite and let transcript activity drive running/idle state.
-        if processes.contains(where: { $0.isDesktop }) {
-            results.append(contentsOf: findRecentCodexDesktopSessions(
-                excluding: seenDesktopSessionIds,
-                statePath: statePath,
-                now: now,
-                fileManager: fm
-            ))
-        }
+        results.append(contentsOf: desktopSessions.filter {
+            !seenDesktopSessionIds.contains($0.providerSessionId ?? $0.sessionId)
+        })
         return results
     }
 
@@ -7737,10 +7988,15 @@ final class AppState {
                 ? "LEFT JOIN threads AS thread ON thread.id = edge.child_thread_id"
                 : ""
 
-            let orderedIds = threadIds.sorted()
             let chunkSize = 200
             var records: [String: CodexSpawnEdgeRecord] = [:]
-            for start in stride(from: 0, to: orderedIds.count, by: chunkSize) {
+            var pendingIds = Array(threadIds)
+            var queriedIds: Set<String> = []
+            while !pendingIds.isEmpty {
+                let orderedIds = pendingIds.filter { !queriedIds.contains($0) }.sorted()
+                pendingIds.removeAll()
+                guard !orderedIds.isEmpty else { break }
+                for start in stride(from: 0, to: orderedIds.count, by: chunkSize) {
                 let end = min(start + chunkSize, orderedIds.count)
                 let chunk = Array(orderedIds[start..<end])
                 let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
@@ -7778,8 +8034,13 @@ final class AppState {
                         status: nonEmptySQLiteColumnString(statement, index: 2),
                         transcriptPath: nonEmptySQLiteColumnString(statement, index: 6)
                     )
+                    if !queriedIds.contains(parent) {
+                        pendingIds.append(parent)
+                    }
                 }
                 sqlite3_finalize(statement)
+                queriedIds.formUnion(chunk)
+            }
             }
             return records
         } ?? [:]
@@ -8263,7 +8524,17 @@ final class AppState {
             combined.append((i, ChatMessage(isUser: false, text: text)))
         }
         combined.sort { $0.0 < $1.0 }
-        let recent = Array(combined.suffix(3).map { $0.1 })
+        var deduplicated: [ChatMessage] = []
+        deduplicated.reserveCapacity(combined.count)
+        for (_, message) in combined {
+            if let last = deduplicated.last,
+               last.isUser == message.isUser,
+               last.text == message.text {
+                continue
+            }
+            deduplicated.append(message)
+        }
+        let recent = Array(deduplicated.suffix(3))
 
         return (turnModel ?? model, recent)
     }
