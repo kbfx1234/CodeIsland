@@ -4122,6 +4122,14 @@ final class AppState {
                     continue
                 }
             }
+            if let canonicalKey = codexDesktopCanonicalKey(for: info),
+               canonicalKey == info.sessionId,
+               let rawProvider = info.providerSessionId,
+               sessions[rawProvider] != nil,
+               reconcileCodexDesktopTwin(rawKey: rawProvider, canonicalKey: canonicalKey, incoming: info) {
+                didMutate = true
+                continue
+            }
 
             // Session already known — try to update PID and attach monitor.
             // Discovery PIDs are heuristic (matched by CWD), so when the session already
