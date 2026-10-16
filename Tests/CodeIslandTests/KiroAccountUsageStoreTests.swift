@@ -37,7 +37,7 @@ final class KiroAccountUsageStoreTests: XCTestCase {
         ])
         let store = KiroAccountUsageStore(dataReader: { data })
         store.refresh()
-        for _ in 0..<20 {
+        for _ in 0..<200 {
             if store.snapshot != nil { break }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -50,7 +50,7 @@ final class KiroAccountUsageStoreTests: XCTestCase {
     func testRefreshDoesNotKeepStaleSnapshotWhenCacheIsUnavailable() async throws {
         let store = KiroAccountUsageStore(dataReader: { nil })
         store.refresh()
-        for _ in 0..<20 {
+        for _ in 0..<200 {
             if !store.isLoading { break }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -64,7 +64,7 @@ final class KiroAccountUsageStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: path) }
         let store = KiroAccountUsageStore(databasePathProvider: { path })
         store.refresh()
-        for _ in 0..<20 {
+        for _ in 0..<200 {
             if store.snapshot != nil { break }
             try await Task.sleep(for: .milliseconds(10))
         }

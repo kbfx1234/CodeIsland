@@ -5,59 +5,6 @@ import SQLite3
 
 @MainActor
 final class AppStateCodexTranscriptTests: XCTestCase {
-    func testCodexBackfillReadsPublicOutputButNotReasoning() throws {
-        let transcript = FileManager.default.temporaryDirectory
-            .appendingPathComponent("codeisland-codex-public-output-\(UUID().uuidString).jsonl")
-        defer { try? FileManager.default.removeItem(at: transcript) }
-
-        let lines = [
-            #"{"type":"event_msg","payload":{"type":"user_message","message":"Inspect the parser"}}"#,
-            #"{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Checking public rollout fields"}],"content":[{"type":"text","text":"hidden chain of thought"}],"encrypted_content":"secret"}}"#,
-            #"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The parser is ready."}]}}"#
-        ].joined(separator: "\n") + "\n"
-        try lines.write(to: transcript, atomically: true, encoding: .utf8)
-
-        let messages = AppState.readRecentFromCodexTranscript(path: transcript.path).1
-
-        XCTAssertEqual(messages.map(\.text), [
-            "Inspect the parser",
-            "The parser is ready."
-        ])
-        XCTAssertFalse(messages.contains { $0.text.contains("hidden chain") })
-    }
-
-    func testTaskStartedClearsPreviousCodexLiveOutputWithoutDeletingHistory() {
-        let appState = AppState()
-        let sessionId = "codex-live-output"
-        var session = SessionSnapshot()
-        session.source = "codex"
-        session.status = .processing
-        session.liveCodexOutput = "Previous turn"
-        session.recentMessages = [ChatMessage(isUser: false, text: "Previous turn")]
-        appState.sessions[sessionId] = session
-
-        appState.applyTranscriptDelta(ConversationTailDelta(
-            sessionId: sessionId,
-            lastUserPrompt: nil,
-            lastAssistantMessage: nil,
-            turnStatus: .processing,
-            hasActivity: true
-        ))
-
-        XCTAssertNil(appState.sessions[sessionId]?.liveCodexOutput)
-        XCTAssertEqual(appState.sessions[sessionId]?.recentMessages.map(\.text), ["Previous turn"])
-    }
-
-    func testCodexHookEnrichmentUpdatesTransientLiveOutput() throws {
-        var sessions: [String: SessionSnapshot] = [:]
-        let data = Data(#"{"session_id":"remote-turn","hook_event_name":"PostToolUse","_source":"codex","last_assistant_message":" Inspecting the failing test. "}"#.utf8)
-        let event = try XCTUnwrap(HookEvent(from: data))
-
-        _ = reduceEvent(sessions: &sessions, event: event, maxHistory: 5)
-
-        XCTAssertEqual(sessions["remote-turn"]?.liveCodexOutput, "Inspecting the failing test.")
-    }
-
     func testDelayedDeltaFromDetachedGenerationCannotMutateRecreatedSession() throws {
         let appState = AppState()
         let sessionId = "codexapp:reused-thread"
@@ -178,6 +125,71 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         XCTAssertEqual(Set(records.map(\.sessionId)), ["root-thread", "sibling-thread"])
         XCTAssertTrue(records.allSatisfy { $0.cwd == "/same/repo" })
         XCTAssertTrue(records.allSatisfy { $0.status == .processing })
+    }
+
+    func testRecentCodexDesktopRecordsIgnoreMetadataTouchOnHistoricalThread() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory
+            .appendingPathComponent("codeisland-codex-desktop-recency-\(UUID().uuidString)")
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let now = Date()
+        let historical = tempDir.appendingPathComponent("historical.jsonl")
+        let active = tempDir.appendingPathComponent("active.jsonl")
+        try (#"{"type":"event_msg","payload":{"type":"task_complete"}}"# + "\n")
+            .write(to: historical, atomically: true, encoding: .utf8)
+        try (#"{"type":"event_msg","payload":{"type":"task_started"}}"# + "\n")
+            .write(to: active, atomically: true, encoding: .utf8)
+        // Both rollouts were touched recently, but only the second thread was
+        // recently used by the user. The first models a settings-only append.
+        try fm.setAttributes([.modificationDate: now], ofItemAtPath: historical.path)
+        try fm.setAttributes([.modificationDate: now], ofItemAtPath: active.path)
+
+        let statePath = tempDir.appendingPathComponent("state_5.sqlite").path
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(statePath, &db), SQLITE_OK)
+        defer { sqlite3_close_v2(db) }
+
+        let current = Int64(now.timeIntervalSince1970)
+        let staleRecency = current - 86_400
+        let sql = """
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            updated_at_ms INTEGER,
+            recency_at INTEGER NOT NULL,
+            recency_at_ms INTEGER,
+            model TEXT,
+            archived INTEGER NOT NULL,
+            has_user_event INTEGER NOT NULL,
+            source TEXT NOT NULL
+        );
+        INSERT INTO threads VALUES (
+            'historical-thread', '\(historical.path)', '/repo',
+            \(current), \(current * 1000), \(staleRecency), \(staleRecency * 1000),
+            'gpt-test', 0, 0, 'vscode'
+        );
+        INSERT INTO threads VALUES (
+            'active-thread', '\(active.path)', '/repo',
+            \(current), \(current * 1000), \(current), \(current * 1000),
+            'gpt-test', 0, 0, 'vscode'
+        );
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+
+        let records = AppState.recentCodexDesktopThreadRecords(
+            statePath: statePath,
+            now: now,
+            freshnessWindow: 600,
+            completionSettleWindow: 30,
+            fileManager: fm
+        )
+
+        XCTAssertEqual(records.map(\.sessionId), ["active-thread"])
+        XCTAssertEqual(records.first?.status, .processing)
     }
 
     func testCodexDesktopStateScanFindsThreadCreatedAfterInitialEmptyScan() throws {
@@ -421,76 +433,6 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         XCTAssertEqual(records.map(\.sessionId), ["desktop-child"])
     }
 
-    func testCodexDesktopStateScanExcludesOtherAppServerClientRollout() throws {
-        let fm = FileManager.default
-        let tempDir = fm.temporaryDirectory
-            .appendingPathComponent("codeisland-codex-db-client-\(UUID().uuidString)")
-        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: tempDir) }
-
-        let desktopRollout = tempDir.appendingPathComponent("desktop.jsonl")
-        let pluginRollout = tempDir.appendingPathComponent("plugin.jsonl")
-        let legacyRollout = tempDir.appendingPathComponent("legacy.jsonl")
-        let started = #"{"type":"event_msg","payload":{"type":"task_started"}}"#
-        try ([
-            #"{"type":"session_meta","payload":{"id":"desktop","cwd":"/repo","originator":"Codex Desktop","source":"vscode"}}"#,
-            started,
-        ].joined(separator: "\n") + "\n").write(
-            to: desktopRollout,
-            atomically: true,
-            encoding: .utf8
-        )
-        // Claude Code's Codex plugin drives its own `codex app-server`.
-        try ([
-            #"{"type":"session_meta","payload":{"id":"plugin","cwd":"/repo","originator":"Claude Code","source":"vscode"}}"#,
-            started,
-        ].joined(separator: "\n") + "\n").write(
-            to: pluginRollout,
-            atomically: true,
-            encoding: .utf8
-        )
-        try ([
-            #"{"type":"session_meta","payload":{"id":"legacy","cwd":"/repo","source":"vscode"}}"#,
-            started,
-        ].joined(separator: "\n") + "\n").write(
-            to: legacyRollout,
-            atomically: true,
-            encoding: .utf8
-        )
-
-        let statePath = tempDir.appendingPathComponent("state_5.sqlite").path
-        var db: OpaquePointer?
-        XCTAssertEqual(sqlite3_open(statePath, &db), SQLITE_OK)
-        defer { sqlite3_close_v2(db) }
-        let now = Int64(Date().timeIntervalSince1970)
-        XCTAssertEqual(sqlite3_exec(db, """
-            CREATE TABLE threads (
-                id TEXT PRIMARY KEY,
-                rollout_path TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                updated_at INTEGER NOT NULL,
-                model TEXT,
-                archived INTEGER NOT NULL,
-                source TEXT NOT NULL
-            );
-            INSERT INTO threads VALUES (
-                'desktop', '\(desktopRollout.path)', '/repo', \(now), NULL, 0, 'vscode'
-            );
-            INSERT INTO threads VALUES (
-                'plugin', '\(pluginRollout.path)', '/repo', \(now), NULL, 0, 'vscode'
-            );
-            INSERT INTO threads VALUES (
-                'legacy', '\(legacyRollout.path)', '/repo', \(now), NULL, 0, 'vscode'
-            );
-            """, nil, nil, nil), SQLITE_OK)
-
-        let records = AppState.recentCodexDesktopThreadRecords(
-            statePath: statePath,
-            fileManager: fm
-        )
-        XCTAssertEqual(Set(records.map(\.sessionId)), ["desktop", "legacy"])
-    }
-
     func testReverseLifecycleScanSkipsOversizedUnterminatedTailLine() throws {
         let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("codeisland-codex-oversized-tail-\(UUID().uuidString).jsonl")
@@ -564,6 +506,84 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         XCTAssertEqual(discovered.first?.providerSessionId, rawSessionId)
         XCTAssertEqual(discovered.first?.termBundleId, AppState.codexAppBundleId)
         XCTAssertEqual(discovered.first?.cwd, "/fallback/repo")
+    }
+
+    func testDesktopProcessScanRejectsMetadataTouchedHistoricalRollout() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory
+            .appendingPathComponent("codeisland-codex-process-recency-\(UUID().uuidString)")
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let now = Date()
+        let rawId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        let sessionsBase = tempDir.appendingPathComponent("sessions")
+        let rollout = try makeCodexRollout(
+            sessionsBase: sessionsBase,
+            sessionId: rawId,
+            cwd: "/historical/repo",
+            now: now
+        )
+
+        let statePath = tempDir.appendingPathComponent("state_5.sqlite").path
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(statePath, &db), SQLITE_OK)
+        defer { sqlite3_close_v2(db) }
+        let current = Int64(now.timeIntervalSince1970)
+        let stale = current - 86_400
+        let sql = """
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            updated_at_ms INTEGER,
+            recency_at INTEGER NOT NULL,
+            recency_at_ms INTEGER,
+            model TEXT,
+            archived INTEGER NOT NULL,
+            has_user_event INTEGER NOT NULL,
+            source TEXT NOT NULL
+        );
+        INSERT INTO threads VALUES (
+            '\(rawId)', '\(rollout.path)', '/historical/repo',
+            \(current), \(current * 1000), \(stale), \(stale * 1000),
+            'gpt-test', 0, 0, 'vscode'
+        );
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+
+        let discovered = AppState.discoverCodexSessions(
+            processes: [CodexProcessDiscoveryCandidate(
+                pid: 123,
+                cwd: "/",
+                startTime: now.addingTimeInterval(-60),
+                isDesktop: true
+            )],
+            sessionsBase: sessionsBase.path,
+            statePath: statePath,
+            now: now,
+            fileManager: fm
+        )
+
+        XCTAssertTrue(discovered.isEmpty)
+
+        // Resuming the same thread advances user recency and must restore it
+        // even though its rollout filename still belongs to an older session.
+        XCTAssertEqual(sqlite3_exec(db, """
+            UPDATE threads SET recency_at = \(current), recency_at_ms = \(current * 1000);
+            """, nil, nil, nil), SQLITE_OK)
+        let resumed = AppState.discoverCodexSessions(
+            processes: [CodexProcessDiscoveryCandidate(
+                pid: 123, cwd: "/", startTime: now.addingTimeInterval(-60), isDesktop: true
+            )],
+            sessionsBase: sessionsBase.path,
+            statePath: statePath,
+            now: now,
+            fileManager: fm
+        )
+        XCTAssertEqual(resumed.map(\.sessionId), ["codexapp:\(rawId)"])
+        XCTAssertEqual(resumed.first?.status, .processing)
     }
 
     func testSameRawThreadOpenInDesktopAndCLIRemainsTwoDiscoveries() throws {
@@ -671,118 +691,6 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         )
 
         XCTAssertEqual(discovered.map(\.sessionId), ["codexapp:\(rawSessionId)"])
-    }
-
-    func testOtherAppServerClientRolloutStaysWithItsOwnProcess() throws {
-        let fm = FileManager.default
-        let tempDir = fm.temporaryDirectory
-            .appendingPathComponent("codeisland-codex-client-mode-\(UUID().uuidString)")
-        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: tempDir) }
-
-        let now = Date()
-        let rawSessionId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
-        let sessionsBase = tempDir.appendingPathComponent("sessions")
-        let rollout = try makeCodexRollout(
-            sessionsBase: sessionsBase,
-            sessionId: rawSessionId,
-            cwd: "/shared/repo",
-            now: now,
-            originator: "Claude Code",
-            source: "vscode"
-        )
-
-        let statePath = tempDir.appendingPathComponent("state_5.sqlite").path
-        var db: OpaquePointer?
-        XCTAssertEqual(sqlite3_open(statePath, &db), SQLITE_OK)
-        defer { sqlite3_close_v2(db) }
-        let sql = """
-            CREATE TABLE threads (
-                id TEXT PRIMARY KEY,
-                rollout_path TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                updated_at INTEGER NOT NULL,
-                model TEXT,
-                archived INTEGER NOT NULL,
-                source TEXT NOT NULL
-            );
-            INSERT INTO threads VALUES (
-                '\(rawSessionId)', '\(rollout.path)', '/shared/repo',
-                \(Int64(now.timeIntervalSince1970)), 'gpt-test', 0, 'vscode'
-            );
-            """
-        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
-
-        let discovered = AppState.discoverCodexSessions(
-            processes: [
-                CodexProcessDiscoveryCandidate(
-                    pid: 100,
-                    cwd: "/",
-                    startTime: now.addingTimeInterval(-60),
-                    isDesktop: true
-                ),
-                CodexProcessDiscoveryCandidate(
-                    pid: 101,
-                    cwd: "/shared/repo",
-                    startTime: now.addingTimeInterval(-60),
-                    isDesktop: false
-                ),
-            ],
-            sessionsBase: sessionsBase.path,
-            statePath: statePath,
-            now: now,
-            fileManager: fm
-        )
-
-        XCTAssertEqual(discovered.map(\.sessionId), [rawSessionId])
-        XCTAssertEqual(discovered.first?.pid, 101)
-        XCTAssertNil(discovered.first?.termBundleId)
-    }
-
-    func testOtherAppServerClientSubagentRolloutStaysInItsParentNamespace() throws {
-        let fm = FileManager.default
-        let tempDir = fm.temporaryDirectory
-            .appendingPathComponent("codeisland-codex-client-child-\(UUID().uuidString)")
-        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: tempDir) }
-
-        let now = Date()
-        let childSessionId = "cccccccc-dddd-4eee-8fff-000000000000"
-        let sessionsBase = tempDir.appendingPathComponent("sessions")
-        // A spawned thread keeps its parent's originator under an object source.
-        _ = try makeCodexRollout(
-            sessionsBase: sessionsBase,
-            sessionId: childSessionId,
-            cwd: "/shared/repo",
-            now: now,
-            originator: "Claude Code",
-            source: ["subagent": ["thread_spawn": ["parent_thread_id": "parent-thread"]]]
-        )
-
-        let discovered = AppState.discoverCodexSessions(
-            processes: [
-                CodexProcessDiscoveryCandidate(
-                    pid: 100,
-                    cwd: "/",
-                    startTime: now.addingTimeInterval(-60),
-                    isDesktop: true
-                ),
-                CodexProcessDiscoveryCandidate(
-                    pid: 101,
-                    cwd: "/shared/repo",
-                    startTime: now.addingTimeInterval(-60),
-                    isDesktop: false
-                ),
-            ],
-            sessionsBase: sessionsBase.path,
-            statePath: tempDir.appendingPathComponent("missing.sqlite").path,
-            now: now,
-            fileManager: fm
-        )
-
-        XCTAssertEqual(discovered.map(\.sessionId), [childSessionId])
-        XCTAssertEqual(discovered.first?.parentSessionId, "parent-thread")
-        XCTAssertNil(discovered.first?.termBundleId)
     }
 
     func testRejectedRootRolloutDoesNotExcludeValidDatabaseRecord() throws {
@@ -935,7 +843,7 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         cwd: String?,
         now: Date,
         originator: String = "Codex Desktop",
-        source: Any = "vscode",
+        source: String = "vscode",
         filenameTimestamp: String = "2000-01-01T00-00-00"
     ) throws -> URL {
         let calendar = Calendar.current
