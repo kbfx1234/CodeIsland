@@ -3899,8 +3899,7 @@ final class AppState {
 
     /// Merge discovered sessions into current state (skip already-known ones)
     func integrateDiscovered(_ discovered: [DiscoveredSession]) {
-        var didMutate = coalesceCodexDesktopTwinSessions()
-        didMutate = removeStaleCodexDesktopSessions(from: discovered) || didMutate
+        var didMutate = removeStaleCodexDesktopSessions(from: discovered)
         var discoveredParents: [String: String] = [:]
         for info in discovered where info.source == "codex" {
             guard let parent = info.parentSessionId, !parent.isEmpty else { continue }
@@ -4147,7 +4146,7 @@ final class AppState {
         }
 
         var removed = false
-        for (sessionId, session) in sessions where session.isCodexDesktop {
+        for (sessionId, session) in sessions where session.source == "codex" && session.termBundleId == Self.codexAppBundleId {
             guard session.status == .idle,
                   processMonitors[sessionId] == nil,
                   !permissionQueue.contains(where: { ($0.event.sessionId ?? "default") == sessionId }),
@@ -7747,8 +7746,11 @@ final class AppState {
                 let fileName = (file as NSString).lastPathComponent
                 let rawSessionId = extractCodexSessionId(from: fileName)
                 guard !rawSessionId.isEmpty else { continue }
+                let canonicalRawSessionId = process.isDesktop
+                    ? codexTranscriptSessionId(path: file, fallback: rawSessionId)
+                    : rawSessionId
                 let identity = codexDiscoveryIdentity(
-                    rawSessionId: rawSessionId,
+                    rawSessionId: canonicalRawSessionId,
                     isDesktop: process.isDesktop
                 )
                 // The process/file scan can see a rollout touched by thread
