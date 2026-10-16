@@ -1,11 +1,13 @@
 import AppKit
 import ApplicationServices
+import os
 import CodeIslandCore
 
 /// Activates the terminal window/tab running a specific Claude Code session.
 /// Supports tab-level switching for: Ghostty, iTerm2, Terminal.app, WezTerm, kitty.
 /// Falls back to app-level activation for: Alacritty, Warp, Hyper, Tabby, Rio.
 struct TerminalActivator {
+    private static let jumpLog = Logger(subsystem: "com.codeisland", category: "session-jump")
     // Internal (not private) so support tests can assert a terminal is recognized,
     // matching sourceToNativeAppBundleId's visibility. See TeraxSupportTests.
     static let knownTerminals: [(name: String, bundleId: String)] = [
@@ -67,6 +69,14 @@ struct TerminalActivator {
         // of raising — or launching — the IDE.
         "aiwork": "com.alipay.dtcoder.ide",
     ]
+
+    static func isCmuxSession(_ session: SessionSnapshot) -> Bool {
+        if let surface = session.cmuxSurfaceId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !surface.isEmpty { return true }
+        if let bundle = session.termBundleId?.lowercased(), bundle.contains("cmux") { return true }
+        if let app = session.termApp?.lowercased(), app.contains("cmux") { return true }
+        return false
+    }
 
     /// Bundle IDs of apps that have both APP and CLI modes.
     /// When termBundleId matches, bring that app to front;
@@ -131,6 +141,18 @@ struct TerminalActivator {
         // which would otherwise aim at that unrelated pane (#321).
         if let harness = session.hostHarness {
             HostHarnessSupport.activate(harness: harness, session: session, sessionId: sessionId)
+            return
+        }
+        // cmux identity is authoritative even when terminal metadata is stale
+        // or inherited from a Codex Desktop parent. Route before generic pane
+        // and process-ancestry activation.
+        if isCmuxSession(session) {
+            jumpLog.info("jump route=cmux session=\(sessionId ?? "-", privacy: .public) surface=\(session.cmuxSurfaceId ?? "-", privacy: .public) workspace=\(session.cmuxWorkspaceId ?? "-", privacy: .public)")
+            activateCmux(
+                surfaceId: session.cmuxSurfaceId,
+                workspaceId: session.cmuxWorkspaceId,
+                codexCwd: session.source == "codex" ? session.cwd : nil
+            )
             return
         }
         if allowHerdr && activateHerdrIfAvailable(session: session, sessionId: sessionId) {
@@ -1407,7 +1429,18 @@ struct TerminalActivator {
     /// - Parameters:
     ///   - surfaceId: cmux surface UUID string (from CMUX_SURFACE_ID env var)
     ///   - workspaceId: cmux workspace UUID string (from CMUX_WORKSPACE_ID env var, optional)
-    private static func activateCmux(surfaceId: String?, workspaceId: String?) {
+    static func cmuxFocusArguments(surfaceId: String?, workspaceId: String?) -> [String]? {
+        guard let sid = surfaceId?.trimmingCharacters(in: .whitespacesAndNewlines), !sid.isEmpty else {
+            return nil
+        }
+        var args = ["focus-panel", "--panel", sid]
+        if let wid = workspaceId?.trimmingCharacters(in: .whitespacesAndNewlines), !wid.isEmpty {
+            args += ["--workspace", wid]
+        }
+        return args
+    }
+
+    private static func activateCmux(surfaceId: String?, workspaceId: String?, codexCwd: String? = nil) {
         // Reuse activateByBundleId: unified handling of Space switching, hidden state, app not running, etc.
         activateByBundleId("com.cmuxterm.app")
 
@@ -1422,11 +1455,17 @@ struct TerminalActivator {
 
         // Invoke focus-panel CLI asynchronously to avoid blocking the main thread
         DispatchQueue.global(qos: .userInitiated).async {
-            var args = ["focus-panel", "--panel", sid]
-            if let wid = workspaceId, !wid.isEmpty {
-                args += ["--workspace", wid]
+            let fallbackArgs = cmuxFocusArguments(surfaceId: sid, workspaceId: workspaceId) ?? []
+            let target = CmuxTerminalResolver.codexTarget(cwd: codexCwd, preferredSurfaceId: surfaceId)
+            let resolvedArgs = target.flatMap {
+                cmuxFocusArguments(surfaceId: $0.surfaceId, workspaceId: $0.workspaceId)
+            } ?? fallbackArgs
+            guard !resolvedArgs.isEmpty else { return }
+            if runProcess(cmuxBin, args: resolvedArgs) == nil {
+                jumpLog.error("jump route=cmux result=focus-panel-failed binary=\(cmuxBin, privacy: .public) args=\(resolvedArgs.joined(separator: " "), privacy: .public)")
+            } else {
+                jumpLog.info("jump route=cmux result=focus-panel-accepted binary=\(cmuxBin, privacy: .public) args=\(resolvedArgs.joined(separator: " "), privacy: .public)")
             }
-            _ = runProcess(cmuxBin, args: args)
         }
     }
 
