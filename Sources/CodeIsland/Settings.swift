@@ -82,7 +82,7 @@ enum SettingsKey {
     static let showSessionRecap = "showSessionRecap"
     static let showModelLabel = "showModelLabel"
 
-    // Token-usage footer (local Claude transcript aggregation)
+    // Usage statistics footer (local activity plus optional official Codex quota)
     static let showUsageStats = "showUsageStats"
 
     // Claude plan limits (Anthropic usage endpoint via the Claude Code login)

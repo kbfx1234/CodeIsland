@@ -40,6 +40,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor [weak appState] in
             try? await Task.sleep(nanoseconds: 5_000_000_000)
             appState?.refreshClaudeUsageIfStale()
+            if UserDefaults.standard.bool(forKey: SettingsKey.showUsageStats) {
+                CodexQuotaStore.shared.startAutoRefresh()
+            }
         }
 
         // Hook installation does subprocess version detection plus disk I/O —
