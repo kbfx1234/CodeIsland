@@ -638,6 +638,10 @@ public final class JSONLTailer: @unchecked Sendable {
                 delta.lastAssistantMessage = text
             }
         default:
+            if type == nil, let kiroKind = json["kind"] as? String {
+                applyKiroLine(kind: kiroKind, payload: json["data"] as? [String: Any], into: &delta)
+                return
+            }
             // Cursor agent transcripts key their entries on a top-level `role`
             // instead of `type`: `{"role":"user","message":{"content":[...]}}`.
             // Restrict the branch to lines with no `type` at all so type-keyed
@@ -645,6 +649,29 @@ public final class JSONLTailer: @unchecked Sendable {
             if type == nil, let role = json["role"] as? String {
                 applyCursorRoleLine(role: role, message: message, into: &delta)
             }
+        }
+    }
+
+    private static func applyKiroLine(
+        kind: String,
+        payload: [String: Any]?,
+        into delta: inout ScanResult.Delta
+    ) {
+        switch kind {
+        case "Prompt", "ToolResults":
+            delta.hasActivity = true
+            delta.turnStatus = .processing
+        case "AssistantMessage":
+            guard let content = payload?["content"] as? [[String: Any]] else { return }
+            delta.hasActivity = true
+            delta.turnStatus = content.contains { ($0["kind"] as? String) == "toolUse" } ? .processing : .idle
+            let text = content.compactMap { block -> String? in
+                guard (block["kind"] as? String) == "text" else { return nil }
+                return (block["data"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty }.joined(separator: "\n")
+            if !text.isEmpty { delta.lastAssistantMessage = text }
+        default:
+            break
         }
     }
 
@@ -853,6 +880,7 @@ public final class JSONLTailer: @unchecked Sendable {
         case claudeRecap
         /// Codex `turn_context` (the turn's model + reasoning effort).
         case codexTurnContext
+        case kiro
         case irrelevant
     }
 
@@ -940,6 +968,10 @@ public final class JSONLTailer: @unchecked Sendable {
                 }
             }
 
+            if hasPrefix(ptr, total: total, expect: kiroLinePrefix) {
+                return .kiro
+            }
+
             // No interesting `type` value — check for Cursor's `role`-keyed shape
             // before giving up. Cursor's writer serializes `{role, message}` with
             // `role` as the first key, so an O(1) prefix check suffices. Scanning
@@ -971,6 +1003,7 @@ public final class JSONLTailer: @unchecked Sendable {
     private static let typeMarker: [UInt8] = Array(#""type":""#.utf8)
     /// The `"role":"` prefix — Cursor transcripts key entries on `role` only.
     private static let roleMarker: [UInt8] = Array(#""role":""#.utf8)
+    private static let kiroLinePrefix: [UInt8] = Array(#"{"version":"v1","kind":"#.utf8)
     private static let userBytes: [UInt8] = Array(#"user""#.utf8)
     private static let assistantBytes: [UInt8] = Array(#"assistant""#.utf8)
     private static let userInputBytes: [UInt8] = Array(#"USER_INPUT""#.utf8)

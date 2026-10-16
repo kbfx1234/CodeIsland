@@ -179,7 +179,7 @@ struct SettingsDefaults {
     static let autoCollapseAfterSessionJump = false
     static let autoExpandOnPermission = true
     static let autoExpandOnCompletion = true
-    static let pluginSessionMode = "separate"
+    static let pluginSessionMode = "merge"
     static let trackClaudeDesktopCowork = true
     static let hapticOnHover = false
     static let hapticIntensity = 1          // 1=light
