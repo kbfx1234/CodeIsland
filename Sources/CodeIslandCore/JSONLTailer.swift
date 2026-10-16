@@ -968,7 +968,8 @@ public final class JSONLTailer: @unchecked Sendable {
                 }
             }
 
-            if hasPrefix(ptr, total: total, expect: kiroLinePrefix) {
+            if total >= kiroLinePrefix.count,
+               kiroLinePrefix.enumerated().allSatisfy({ ptr[$0.offset] == $0.element }) {
                 return .kiro
             }
 
