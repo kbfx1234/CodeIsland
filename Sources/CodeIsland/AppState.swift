@@ -3897,9 +3897,142 @@ final class AppState {
         return mutated
     }
 
+    private func coalesceCodexDesktopTwinSessions() -> Bool {
+        var didMutate = false
+        let canonicalKeys = sessions.keys.filter { $0.hasPrefix(Self.codexAppSessionPrefix) }
+        for canonicalKey in canonicalKeys {
+            guard let canonical = sessions[canonicalKey],
+                  canonical.source == "codex",
+                  canonical.termBundleId == Self.codexAppBundleId,
+                  let providerId = canonical.providerSessionId,
+                  let transcriptPath = canonical.transcriptPath,
+                  Self.codexTranscriptOrigin(path: transcriptPath) == .desktop else {
+                continue
+            }
+            let rawCandidates = sessions.keys.filter { key in
+                guard key != canonicalKey,
+                      key == providerId || !key.hasPrefix(Self.codexAppSessionPrefix),
+                      let candidate = sessions[key],
+                      candidate.source == "codex",
+                      !candidate.isNativeAppMode else { return false }
+                return Self.codexDesktopTranscriptsMatch(
+                    existingTranscriptPath: candidate.transcriptPath,
+                    discoveredTranscriptPath: transcriptPath
+                ) || Self.codexSessionsHaveStrongDesktopIdentity(
+                    existingProviderSessionId: candidate.providerSessionId ?? key,
+                    existingTranscriptPath: candidate.transcriptPath,
+                    discoveredProviderSessionId: providerId,
+                    discoveredTranscriptPath: transcriptPath
+                )
+            }
+            for rawKey in rawCandidates {
+                let info = DiscoveredSession(
+                    sessionId: canonicalKey,
+                    cwd: canonical.cwd ?? sessions[rawKey]?.cwd ?? "",
+                    tty: nil,
+                    model: canonical.model,
+                    pid: nil,
+                    modifiedAt: canonical.lastActivity,
+                    recentMessages: canonical.recentMessages,
+                    source: "codex",
+                    transcriptPath: transcriptPath,
+                    status: canonical.status,
+                    termBundleId: Self.codexAppBundleId,
+                    providerSessionId: providerId
+                )
+                if reconcileCodexDesktopTwin(rawKey: rawKey, canonicalKey: canonicalKey, incoming: info) {
+                    didMutate = true
+                }
+            }
+        }
+        return didMutate
+    }
+
+    private func reconcileCodexDesktopTwin(
+        rawKey: String,
+        canonicalKey: String,
+        incoming: DiscoveredSession
+    ) -> Bool {
+        guard rawKey != canonicalKey,
+              let raw = sessions[rawKey],
+              raw.source == "codex",
+              let providerId = incoming.providerSessionId ?? raw.providerSessionId,
+              let incomingPath = incoming.transcriptPath,
+              (Self.codexDesktopTranscriptsMatch(
+                    existingTranscriptPath: raw.transcriptPath,
+                    discoveredTranscriptPath: incomingPath
+                ) || Self.codexSessionsHaveStrongDesktopIdentity(
+                    existingProviderSessionId: raw.providerSessionId ?? rawKey,
+                    existingTranscriptPath: raw.transcriptPath,
+                    discoveredProviderSessionId: providerId,
+                    discoveredTranscriptPath: incomingPath
+                )),
+              Self.codexTranscriptOrigin(path: incomingPath) == .desktop else {
+            return false
+        }
+
+        var merged = sessions[canonicalKey] ?? raw
+        let rawIsNewer = raw.lastActivity > merged.lastActivity
+        if rawIsNewer {
+            merged.lastActivity = raw.lastActivity
+            merged.status = raw.status
+            merged.cwd = raw.cwd ?? merged.cwd
+            merged.model = raw.model ?? merged.model
+            merged.recentMessages = raw.recentMessages.isEmpty ? merged.recentMessages : raw.recentMessages
+            merged.lastUserPrompt = raw.lastUserPrompt ?? merged.lastUserPrompt
+            merged.lastAssistantMessage = raw.lastAssistantMessage ?? merged.lastAssistantMessage
+        }
+        for (id, state) in raw.subagents {
+            if let current = merged.subagents[id], current.lastActivity >= state.lastActivity {
+                continue
+            }
+            merged.subagents[id] = state
+        }
+        for id in raw.closedSubagentIds {
+            merged.recordClosedSubagentId(id)
+        }
+        merged.source = "codex"
+        merged.termBundleId = Self.codexAppBundleId
+        merged.providerSessionId = providerId
+        merged.transcriptPath = incomingPath
+        merged.cliPid = nil
+        merged.cliStartTime = nil
+        sessions[canonicalKey] = merged
+
+        let wasActive = activeSessionId == rawKey
+        removeSession(rawKey)
+        if wasActive || activeSessionId == nil {
+            activeSessionId = canonicalKey
+        }
+        return true
+    }
+
+    nonisolated static func codexSessionsHaveStrongDesktopIdentity(
+        existingProviderSessionId: String?,
+        existingTranscriptPath: String?,
+        discoveredProviderSessionId: String?,
+        discoveredTranscriptPath: String?
+    ) -> Bool {
+        guard let existingProviderSessionId,
+              !existingProviderSessionId.isEmpty,
+              let discoveredProviderSessionId,
+              !discoveredProviderSessionId.isEmpty,
+              existingProviderSessionId == discoveredProviderSessionId,
+              let existingTranscriptPath,
+              !existingTranscriptPath.isEmpty,
+              let discoveredTranscriptPath,
+              !discoveredTranscriptPath.isEmpty else {
+            return false
+        }
+        let existingURL = URL(fileURLWithPath: existingTranscriptPath).standardizedFileURL
+        let discoveredURL = URL(fileURLWithPath: discoveredTranscriptPath).standardizedFileURL
+        return existingURL.path == discoveredURL.path
+    }
+
     /// Merge discovered sessions into current state (skip already-known ones)
     func integrateDiscovered(_ discovered: [DiscoveredSession]) {
-        var didMutate = removeStaleCodexDesktopSessions(from: discovered)
+        var didMutate = coalesceCodexDesktopTwinSessions()
+        didMutate = removeStaleCodexDesktopSessions(from: discovered) || didMutate
         var discoveredParents: [String: String] = [:]
         for info in discovered where info.source == "codex" {
             guard let parent = info.parentSessionId, !parent.isEmpty else { continue }
