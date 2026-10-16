@@ -2162,7 +2162,7 @@ struct ConfigInstaller {
             case .kiroAgent:
                 // Kiro entries: { command, matcher: "*", timeout_ms }. Caller declares
                 // timeout in seconds for consistency with other CLIs; convert to ms here.
-                entry = ["command": baseCommand, "matcher": "*", "timeout_ms": timeout * 1000]
+                entry = ["command": baseCommand, "matcher": ".*", "timeout_ms": timeout * 1000]
             case .antigravityNamed:
                 // Antigravity named-config entry. The outer wrapper name is the
                 // configKey ("codeisland"), keyed here by installExternalHooks, so we

@@ -3948,6 +3948,16 @@ final class AppState {
         return didMutate
     }
 
+    private func codexDesktopCanonicalKey(for info: DiscoveredSession) -> String? {
+        guard info.source == "codex",
+              let transcriptPath = info.transcriptPath,
+              Self.codexTranscriptOrigin(path: transcriptPath) == .desktop else { return nil }
+        let raw = info.providerSessionId ?? info.sessionId
+        let provider = raw.hasPrefix(Self.codexAppSessionPrefix)
+            ? String(raw.dropFirst(Self.codexAppSessionPrefix.count)) : raw
+        return provider.isEmpty ? nil : Self.codexAppSessionPrefix + provider
+    }
+
     private func reconcileCodexDesktopTwin(
         rawKey: String,
         canonicalKey: String,
@@ -4085,6 +4095,25 @@ final class AppState {
                     didMutate = true
                 }
                 continue
+            }
+
+            if let canonicalKey = codexDesktopCanonicalKey(for: info), canonicalKey != info.sessionId {
+                if sessions[canonicalKey] != nil {
+                    if reconcileCodexDesktopTwin(rawKey: info.sessionId, canonicalKey: canonicalKey, incoming: info) {
+                        didMutate = true
+                    }
+                    _ = applyDiscoveredRuntimeState(info, to: canonicalKey)
+                    _ = backfillSessionMessages(sessionId: canonicalKey, from: info)
+                    _ = applyDiscoveredMetadata(info, to: canonicalKey)
+                    attachTranscriptTailerIfNeeded(sessionId: canonicalKey)
+                    tryMonitorSession(canonicalKey)
+                    continue
+                }
+                if let rawProvider = info.providerSessionId, sessions[rawProvider] != nil,
+                   reconcileCodexDesktopTwin(rawKey: rawProvider, canonicalKey: canonicalKey, incoming: info) {
+                    didMutate = true
+                    continue
+                }
             }
 
             // Session already known — try to update PID and attach monitor.
