@@ -207,8 +207,9 @@ final class CLIProcessResolverTests: XCTestCase {
         for (name, ancestry, expected) in cases {
             XCTAssertEqual(CLIProcessResolver.codexBundledProcessRole(ancestry: ancestry), expected, name)
         }
+    }
 
-// MARK: - fallbackSessionPID (GUI host ghost cards)
+    // MARK: - fallbackSessionPID (GUI host ghost cards)
 
     /// Real repro: a `--source kiro` event with no session_id. Kiro is an
     /// Electron IDE, so the loose `/<source>` rule matches its GUI binary, and
