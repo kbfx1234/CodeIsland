@@ -149,7 +149,8 @@ struct TerminalActivator {
             jumpLog.info("jump route=cmux session=\(sessionId ?? "-", privacy: .public) surface=\(session.cmuxSurfaceId ?? "-", privacy: .public) workspace=\(session.cmuxWorkspaceId ?? "-", privacy: .public)")
             activateCmux(
                 surfaceId: session.cmuxSurfaceId,
-                workspaceId: session.cmuxWorkspaceId
+                workspaceId: session.cmuxWorkspaceId,
+                codexCwd: session.source == "codex" ? session.cwd : nil
             )
             return
         }
@@ -1458,7 +1459,7 @@ struct TerminalActivator {
         return args
     }
 
-    private static func activateCmux(surfaceId: String?, workspaceId: String?) {
+    private static func activateCmux(surfaceId: String?, workspaceId: String?, codexCwd: String? = nil) {
         // Reuse activateByBundleId: unified handling of Space switching, hidden state, app not running, etc.
         activateByBundleId("com.cmuxterm.app")
 
@@ -1479,10 +1480,16 @@ struct TerminalActivator {
 
         // Invoke focus-panel CLI asynchronously to avoid blocking the main thread
         DispatchQueue.global(qos: .userInitiated).async {
-            if runProcess(cmuxBin, args: args) == nil {
-                jumpLog.error("jump route=cmux result=focus-panel-failed binary=\(cmuxBin, privacy: .public) args=\(args.joined(separator: " "), privacy: .public)")
+            // Recheck saved snapshots too: they may still contain a shared
+            // Codex daemon's original terminal rather than the current TUI.
+            let target = CmuxTerminalResolver.codexTarget(cwd: codexCwd, preferredSurfaceId: surfaceId)
+            let resolvedArgs = target.flatMap {
+                cmuxFocusArguments(surfaceId: $0.surfaceId, workspaceId: $0.workspaceId)
+            } ?? args
+            if runProcess(cmuxBin, args: resolvedArgs) == nil {
+                jumpLog.error("jump route=cmux result=focus-panel-failed binary=\(cmuxBin, privacy: .public) args=\(resolvedArgs.joined(separator: " "), privacy: .public)")
             } else {
-                jumpLog.info("jump route=cmux result=focus-panel-accepted binary=\(cmuxBin, privacy: .public) args=\(args.joined(separator: " "), privacy: .public)")
+                jumpLog.info("jump route=cmux result=focus-panel-accepted binary=\(cmuxBin, privacy: .public) args=\(resolvedArgs.joined(separator: " "), privacy: .public)")
             }
         }
     }

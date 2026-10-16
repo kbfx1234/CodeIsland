@@ -1035,9 +1035,77 @@ private struct AppearancePage: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
                 }
+                CodexRuntimeStatusRow()
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+private struct CodexRuntimeStatusRow: View {
+    @ObservedObject private var store = CodexQuotaStore.shared
+    @ObservedObject private var l10n = L10n.shared
+    @AppStorage(SettingsKey.showUsageStats) private var showUsageStats = SettingsDefaults.showUsageStats
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "terminal")
+                    .foregroundStyle(.secondary)
+                Text("Codex connection")
+                    .fontWeight(.medium)
+                Spacer()
+                Button {
+                    store.refresh()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Refresh Codex connection")
+            }
+
+            HStack(spacing: 6) {
+                Text(accessLabel)
+                if let provider = store.profile.modelProvider {
+                    Text("· \(provider)")
+                }
+                if let host = store.profile.endpointHost {
+                    Text("· \(host)")
+                }
+            }
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundStyle(.secondary)
+
+            Text(capabilityLabel)
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+        }
+        .onAppear {
+            if showUsageStats {
+                store.startAutoRefresh()
+            }
+        }
+        .onChange(of: showUsageStats) { _, enabled in
+            if enabled { store.startAutoRefresh() } else { store.stopAutoRefresh() }
+        }
+    }
+
+    private var accessLabel: String {
+        switch store.profile.accessKind {
+        case .officialSubscription: return "Official subscription"
+        case .apiRouter: return "Company API router"
+        case .apiKey: return "API key"
+        case .unknown: return "Not detected"
+        }
+    }
+
+    private var capabilityLabel: String {
+        switch store.profile.quotaCapability {
+        case .officialFiveHourAndWeekly: return "Quota: 5-hour and weekly windows"
+        case .localUsageOnly: return "Quota: controlled by provider; local usage only"
+        case .unavailable: return "Quota: unavailable"
+        case .unknown: return l10n["codex_quota_unavailable"]
+        }
     }
 }
 

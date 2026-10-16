@@ -127,6 +127,71 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         XCTAssertTrue(records.allSatisfy { $0.status == .processing })
     }
 
+    func testRecentCodexDesktopRecordsIgnoreMetadataTouchOnHistoricalThread() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory
+            .appendingPathComponent("codeisland-codex-desktop-recency-\(UUID().uuidString)")
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let now = Date()
+        let historical = tempDir.appendingPathComponent("historical.jsonl")
+        let active = tempDir.appendingPathComponent("active.jsonl")
+        try (#"{"type":"event_msg","payload":{"type":"task_complete"}}"# + "\n")
+            .write(to: historical, atomically: true, encoding: .utf8)
+        try (#"{"type":"event_msg","payload":{"type":"task_started"}}"# + "\n")
+            .write(to: active, atomically: true, encoding: .utf8)
+        // Both rollouts were touched recently, but only the second thread was
+        // recently used by the user. The first models a settings-only append.
+        try fm.setAttributes([.modificationDate: now], ofItemAtPath: historical.path)
+        try fm.setAttributes([.modificationDate: now], ofItemAtPath: active.path)
+
+        let statePath = tempDir.appendingPathComponent("state_5.sqlite").path
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(statePath, &db), SQLITE_OK)
+        defer { sqlite3_close_v2(db) }
+
+        let current = Int64(now.timeIntervalSince1970)
+        let staleRecency = current - 86_400
+        let sql = """
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            updated_at_ms INTEGER,
+            recency_at INTEGER NOT NULL,
+            recency_at_ms INTEGER,
+            model TEXT,
+            archived INTEGER NOT NULL,
+            has_user_event INTEGER NOT NULL,
+            source TEXT NOT NULL
+        );
+        INSERT INTO threads VALUES (
+            'historical-thread', '\(historical.path)', '/repo',
+            \(current), \(current * 1000), \(staleRecency), \(staleRecency * 1000),
+            'gpt-test', 0, 0, 'vscode'
+        );
+        INSERT INTO threads VALUES (
+            'active-thread', '\(active.path)', '/repo',
+            \(current), \(current * 1000), \(current), \(current * 1000),
+            'gpt-test', 0, 0, 'vscode'
+        );
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+
+        let records = AppState.recentCodexDesktopThreadRecords(
+            statePath: statePath,
+            now: now,
+            freshnessWindow: 600,
+            completionSettleWindow: 30,
+            fileManager: fm
+        )
+
+        XCTAssertEqual(records.map(\.sessionId), ["active-thread"])
+        XCTAssertEqual(records.first?.status, .processing)
+    }
+
     func testCodexDesktopStateScanFindsThreadCreatedAfterInitialEmptyScan() throws {
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory
@@ -441,6 +506,84 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         XCTAssertEqual(discovered.first?.providerSessionId, rawSessionId)
         XCTAssertEqual(discovered.first?.termBundleId, AppState.codexAppBundleId)
         XCTAssertEqual(discovered.first?.cwd, "/fallback/repo")
+    }
+
+    func testDesktopProcessScanRejectsMetadataTouchedHistoricalRollout() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory
+            .appendingPathComponent("codeisland-codex-process-recency-\(UUID().uuidString)")
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let now = Date()
+        let rawId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        let sessionsBase = tempDir.appendingPathComponent("sessions")
+        let rollout = try makeCodexRollout(
+            sessionsBase: sessionsBase,
+            sessionId: rawId,
+            cwd: "/historical/repo",
+            now: now
+        )
+
+        let statePath = tempDir.appendingPathComponent("state_5.sqlite").path
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(statePath, &db), SQLITE_OK)
+        defer { sqlite3_close_v2(db) }
+        let current = Int64(now.timeIntervalSince1970)
+        let stale = current - 86_400
+        let sql = """
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            updated_at_ms INTEGER,
+            recency_at INTEGER NOT NULL,
+            recency_at_ms INTEGER,
+            model TEXT,
+            archived INTEGER NOT NULL,
+            has_user_event INTEGER NOT NULL,
+            source TEXT NOT NULL
+        );
+        INSERT INTO threads VALUES (
+            '\(rawId)', '\(rollout.path)', '/historical/repo',
+            \(current), \(current * 1000), \(stale), \(stale * 1000),
+            'gpt-test', 0, 0, 'vscode'
+        );
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+
+        let discovered = AppState.discoverCodexSessions(
+            processes: [CodexProcessDiscoveryCandidate(
+                pid: 123,
+                cwd: "/",
+                startTime: now.addingTimeInterval(-60),
+                isDesktop: true
+            )],
+            sessionsBase: sessionsBase.path,
+            statePath: statePath,
+            now: now,
+            fileManager: fm
+        )
+
+        XCTAssertTrue(discovered.isEmpty)
+
+        // Resuming the same thread advances user recency and must restore it
+        // even though its rollout filename still belongs to an older session.
+        XCTAssertEqual(sqlite3_exec(db, """
+            UPDATE threads SET recency_at = \(current), recency_at_ms = \(current * 1000);
+            """, nil, nil, nil), SQLITE_OK)
+        let resumed = AppState.discoverCodexSessions(
+            processes: [CodexProcessDiscoveryCandidate(
+                pid: 123, cwd: "/", startTime: now.addingTimeInterval(-60), isDesktop: true
+            )],
+            sessionsBase: sessionsBase.path,
+            statePath: statePath,
+            now: now,
+            fileManager: fm
+        )
+        XCTAssertEqual(resumed.map(\.sessionId), ["codexapp:\(rawId)"])
+        XCTAssertEqual(resumed.first?.status, .processing)
     }
 
     func testSameRawThreadOpenInDesktopAndCLIRemainsTwoDiscoveries() throws {

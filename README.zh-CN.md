@@ -30,6 +30,8 @@ CodeIsland 是一个运行在 macOS 刘海和菜单栏区域的 AI 编码 Agent 
 ## 这个 Fork 新增了什么
 
 - **Codex Desktop 身份和跳转** — 从 transcript metadata 读取真实 thread ID，支持 `codex://threads/<id>` 深链接，过滤内部 review 线程，并把子 Agent 合并到父会话。
+- **Codex provider 感知用量** — 从本地 Codex 配置识别官方 OAuth、API key 和自定义 API Router。官方订阅可以显示服务端 5 小时 / 每周额度；公司 Router 的额度由组织侧决定，因此只显示本地 token 活动。
+- **Codex 与 Kiro 用量统计** — 本地读取 Codex rollout token、Kiro CLI/IDE session credits，并在可用时从只读共享缓存显示 Kiro 账户周期额度；本地活动与账户额度分开。
 - **Codex 重复会话保护** — rollout 续接文件名不再生成第二张灵动岛卡片，同时保持 Desktop 和 CLI 会话隔离。
 - **Claude Code + cmux 精确定位** — native bridge 和 shell fallback 都传递 `CMUX_SURFACE_ID` / `CMUX_WORKSPACE_ID`，点击卡片可聚焦准确的 cmux surface。
 - **Kiro CLI 支持** — 新增 v2/v3 hook 安装、会话发现、本地使用量读取和 Kiro 专用健康诊断。

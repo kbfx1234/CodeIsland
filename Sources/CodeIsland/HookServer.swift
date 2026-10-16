@@ -400,6 +400,15 @@ class HookServer {
             return data
         }
         raw["_term_bundle"] = AppState.codexAppBundleId
+        // Desktop hooks inherit the root thread's session_id even for a
+        // subagent rollout. Use the child id from session_meta so the hook
+        // cannot create a root card backed by a child transcript.
+        if AppState.codexSubagentMetadata(inTranscriptPath: transcriptPath) != nil {
+            raw["session_id"] = AppState.codexTranscriptSessionId(
+                path: transcriptPath,
+                fallback: sessionId
+            )
+        }
         guard let rewritten = try? JSONSerialization.data(withJSONObject: raw) else {
             return data
         }
