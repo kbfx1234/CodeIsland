@@ -380,6 +380,41 @@ class HookServer {
         return AppState.codexSubagentMetadata(inTranscriptPath: path)
     }
 
+    /// Desktop hooks occasionally arrive without the bridge's native bundle
+    /// marker. Use the rollout's explicit provenance to restore the canonical
+    /// `codexapp:` namespace, while honoring cmux identity and CLI provenance.
+    /// The transformation is pure so it can be regression-tested without a
+    /// live socket or ChatGPT process.
+    nonisolated static func canonicalizeCodexDesktopHookPayload(data: Data) -> Data {
+        guard var raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (raw["_source"] as? String)?.lowercased() == "codex",
+              raw["_term_bundle"] == nil,
+              let sessionId = raw["session_id"] as? String,
+              !sessionId.isEmpty,
+              !sessionId.hasPrefix(AppState.codexAppSessionPrefix),
+              let transcriptPath = raw["transcript_path"] as? String,
+              !transcriptPath.isEmpty,
+              raw["_cmux_surface_id"] == nil,
+              raw["_cmux_workspace_id"] == nil,
+              AppState.codexTranscriptOrigin(path: transcriptPath) == .desktop else {
+            return data
+        }
+        raw["_term_bundle"] = AppState.codexAppBundleId
+        // Desktop hooks inherit the root thread's session_id even for a
+        // subagent rollout. Use the child id from session_meta so the hook
+        // cannot create a root card backed by a child transcript.
+        if AppState.codexSubagentMetadata(inTranscriptPath: transcriptPath) != nil {
+            raw["session_id"] = AppState.codexTranscriptSessionId(
+                path: transcriptPath,
+                fallback: sessionId
+            )
+        }
+        guard let rewritten = try? JSONSerialization.data(withJSONObject: raw) else {
+            return data
+        }
+        return rewritten
+    }
+
     func codexNativeSubsessionParentId(from raw: [String: Any]) -> String? {
         guard (raw["_via_plugin"] as? Bool) != true,
               SessionSnapshot.normalizedSupportedSource(raw["_source"] as? String) == "codex",

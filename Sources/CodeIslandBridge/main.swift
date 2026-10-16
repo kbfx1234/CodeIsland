@@ -491,13 +491,20 @@ if json["session_id"] == nil,
     // (e.g. Cursor IDE spawning multiple parallel agent subprocesses, #148)
     // collapse onto a single session card instead of fanning into N cards
     // (one per sub-agent ppid).
-    let sessionPID = CLIProcessResolver.resolvedSessionPID(
+    // Returns nil when the only source match in the ancestry is a GUI host
+    // process (e.g. Kiro.app's main binary, ppid 1, shared by every window and
+    // workspace). Its PID cannot identify a session, so the event is dropped by
+    // the guard below instead of piling onto a global ghost card.
+    if let sessionPID = CLIProcessResolver.fallbackSessionPID(
         immediateParentPID: Int32(immediateParentPID),
         source: effectiveSource ?? source,
         ancestry: coreAncestry
-    )
-    json["session_id"] = "\(source)-ppid-\(sessionPID)"
-    debugLog("session_id missing, generated fallback id: \(json["session_id"] ?? "")")
+    ) {
+        json["session_id"] = "\(source)-ppid-\(sessionPID)"
+        debugLog("session_id missing, generated fallback id: \(json["session_id"] ?? "")")
+    } else {
+        debugLog("session_id missing and ancestry is a GUI app host; refusing ppid fallback")
+    }
 }
 guard let sessionId = json["session_id"] as? String, !sessionId.isEmpty else {
     debugLog("no session_id, dropping")
@@ -591,6 +598,17 @@ if let cmuxSurface = env["CMUX_SURFACE_ID"], !cmuxSurface.isEmpty {
 }
 if let cmuxWorkspace = env["CMUX_WORKSPACE_ID"], !cmuxWorkspace.isEmpty {
     json["_cmux_workspace_id"] = cmuxWorkspace
+}
+// A shared Codex app-server keeps the CMUX environment of its original
+// launcher. Its hooks must point at the live terminal client for this CWD.
+if effectiveSource == "codex", json["_cmux_surface_id"] != nil,
+   let target = CmuxTerminalResolver.codexTarget(
+       cwd: json["cwd"] as? String,
+       preferredSurfaceId: json["_cmux_surface_id"] as? String
+   ) {
+    json["_cmux_surface_id"] = target.surfaceId
+    json["_cmux_workspace_id"] = target.workspaceId
+    json["_ppid"] = target.pid
 }
 
 // Zellij multiplexer detection — pane id + optional session name for precise tab focus
