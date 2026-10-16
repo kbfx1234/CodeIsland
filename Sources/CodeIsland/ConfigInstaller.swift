@@ -1331,6 +1331,104 @@ struct ConfigInstaller {
         return UserDefaults.standard.bool(forKey: key)
     }
 
+    /// Read-only health report for the shared bridge and configured CLIs.
+    /// Missing CLIs are informational (they are not installed on this machine);
+    /// detected but incomplete installations are repairable with
+    /// ``verifyAndRepair()``. The optional arguments keep this deterministic in
+    /// tests without changing the production paths.
+    static func hookHealthReport(
+        fm: FileManager = .default,
+        socketPath: String = SocketPath.path
+    ) -> HookHealthReport {
+        var items: [HookHealthItem] = []
+
+        let bridgeExists = fm.fileExists(atPath: bridgePath)
+        let bridgeExecutable = bridgeExists && fm.isExecutableFile(atPath: bridgePath)
+        items.append(HookHealthItem(
+            id: "bridge",
+            title: "CodeIsland bridge",
+            detail: bridgeExecutable ? bridgePath : (bridgeExists ? "文件不可执行" : "文件不存在"),
+            severity: bridgeExecutable ? .healthy : .needsRepair
+        ))
+
+        let scriptExists = fm.fileExists(atPath: hookScriptPath)
+        let scriptExecutable = scriptExists && fm.isExecutableFile(atPath: hookScriptPath)
+        items.append(HookHealthItem(
+            id: "hook-script",
+            title: "Hook script",
+            detail: scriptExecutable ? hookScriptPath : (scriptExists ? "文件不可执行" : "文件不存在"),
+            severity: scriptExecutable ? .healthy : .needsRepair
+        ))
+
+        let socketExists = fm.fileExists(atPath: socketPath)
+        items.append(HookHealthItem(
+            id: "socket",
+            title: "CodeIsland socket",
+            detail: socketExists ? socketPath : "未监听 \(socketPath)",
+            // A stopped app has no socket and cannot receive hooks; this is
+            // still a repairable runtime condition, not a manual action.
+            severity: socketExists ? .healthy : .needsRepair
+        ))
+
+        for cli in allCLIs {
+            let detected = cliExists(source: cli.source)
+            let enabled = isEnabled(source: cli.source)
+            // Kiro has two independent hook engines. Report the reliable v2
+            // profile separately; the v3 runtime is diagnosed below so its
+            // current 2.21.0 limitation is visible instead of being hidden by
+            // a combined healthy result.
+            let installed = detected && (cli.source == "kiro"
+                ? isKiroV2HooksInstalled(fm: fm)
+                : isInstalled(source: cli.source))
+            let severity: HookHealthSeverity
+            let detail: String
+            if !detected {
+                severity = .healthy
+                detail = "未检测到，已跳过"
+            } else if !enabled {
+                severity = .healthy
+                detail = "已停用"
+            } else if installed {
+                severity = .healthy
+                detail = cli.displayConfigPath
+            } else {
+                severity = .needsRepair
+                detail = "配置缺失或格式不完整：\(cli.displayConfigPath)"
+            }
+            items.append(HookHealthItem(
+                id: "cli-\(cli.source)",
+                title: cli.name,
+                detail: detail,
+                severity: severity
+            ))
+
+            if cli.source == "kiro", detected, enabled {
+                let v3Configured = isKiroV3HooksInstalled(fm: fm)
+                items.append(HookHealthItem(
+                    id: "cli-kiro-v3",
+                    title: "Kiro v3 standalone",
+                    detail: v3Configured
+                        ? "配置已安装（仅每轮开始和结束）"
+                        : "配置缺失：~/.kiro/hooks/codeisland.json",
+                    severity: v3Configured ? .healthy : .needsRepair
+                ))
+            }
+        }
+
+        // OpenCode is plugin-based and intentionally not part of allCLIs.
+        let openCodeDetected = cliExists(source: "opencode")
+        let openCodeEnabled = isEnabled(source: "opencode")
+        let openCodeInstalled = openCodeDetected && isInstalled(source: "opencode")
+        items.append(HookHealthItem(
+            id: "cli-opencode",
+            title: "OpenCode",
+            detail: !openCodeDetected ? "未检测到，已跳过" : (!openCodeEnabled ? "已停用" : (openCodeInstalled ? "~/.config/opencode/plugins/codeisland.js" : "插件缺失或配置不完整")),
+            severity: !openCodeDetected || !openCodeEnabled || openCodeInstalled ? .healthy : .needsRepair
+        ))
+
+        return HookHealthReport(generatedAt: Date(), items: items)
+    }
+
     /// Toggle a single CLI on/off: installs or uninstalls its hooks.
     @discardableResult
     static func setEnabled(source: String, enabled: Bool) -> Bool {
@@ -1513,6 +1611,163 @@ struct ConfigInstaller {
             if installOmpExtension(fm: fm) { repaired.append("Oh My Pi") }
         }
         return repaired
+    }
+
+    /// Create one timestamped, side-by-side backup for each existing CLI config
+    /// that may be touched by ``verifyAndRepair``. Existing backups are retained.
+    /// Copy failures are intentionally ignored: diagnostics and repair continue,
+    /// while the UI still reports the repair result rather than claiming rollback.
+    private static func backupHookConfigsForRepair(fm: FileManager) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        var paths = allCLIs
+            .filter { isEnabled(source: $0.source) && cliExists(source: $0.source) }
+            .map(\.fullPath)
+        paths.append(codexHome() + "/config.toml")
+        paths.append(opencodeConfigPath)
+        paths.append(opencodeConfigPathNew)
+        paths.append(opencodeConfigPathJsonc)
+        paths.append(kiroV3HooksPath)
+
+        var seen = Set<String>()
+        for path in paths where seen.insert(path).inserted {
+            guard fm.fileExists(atPath: path) else {
+                continue
+            }
+            let directory = (path as NSString).deletingLastPathComponent
+            let filename = (path as NSString).lastPathComponent
+            let hasExistingBackup = (try? fm.contentsOfDirectory(atPath: directory))?.contains {
+                $0.hasPrefix(filename + ".codeisland.bak.")
+            } ?? false
+            guard !hasExistingBackup else { continue }
+            let backupPath = path + ".codeisland.bak." + stamp
+            do {
+                try fm.copyItem(atPath: path, toPath: backupPath)
+            } catch {
+                // A config can disappear between detection and copy; repair should
+                // remain best-effort and must not fail the whole startup path.
+            }
+        }
+    }
+
+    // MARK: - Kiro CLI v3 standalone hooks
+
+    private static let kiroV3Events: [(String, String, Int)] = [
+        // Kiro IDE renders every command hook in chat, so keep only turn boundaries.
+        ("UserPromptSubmit", "user-prompt-submit", 5),
+        ("Stop", "stop", 5),
+    ]
+
+    /// The v3 event contract is kept internal so unit tests can lock the
+    /// schema without writing into the user's home directory.
+    static var kiroV3EventNames: [String] { kiroV3Events.map(\.0) }
+
+    static func kiroV3HookEntry(trigger: String, name: String, command: String, timeout: Int) -> [String: Any] {
+        [
+            "name": "codeisland-\(name)",
+            "trigger": trigger,
+            "action": ["type": "command", "command": command],
+            "timeout": timeout,
+            "enabled": true,
+        ]
+    }
+
+    private static func isManagedKiroV3Hook(_ entry: [String: Any]) -> Bool {
+        guard let action = entry["action"] as? [String: Any],
+              let command = action["command"] as? String else { return false }
+        return command.contains("codeisland-bridge") && command.contains("--source kiro")
+    }
+
+    static func kiroV3Hooks(replacingManaged hooks: [[String: Any]], command: String) -> [[String: Any]] {
+        hooks.filter { !isManagedKiroV3Hook($0) }
+            + kiroV3Events.map { trigger, name, timeout in
+                kiroV3HookEntry(trigger: trigger, name: name, command: command, timeout: timeout)
+            }
+    }
+
+    @discardableResult
+    private static func installKiroV3Hooks(fm: FileManager) -> Bool {
+        let kiroRoot = NSHomeDirectory() + "/.kiro"
+        guard fm.fileExists(atPath: kiroRoot) else { return true }
+        try? fm.createDirectory(atPath: kiroV3HooksDir, withIntermediateDirectories: true)
+
+        if fm.fileExists(atPath: kiroV3HooksPath) {
+            backupHookConfigIfNeeded(path: kiroV3HooksPath, fm: fm)
+        }
+        var root: [String: Any] = [:]
+        if let data = fm.contents(atPath: kiroV3HooksPath), !data.isEmpty {
+            guard let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return false
+            }
+            root = parsed
+        }
+        root["name"] = root["name"] ?? "codeisland"
+        root["version"] = root["version"] ?? "v1"
+        guard (root["version"] as? String) == "v1" else { return false }
+        let command = "\(bridgeCommand) --source kiro"
+        root["hooks"] = kiroV3Hooks(replacingManaged: root["hooks"] as? [[String: Any]] ?? [], command: command)
+        guard JSONSerialization.isValidJSONObject(root),
+              let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]) else {
+            return false
+        }
+        do {
+            try data.write(to: URL(fileURLWithPath: kiroV3HooksPath), options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func isKiroV3HooksInstalled(fm: FileManager) -> Bool {
+        guard let data = fm.contents(atPath: kiroV3HooksPath),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (root["version"] as? String) == "v1",
+              let hooks = root["hooks"] as? [[String: Any]] else { return false }
+        return kiroV3HooksInstalled(hooks, command: "\(bridgeCommand) --source kiro")
+    }
+
+    static func kiroV3HooksInstalled(_ hooks: [[String: Any]], command: String) -> Bool {
+        let managed = hooks.filter { isManagedKiroV3Hook($0) }
+        guard managed.count == kiroV3Events.count else { return false }
+        return kiroV3Events.allSatisfy { trigger, _, _ in
+            managed.contains { entry in
+                guard entry["trigger"] as? String == trigger,
+                      let action = entry["action"] as? [String: Any],
+                      action["type"] as? String == "command",
+                      action["command"] as? String == command,
+                      (entry["enabled"] as? Bool) != false else { return false }
+                return entry["matcher"] == nil
+            }
+        }
+    }
+
+    private static func isKiroV2HooksInstalled(fm: FileManager) -> Bool {
+        guard let cli = allCLIs.first(where: { $0.source == "kiro" }) else { return false }
+        return isHooksInstalled(for: cli, fm: fm)
+    }
+
+    private static func uninstallKiroV3Hooks(fm: FileManager) {
+        guard let data = fm.contents(atPath: kiroV3HooksPath),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let hooks = root["hooks"] as? [[String: Any]] else { return }
+        let remaining = hooks.filter { !isManagedKiroV3Hook($0) }
+        var updated = root
+        updated["hooks"] = remaining
+        if let output = try? JSONSerialization.data(withJSONObject: updated, options: [.prettyPrinted, .sortedKeys]) {
+            try? output.write(to: URL(fileURLWithPath: kiroV3HooksPath), options: Data.WritingOptions.atomic)
+        }
+    }
+
+    private static func backupHookConfigIfNeeded(path: String, fm: FileManager) {
+        guard fm.fileExists(atPath: path) else { return }
+        let directory = (path as NSString).deletingLastPathComponent
+        let filename = (path as NSString).lastPathComponent
+        let hasExistingBackup = (try? fm.contentsOfDirectory(atPath: directory))?.contains {
+            $0.hasPrefix(filename + ".codeisland.bak.")
+        } ?? false
+        guard !hasExistingBackup else { return }
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        try? fm.copyItem(atPath: path, toPath: path + ".codeisland.bak." + stamp)
     }
 
     // MARK: - JSONC Support
