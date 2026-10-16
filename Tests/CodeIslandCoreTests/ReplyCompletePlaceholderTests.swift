@@ -132,4 +132,36 @@ final class ReplyCompletePlaceholderTests: XCTestCase {
         XCTAssertFalse(messages.contains(where: { $0.text == "Reply complete" }),
                        "Placeholder must not be added when lastAssistantMessage is already set")
     }
+
+    func testRepeatedStopReplyIsAddedOnlyOnce() throws {
+        var session = SessionSnapshot()
+        session.source = "codex"
+        session.addRecentMessage(ChatMessage(isUser: true, text: "summarize it"))
+        var sessions = ["codex-session": session]
+
+        let payload: [String: Any] = [
+            "hook_event_name": "Stop",
+            "session_id": "codex-session",
+            "_source": "codex",
+            "last_assistant_message": "The summary is ready.",
+        ]
+        let event = try hookEvent(payload)
+
+        _ = reduceEvent(sessions: &sessions, event: event, maxHistory: 20)
+        _ = reduceEvent(sessions: &sessions, event: event, maxHistory: 20)
+
+        let messages = sessions["codex-session"]?.recentMessages ?? []
+        XCTAssertEqual(messages.map(\.text), ["summarize it", "The summary is ready."])
+    }
+
+    func testRepeatedTextInLaterTurnIsPreserved() {
+        var session = SessionSnapshot()
+        session.addRecentMessage(ChatMessage(isUser: true, text: "first"))
+        session.addRecentMessage(ChatMessage(isUser: false, text: "Done"))
+        session.addRecentMessage(ChatMessage(isUser: true, text: "second"))
+        session.addRecentMessage(ChatMessage(isUser: false, text: "Done"))
+
+        XCTAssertEqual(session.recentMessages.map(\.text), ["Done", "second", "Done"],
+                       "Only consecutive duplicates are suppressed; maxCount still applies")
+    }
 }
