@@ -4109,6 +4109,13 @@ final class AppState {
                     tryMonitorSession(canonicalKey)
                     continue
                 }
+                if canonicalKey == info.sessionId,
+                   let rawProvider = info.providerSessionId,
+                   sessions[rawProvider] != nil,
+                   reconcileCodexDesktopTwin(rawKey: rawProvider, canonicalKey: canonicalKey, incoming: info) {
+                    didMutate = true
+                    continue
+                }
                 if let rawProvider = info.providerSessionId, sessions[rawProvider] != nil,
                    reconcileCodexDesktopTwin(rawKey: rawProvider, canonicalKey: canonicalKey, incoming: info) {
                     didMutate = true
@@ -4958,7 +4965,8 @@ final class AppState {
                 child.cwd = child.cwd ?? parent.session.cwd
                 // The child's own model (its hooks, then its rollout below) —
                 // never the parent's: children routinely run on another model.
-                child.model = child.model ?? subagent.model
+                child.model = child.model ?? subagent.model ?? parent.session.model
+                child.reasoningEffort = child.reasoningEffort ?? subagent.reasoningEffort
                 child.reasoningEffort = child.reasoningEffort ?? subagent.reasoningEffort
                 child.permissionMode = child.permissionMode ?? parent.session.permissionMode
                 child.termApp = child.termApp ?? parent.session.termApp
