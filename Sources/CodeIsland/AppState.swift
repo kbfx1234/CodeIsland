@@ -8096,6 +8096,56 @@ final class AppState {
         return value
     }
 
+
+    nonisolated static func codexDesktopTranscriptsMatch(
+        existingTranscriptPath: String?,
+        discoveredTranscriptPath: String?
+    ) -> Bool {
+        guard let existingTranscriptPath, !existingTranscriptPath.isEmpty,
+              let discoveredTranscriptPath, !discoveredTranscriptPath.isEmpty else {
+            return false
+        }
+        return URL(fileURLWithPath: existingTranscriptPath).standardizedFileURL.path
+            == URL(fileURLWithPath: discoveredTranscriptPath).standardizedFileURL.path
+    }
+
+    nonisolated static func isCodexInternalTranscript(path: String) -> Bool {
+        guard let firstLine = readFirstLine(path: path),
+              let data = firstLine.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let payload = json["payload"] as? [String: Any] else {
+            return false
+        }
+        if (payload["thread_source"] as? String)?.lowercased() == "guardian_review" {
+            return true
+        }
+        guard let source = payload["source"] as? [String: Any],
+              let subagent = source["subagent"] as? [String: Any] else {
+            return false
+        }
+        return (subagent["other"] as? String)?.lowercased() == "guardian"
+    }
+
+    internal nonisolated static func kiroTranscriptStatus(path: String) -> AgentStatus {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return .idle }
+        defer { try? handle.close() }
+        let size = handle.seekToEndOfFile()
+        let readSize = min(size, 64 * 1024)
+        handle.seek(toFileOffset: size - readSize)
+        guard let text = String(data: handle.readDataToEndOfFile(), encoding: .utf8),
+              let line = text.split(separator: "\n").last,
+              let data = line.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let kind = object["kind"] as? String else { return .idle }
+        if kind == "Prompt" || kind == "ToolResults" { return .processing }
+        guard kind == "AssistantMessage",
+              let payload = object["data"] as? [String: Any],
+              let content = payload["content"] as? [[String: Any]],
+              content.contains(where: { ($0["kind"] as? String) == "toolUse" }) else {
+            return .idle
+        }
+        return .processing
+    }
     /// Find the most recent Codex session file matching a CWD
     /// Scans back up to 7 days to cover long-running sessions that span day boundaries
     private nonisolated static func findRecentCodexSession(base: String, cwd: String, after: Date?, fm: FileManager) -> String? {
