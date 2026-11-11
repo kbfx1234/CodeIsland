@@ -128,4 +128,3 @@ final class QuestionWizardStateTests: XCTestCase {
         XCTAssertNil(appState.questionDraft(for: request.id), "answered, skipped or drained: the draft goes too")
     }
 }
-
