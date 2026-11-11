@@ -161,6 +161,14 @@ struct TerminalVisibilityDetector {
             return false
         }
 
+        // Harness desktop app in front: like a native agent app, the app IS
+        // the session surface. A browser in front says nothing about which
+        // tab is showing, so it never counts as the session being visible.
+        if let harness = session.hostHarness {
+            if case .desktopApp = harness.surface { return true }
+            return false
+        }
+
         // Native app bundles (Cursor APP, Codex APP): app IS the session, suppress when frontmost
         if session.isNativeAppMode {
             return true

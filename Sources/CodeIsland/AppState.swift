@@ -930,6 +930,8 @@ final class AppState {
         detachTranscriptTailer(sessionId: sessionId)
         exitingSessions.removeValue(forKey: sessionId)
         modelReadRetryAt.removeValue(forKey: sessionId)
+        hostHarnessProbes.removeValue(forKey: sessionId)
+        hostHarnessProbeRetryAt.removeValue(forKey: sessionId)
         completionQueue.removeAll { $0 == sessionId }
         if activeSessionId == sessionId {
             activeSessionId = mostActiveSessionId()
@@ -1238,6 +1240,49 @@ final class AppState {
                 s.gitBranch = info?.branch
                 s.gitIsWorktree = info?.isWorktree ?? false
                 self.sessions[sessionId] = s
+            }
+        }
+    }
+
+    /// Last conclusive host-harness probe per session, keyed to the CLI pid it
+    /// walked. A SessionStart rebuilds the snapshot; the cache lets the result
+    /// be re-applied without walking the ancestry again. (#321)
+    private var hostHarnessProbes: [String: (pid: pid_t, harness: HostHarness?)] = [:]
+    private var hostHarnessProbesInFlight: Set<String> = []
+    /// Throttle for probes that could not read the process (it had already
+    /// exited, or the pid is a short-lived hook shell) — retried, not cached.
+    private var hostHarnessProbeRetryAt: [String: Date] = [:]
+
+    /// Detect a UI harness (T3 Code) in the CLI's ancestry, off the main actor.
+    /// Runs once per CLI pid; remote sessions never probe the local process table.
+    private func maybeResolveHostHarness(for sessionId: String) {
+        guard let session = sessions[sessionId],
+              !session.isRemote,
+              let pid = session.cliPid, pid > 1 else { return }
+        if let cached = hostHarnessProbes[sessionId], cached.pid == pid {
+            if session.hostHarness != cached.harness {
+                sessions[sessionId]?.hostHarness = cached.harness
+            }
+            return
+        }
+        guard !hostHarnessProbesInFlight.contains(sessionId),
+              Date() >= hostHarnessProbeRetryAt[sessionId] ?? .distantPast else { return }
+        hostHarnessProbesInFlight.insert(sessionId)
+        Task.detached(priority: .utility) {
+            let result = HostHarnessSupport.probe(cliPid: pid)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.hostHarnessProbesInFlight.remove(sessionId)
+                guard self.sessions[sessionId]?.cliPid == pid else { return }
+                if result.conclusive {
+                    self.hostHarnessProbes[sessionId] = (pid, result.harness)
+                    self.hostHarnessProbeRetryAt.removeValue(forKey: sessionId)
+                } else {
+                    self.hostHarnessProbeRetryAt[sessionId] = Date().addingTimeInterval(10)
+                }
+                if self.sessions[sessionId]?.hostHarness != result.harness {
+                    self.sessions[sessionId]?.hostHarness = result.harness
+                }
             }
         }
     }
@@ -1558,6 +1603,7 @@ final class AppState {
         // After reduce: remoteHostId is authoritative (extractMetadata just ran),
         // so a remote session can never probe the local filesystem here.
         maybeRefreshGitBranch(for: sessionId, cwdBefore: cwdBeforeReduce, normalizedEventName: normalizedEventName)
+        maybeResolveHostHarness(for: sessionId)
 
         // Backfill model after metadata extraction. Hooks are inconsistent across providers,
         // so retry with a cooldown instead of giving up permanently on the first miss.
@@ -3087,6 +3133,8 @@ final class AppState {
             )
             // Reattach exit monitoring without changing the restored idle/running snapshot.
             tryMonitorSession(restoredSessionId)
+            // Harness is re-probed, not persisted — it may have restarted between runs.
+            maybeResolveHostHarness(for: restoredSessionId)
         }
         SessionPersistence.clear()
         _ = coalesceCodexDesktopTwinSessions()

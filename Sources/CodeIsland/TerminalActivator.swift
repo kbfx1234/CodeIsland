@@ -137,6 +137,12 @@ struct TerminalActivator {
             jumpLog.info("jump skipped route=remote session=\(sessionId ?? "-", privacy: .public)")
             return
         }
+        // A UI harness (T3 Code) owns the conversation; route to it before
+        // terminal or multiplexer routing.
+        if let harness = session.hostHarness {
+            HostHarnessSupport.activate(harness: harness, session: session, sessionId: sessionId)
+            return
+        }
         if let terminal = session.herdrTerminalId?.trimmingCharacters(in: .whitespacesAndNewlines),
            !terminal.isEmpty {
             DispatchQueue.global(qos: .userInitiated).async {

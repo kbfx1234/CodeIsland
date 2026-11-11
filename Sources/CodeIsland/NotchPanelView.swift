@@ -1219,10 +1219,11 @@ private struct QuestionBar: View {
     }
 
     /// Remote sessions run on another machine — there is no local terminal to
-    /// focus, so the affordance stays hidden rather than dead.
+    /// focus, so the affordance stays hidden rather than dead. Same for a
+    /// harness-hosted session (T3 Code) whose harness URL is unknown (#321).
     private var canJumpToTerminal: Bool {
         guard let session else { return false }
-        return !session.isRemote
+        return session.canJumpFromNotch
     }
 
     var body: some View {
@@ -2529,8 +2530,9 @@ func startNotchCardJump(
         }
     }
 
-    // Remote sessions have no local terminal to focus
-    guard !session.isRemote else { return nil }
+    // Remote sessions have no local terminal to focus; an unverified harness
+    // (T3 Code server whose URL is unknown) has nowhere to go either.
+    guard session.canJumpFromNotch else { return nil }
 
     TerminalActivator.activate(session: session, sessionId: sessionId)
 
@@ -2894,7 +2896,7 @@ private struct SessionCard: View {
     private func handleSessionClick() {
         TerminalActivator.activate(session: session, sessionId: sessionId)
 
-        guard autoCollapseAfterSessionJump, !session.isRemote else { return }
+        guard autoCollapseAfterSessionJump, session.canJumpFromNotch else { return }
 
         jumpValidationTask?.cancel()
         jumpValidationTask = Task {
@@ -3192,6 +3194,23 @@ private struct TerminalBadge: View {
         }
     }
 
+    /// Same chip for the UI harness that spawned the CLI (T3 Code): the
+    /// terminal badge still names where the harness server runs, the chip
+    /// says the conversation itself lives in the harness (#321).
+    @ViewBuilder
+    private func hostHarnessChip(fg: Color, bg: Color) -> some View {
+        if let harness = session.hostHarnessLabel {
+            Text(harness)
+                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                .foregroundStyle(fg)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(bg)
+                .clipShape(RoundedRectangle(cornerRadius: 3))
+                .help(String(format: L10n.shared["hosted_by_harness_hint"], harness))
+        }
+    }
+
     var body: some View {
         Group {
             if session.isRemote {
@@ -3225,6 +3244,7 @@ private struct TerminalBadge: View {
                             .foregroundStyle(.white.opacity(0.5))
                     }
                     multiplexerChip(fg: .white.opacity(0.5), bg: .white.opacity(0.1))
+                    hostHarnessChip(fg: .white.opacity(0.5), bg: .white.opacity(0.1))
                 }
             }
         }
