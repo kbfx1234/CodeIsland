@@ -102,6 +102,12 @@ const ENV_KEYS = [
   "ZELLIJ_PANE_ID",
   "ZELLIJ_SESSION_NAME",
   "WEZTERM_PANE",
+  "HERDR_ENV",
+  "HERDR_PANE_ID",
+  "HERDR_SOCKET_PATH",
+  "HERDR_BIN_PATH",
+  "HC_TERMINAL_ID",
+  "HC_TERMINAL_SOCKET",
   "__CFBundleIdentifier",
 ] as const;
 
@@ -129,6 +135,16 @@ function collectEnv(): Record<string, string> {
     if (process.env[key]) env[key] = process.env[key]!;
   }
   return env;
+}
+
+function herdrMetadata(env: Record<string, string>): Record<string, string> {
+  return {
+    ...(env.HERDR_PANE_ID ? { _herdr_pane_id: env.HERDR_PANE_ID } : {}),
+    ...(env.HERDR_SOCKET_PATH ? { _herdr_socket_path: env.HERDR_SOCKET_PATH } : {}),
+    ...(env.HERDR_BIN_PATH ? { _herdr_bin_path: env.HERDR_BIN_PATH } : {}),
+    ...(env.HC_TERMINAL_ID ? { _herdr_terminal_id: env.HC_TERMINAL_ID } : {}),
+    ...(env.HC_TERMINAL_SOCKET ? { _herdr_terminal_socket: env.HC_TERMINAL_SOCKET } : {}),
+  };
 }
 
 /**
@@ -268,11 +284,13 @@ function base(
   extra: Record<string, unknown>,
   tty: string | null,
 ): Record<string, unknown> {
+  const env = collectEnv();
   return {
     session_id: `openclaw-${lane}`,
     _source: "openclaw",
     _ppid: process.pid,
-    _env: collectEnv(),
+    _env: env,
+    ...herdrMetadata(env),
     _tty: tty,
     _server_port: 0,
     cwd,

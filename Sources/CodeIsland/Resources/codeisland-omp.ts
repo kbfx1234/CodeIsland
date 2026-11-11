@@ -100,6 +100,8 @@ const ENV_KEYS = [
   "HERDR_PANE_ID",
   "HERDR_SOCKET_PATH",
   "HERDR_BIN_PATH",
+  "HC_TERMINAL_ID",
+  "HC_TERMINAL_SOCKET",
   "__CFBundleIdentifier",
 ] as const;
 
@@ -129,12 +131,16 @@ function collectEnv(): Record<string, string> {
 function herdrMetadata(env: Record<string, string>): Record<string, string> {
   const pane = env.HERDR_PANE_ID?.trim();
   const socket = env.HERDR_SOCKET_PATH?.trim();
-  if (env.HERDR_ENV !== "1" || !pane || !socket) return {};
+  const desktop: Record<string, string> = {};
+  if (env.HC_TERMINAL_ID?.trim()) desktop._herdr_terminal_id = env.HC_TERMINAL_ID.trim();
+  if (env.HC_TERMINAL_SOCKET?.trim()) desktop._herdr_terminal_socket = env.HC_TERMINAL_SOCKET.trim();
+  if (env.HERDR_ENV !== "1" || !pane || !socket) return desktop;
   const binary = env.HERDR_BIN_PATH?.trim();
   return {
     _herdr_pane_id: pane,
     _herdr_socket_path: socket,
     ...(binary ? { _herdr_bin_path: binary } : {}),
+    ...desktop,
   };
 }
 

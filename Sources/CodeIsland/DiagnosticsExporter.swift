@@ -174,6 +174,9 @@ struct DiagnosticsExporter {
             let hasHerdrRouting = s.herdrPaneId?.isEmpty == false && s.herdrSocketPath?.isEmpty == false
             dict["hasHerdrRouting"] = hasHerdrRouting
             if let pane = s.herdrPaneId, !pane.isEmpty { dict["herdrPaneId"] = pane }
+            let hasHerdrDesktopRouting = s.herdrTerminalId?.isEmpty == false
+            dict["hasHerdrDesktopRouting"] = hasHerdrDesktopRouting
+            if let terminal = s.herdrTerminalId, !terminal.isEmpty { dict["herdrTerminalId"] = terminal }
             dict["subagentCount"] = s.subagents.count
             dict["toolHistoryCount"] = s.toolHistory.count
             return dict

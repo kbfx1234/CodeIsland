@@ -67,6 +67,8 @@ final class SessionPersistenceTests: XCTestCase {
             herdrPaneId: nil,
             herdrSocketPath: nil,
             herdrBinaryPath: nil,
+            herdrTerminalId: nil,
+            herdrTerminalSocket: nil,
             cliPid: 456,
             cliStartTime: cliStartTime,
             startTime: startTime,
@@ -115,6 +117,8 @@ final class SessionPersistenceTests: XCTestCase {
             herdrPaneId: nil,
             herdrSocketPath: nil,
             herdrBinaryPath: nil,
+            herdrTerminalId: nil,
+            herdrTerminalSocket: nil,
             cliPid: nil,
             cliStartTime: nil,
             startTime: startTime,
@@ -193,6 +197,8 @@ final class SessionPersistenceTests: XCTestCase {
             herdrPaneId: nil,
             herdrSocketPath: nil,
             herdrBinaryPath: nil,
+            herdrTerminalId: nil,
+            herdrTerminalSocket: nil,
             cliPid: nil,
             cliStartTime: nil,
             startTime: startTime,
@@ -268,6 +274,8 @@ final class SessionPersistenceTests: XCTestCase {
             herdrPaneId: "w1:p2",
             herdrSocketPath: "/tmp/herdr.sock",
             herdrBinaryPath: "/opt/homebrew/bin/herdr",
+            herdrTerminalId: "t3",
+            herdrTerminalSocket: "/Users/mi/.local/state/herdr-core/default/default.sock",
             cliPid: nil,
             cliStartTime: nil,
             startTime: startTime,
@@ -282,6 +290,8 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertEqual(decoded.herdrPaneId, "w1:p2")
         XCTAssertEqual(decoded.herdrSocketPath, "/tmp/herdr.sock")
         XCTAssertEqual(decoded.herdrBinaryPath, "/opt/homebrew/bin/herdr")
+        XCTAssertEqual(decoded.herdrTerminalId, "t3")
+        XCTAssertEqual(decoded.herdrTerminalSocket, "/Users/mi/.local/state/herdr-core/default/default.sock")
     }
 
     /// A file written by a newer version, read back after a downgrade: one

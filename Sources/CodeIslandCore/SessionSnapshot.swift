@@ -162,6 +162,8 @@ public struct SessionSnapshot: Sendable {
     public var herdrPaneId: String?       // Herdr pane identifier (wN:pN)
     public var herdrSocketPath: String?   // Owning Herdr server socket
     public var herdrBinaryPath: String?   // Herdr executable captured from pane env
+    public var herdrTerminalId: String?   // Herdr Desktop terminal address (tN)
+    public var herdrTerminalSocket: String? // Herdr core socket for that terminal
     public var supersetWorkspaceId: String? // Superset workspace UUID (from SUPERSET_WORKSPACE_ID env var); presence means running inside Superset
     public var supersetPaneId: String?  // Superset pane/terminal id (from SUPERSET_PANE_ID / SUPERSET_TERMINAL_ID env var)
     /// Orca terminal handle (ORCA_TERMINAL_HANDLE) — the argument `orca terminal
@@ -970,8 +972,17 @@ public struct SessionSnapshot: Sendable {
         if hostHarness != nil { return nil }
         if zellijPaneId != nil || zellijSessionName != nil { return "zellij" }
         if tmuxEnv != nil || tmuxPane != nil { return "tmux" }
+        if hasHerdrDesktopRoute { return nil }
         if hasHerdrRoute { return "herdr" }
         return nil
+    }
+
+    /// Herdr Desktop runs the terminal through herdr-core and exposes its
+    /// stable terminal address separately from the old pane API.
+    public var hasHerdrDesktopRoute: Bool {
+        guard let terminal = herdrTerminalId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !terminal.isEmpty else { return false }
+        return true
     }
 
     /// Herdr routing needs both halves: a pane id aimed at the wrong server is
@@ -991,6 +1002,7 @@ public struct SessionSnapshot: Sendable {
             return remoteDisplayName ?? "Remote"
         }
         // AiWork (formerly DTCoder): badge names match Hooks settings.
+        if hasHerdrDesktopRoute { return "Herdr" }
         if source == "aiwork" { return "AiWork" }
         if source == "aiwork-cli" { return "AiWork CLI" }
         // If termBundleId is a known app, show app name (APP mode)
@@ -1883,6 +1895,14 @@ private func applyEnvMetadata(into sessions: inout [String: SessionSnapshot], se
        ClaudeDesktopCodeSession.isValidHostSessionId(host) {
         sessions[sessionId]?.claudeDesktopSessionId = host
     }
+    if sessions[sessionId]?.herdrTerminalId == nil,
+       let terminal = env["HC_TERMINAL_ID"], !terminal.isEmpty {
+        sessions[sessionId]?.herdrTerminalId = terminal
+    }
+    if sessions[sessionId]?.herdrTerminalSocket == nil,
+       let socket = env["HC_TERMINAL_SOCKET"], !socket.isEmpty {
+        sessions[sessionId]?.herdrTerminalSocket = socket
+    }
 }
 
 /// Fill identity fields on a parent card from a merged Task/subagent hook.
@@ -1991,6 +2011,14 @@ private func applyHerdrRoute(
     if let binary = event.rawJSON["_herdr_bin_path"] as? String, !binary.isEmpty,
        !fillingOnly || sessions[sessionId]?.herdrBinaryPath == nil {
         sessions[sessionId]?.herdrBinaryPath = binary
+    }
+    if sessions[sessionId]?.herdrTerminalId == nil,
+       let terminal = event.rawJSON["_herdr_terminal_id"] as? String, !terminal.isEmpty {
+        sessions[sessionId]?.herdrTerminalId = terminal
+    }
+    if sessions[sessionId]?.herdrTerminalSocket == nil,
+       let socket = event.rawJSON["_herdr_terminal_socket"] as? String, !socket.isEmpty {
+        sessions[sessionId]?.herdrTerminalSocket = socket
     }
 }
 

@@ -3,7 +3,7 @@ import ApplicationServices
 import os
 import CodeIslandCore
 
-/// Activates the terminal window/tab running a specific Claude Code session.
+/// Activates the terminal window/tab or Herdr Desktop terminal running a session.
 /// Supports tab-level switching for: Ghostty, iTerm2, Terminal.app, WezTerm, kitty.
 /// Falls back to app-level activation for: Alacritty, Warp, Hyper, Tabby, Rio.
 struct TerminalActivator {
@@ -135,6 +135,21 @@ struct TerminalActivator {
     ) {
         guard !session.isRemote else {
             jumpLog.info("jump skipped route=remote session=\(sessionId ?? "-", privacy: .public)")
+            return
+        }
+        if let terminal = session.herdrTerminalId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !terminal.isEmpty {
+            DispatchQueue.global(qos: .userInitiated).async {
+                if HerdrDesktopController.focus(terminalId: terminal) {
+                    jumpLog.info("jump route=herdr-desktop result=accepted terminal=\(terminal, privacy: .public)")
+                } else {
+                    jumpLog.error("jump route=herdr-desktop result=rejected terminal=\(terminal, privacy: .public)")
+                    var fallback = session
+                    fallback.herdrTerminalId = nil
+                    fallback.herdrTerminalSocket = nil
+                    activate(session: fallback, sessionId: sessionId, allowHerdr: false)
+                }
+            }
             return
         }
         if allowHerdr && activateHerdrIfAvailable(session: session, sessionId: sessionId) {

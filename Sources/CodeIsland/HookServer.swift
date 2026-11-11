@@ -745,6 +745,18 @@ class HookServer {
             return
         }
 
+        // ACP transport requests belong to their client harness's card.
+        if event.rawJSON["_remote_host_id"] == nil,
+           KiroSessionRouting.isInternalSession(
+               source: event.rawJSON["_source"] as? String,
+               sessionId: event.sessionId,
+               pid: KiroSessionRouting.pid(from: event.rawJSON["_ppid"])
+           ) {
+            if let sessionId = event.sessionId { appState.removeSession(sessionId) }
+            sendResponse(connection: connection, data: Data("{}".utf8))
+            return
+        }
+
         // User-configured cwd exclusion: drop hooks fired by background plugins
         // (e.g. claude-mem, agent loops) whose cwd matches any user-provided
         // substring. Default empty list = no filtering, matches existing behavior. (#125)

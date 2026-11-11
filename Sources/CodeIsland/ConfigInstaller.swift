@@ -916,7 +916,7 @@ struct ConfigInstaller {
     }
 
     /// Hook script version — bump this when the script template changes
-    private static let hookScriptVersion = 6
+    private static let hookScriptVersion = 7
 
     /// Hook script for Claude Code (dispatcher: bridge binary → nc fallback)
     private static let hookScript = """
@@ -931,8 +931,9 @@ struct ConfigInstaller {
         [ -S "$SOCK" ] || exit 0
         INPUT=$(cat)
         _ITERM_GUID="${ITERM_SESSION_ID##*:}"
+        HERDR_INFO="\\\"_herdr_terminal_id\\\":\\\"${HC_TERMINAL_ID:-}\\\",\\\"_herdr_terminal_socket\\\":\\\"${HC_TERMINAL_SOCKET:-}\\\""
         TERM_INFO="\\"_term_app\\":\\"${TERM_PROGRAM:-}\\",\\"_iterm_session\\":\\"${_ITERM_GUID:-}\\",\\"_tty\\":\\"$(tty 2>/dev/null || true)\\",\\"_cmux_surface_id\\":\\"${CMUX_SURFACE_ID:-}\\",\\"_cmux_workspace_id\\":\\"${CMUX_WORKSPACE_ID:-}\\",\\"_ppid\\":$PPID"
-        PATCHED="${INPUT%\\}},${TERM_INFO}}"
+        PATCHED="${INPUT%\\}},${TERM_INFO},${HERDR_INFO}}"
         if echo "$INPUT" | grep -q '"PermissionRequest"'; then
           echo "$PATCHED" | nc -U -w 120 "$SOCK" 2>/dev/null || true
         else
@@ -1084,6 +1085,7 @@ struct ConfigInstaller {
                 && isKiroV3HooksInstalled(fm: FileManager.default)
         }
         if source == "cline" {
+            guard isEnabled(source: source) else { return false }
             guard let cli = allCLIs.first(where: { $0.source == "cline" }) else { return false }
             return isClineHooksInstalled(cli: cli, fm: FileManager.default)
         }
@@ -1107,9 +1109,12 @@ struct ConfigInstaller {
         if source == "grok" { return FileManager.default.fileExists(atPath: grokHome()) }
         if source == "copilot" { return FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.copilot") }
         if source == "cline" {
-            let fm = FileManager.default
-            return fm.fileExists(atPath: NSHomeDirectory() + "/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev")
-                || fm.fileExists(atPath: NSHomeDirectory() + "/Documents/Cline")
+            // Cline's extension data lives under Application Support. Do not use
+            // ~/Documents/Cline as an installation marker: merely probing that
+            // protected folder makes macOS present a Documents permission prompt.
+            return FileManager.default.fileExists(
+                atPath: NSHomeDirectory() + "/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev"
+            )
         }
         if source == "google-antigravity" {
             // Detect via Antigravity-specific markers, NOT bare ~/.gemini (which the
@@ -1141,9 +1146,16 @@ struct ConfigInstaller {
     // Keep backward compat
     static func isCodexInstalled() -> Bool { isInstalled(source: "codex") }
 
-    /// Whether a CLI is enabled by user (UserDefaults). Default: true.
+    /// Whether a CLI is enabled by user (UserDefaults). Most CLIs default true;
+    /// integrations that write to protected folders can opt in explicitly.
     static func isEnabled(source: String) -> Bool {
         let key = "cli_enabled_\(source)"
+        // Cline hooks are written inside ~/Documents, which macOS protects with
+        // TCC. Keep this integration opt-in so launching CodeIsland never asks
+        // for Documents access or creates files there unexpectedly.
+        if source == "cline", UserDefaults.standard.object(forKey: key) == nil {
+            return false
+        }
         if UserDefaults.standard.object(forKey: key) == nil { return true }
         return UserDefaults.standard.bool(forKey: key)
     }
@@ -1782,7 +1794,14 @@ struct ConfigInstaller {
 
     @discardableResult
     static func installExternalHooks(cli: CLIConfig, fm: FileManager) -> Bool {
-        if cli.format == .cline { return installClineHooks(cli: cli, fm: fm) }
+        if cli.format == .cline {
+            // Do not create ~/Documents/Cline/Hooks unless the Cline extension
+            // is actually present and the user explicitly enabled its hooks.
+            guard fm.fileExists(
+                atPath: NSHomeDirectory() + "/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev"
+            ) else { return true }
+            return installClineHooks(cli: cli, fm: fm)
+        }
         if cli.format == .kimi {
             // Kimi: do not create ~/.kimi-code (or legacy ~/.kimi) unless there is
             // already evidence of an existing install. Prefer the modern root.
@@ -3313,13 +3332,13 @@ struct ConfigInstaller {
     // MARK: - pi Extension
 
     /// Current pi extension version — bump when codeisland-pi.ts changes.
-    private static let piExtensionVersion = "v4"
+    private static let piExtensionVersion = "v5"
 
     /// Current omp extension version — bump when codeisland-omp.ts changes.
     /// Kept independent of pi (OMP reuses the "CodeIsland pi extension" banner
     /// but ships its own resource file), so a pi-only bump does not false-flag
     /// healthy OMP installs as needing repair.
-    private static let ompExtensionVersion = "v7"
+    private static let ompExtensionVersion = "v8"
 
     private static func piExtensionSource() -> String? {
         if let url = Bundle.appModule.url(forResource: "codeisland-pi", withExtension: "ts", subdirectory: "Resources"),
@@ -3694,7 +3713,7 @@ struct ConfigInstaller {
     }
 
     /// Current OpenCode plugin version — bump when codeisland-opencode.js changes
-    private static let opencodePluginVersion = "v7"
+    private static let opencodePluginVersion = "v8"
 
     private static func isOpencodePluginInstalled(fm: FileManager) -> Bool {
         guard fm.fileExists(atPath: opencodePluginPath) else { return false }

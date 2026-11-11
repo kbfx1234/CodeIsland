@@ -403,6 +403,17 @@ let effectiveSource = cliPromoted ?? inferredSource
 if let source = effectiveSource {
     json["_source"] = source
 }
+if SessionSnapshot.normalizedSupportedSource(effectiveSource) == "kiro",
+   let kiroProcess = ancestry.first(where: {
+       ["kiro-cli", "kiro-cli-chat"].contains((($0.executablePath ?? "") as NSString).lastPathComponent)
+   }),
+   !KiroSessionRouting.shouldForwardHook(
+       source: effectiveSource,
+       isACPProcess: KiroSessionRouting.isACPProcess(pid: Int32(kiroProcess.pid))
+   ) {
+    debugLog("hook ignored reason=kiro-acp-internal")
+    exit(0)
+}
 // Mark events that arrived via a plugin proxy (no explicit --source but
 // ancestry inferred a real source — e.g. the omo OpenCode plugin firing
 // Claude hooks) so the host app can route them per pluginSessionMode.
@@ -565,6 +576,16 @@ if env["HERDR_ENV"] == "1",
     if let binary = env["HERDR_BIN_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines), !binary.isEmpty {
         json["_herdr_bin_path"] = binary
     }
+}
+
+// Herdr Desktop runs terminals through herdr-core. Capture its stable terminal
+// address so click-to-jump can use the app's pane.focus command even though the
+// PTY reports the outer Ghostty identity.
+if let terminal = env["HC_TERMINAL_ID"]?.trimmingCharacters(in: .whitespacesAndNewlines), !terminal.isEmpty {
+    json["_herdr_terminal_id"] = terminal
+}
+if let socket = env["HC_TERMINAL_SOCKET"]?.trimmingCharacters(in: .whitespacesAndNewlines), !socket.isEmpty {
+    json["_herdr_terminal_socket"] = socket
 }
 
 // Superset (Electron agent-orchestration terminal) — TERM_PROGRAM is spoofed to "kitty"

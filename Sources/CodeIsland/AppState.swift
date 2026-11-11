@@ -355,6 +355,18 @@ final class AppState {
     }
 
     private func cleanupIdleSessions() {
+        let internalKiroSessionIds = sessions.compactMap { sessionId, session -> String? in
+            guard !session.isRemote,
+                  KiroSessionRouting.isInternalSession(
+                      source: session.source,
+                      sessionId: sessionId,
+                      pid: session.cliPid
+                  ) else { return nil }
+            return sessionId
+        }
+        for sessionId in internalKiroSessionIds {
+            removeSession(sessionId)
+        }
         expireStaleInteractiveRequests(now: Date())
         // 1. Verify monitored PIDs are still alive (DispatchSource can silently miss exits)
         //    Also kill orphaned processes (ppid <= 1, terminal closed but process survived).
@@ -1467,6 +1479,16 @@ final class AppState {
 
         let sessionId = event.sessionId ?? "default"
         let normalizedEventName = EventNormalizer.normalize(event.eventName)
+
+        if event.rawJSON["_remote_host_id"] == nil,
+           KiroSessionRouting.isInternalSession(
+               source: source,
+               sessionId: sessionId,
+               pid: KiroSessionRouting.pid(from: event.rawJSON["_ppid"])
+           ) {
+            removeSession(sessionId)
+            return
+        }
 
         // Account chatter, not session activity. CodeBuddy fires
         // Notification(auth_success) as the CLI boots — before SessionStart and
@@ -2987,6 +3009,7 @@ final class AppState {
         let cutoff = Date().addingTimeInterval(-30 * 60) // 30 minutes
         for p in persisted where p.lastActivity > cutoff {
             guard let source = SessionSnapshot.normalizedSupportedSource(p.source) else { continue }
+            guard !KiroSessionRouting.isInternalSession(source: source, sessionId: p.sessionId, pid: p.cliPid) else { continue }
             let restoredSessionId = Self.canonicalRestoredCodexSessionId(
                 sessionId: p.sessionId,
                 source: source,
@@ -3025,6 +3048,8 @@ final class AppState {
             snapshot.herdrPaneId = p.herdrPaneId
             snapshot.herdrSocketPath = p.herdrSocketPath
             snapshot.herdrBinaryPath = p.herdrBinaryPath
+            snapshot.herdrTerminalId = p.herdrTerminalId
+            snapshot.herdrTerminalSocket = p.herdrTerminalSocket
             snapshot.lastActivity = p.lastActivity
             snapshot.transcriptPath = p.transcriptPath
             if let closed = p.closedSubagentIds, !closed.isEmpty {
@@ -3574,6 +3599,7 @@ final class AppState {
             return lhs.modifiedAt < rhs.modifiedAt
         }
         for info in orderedDiscovered {
+            if KiroSessionRouting.isInternalSession(source: info.source, sessionId: info.sessionId, pid: info.pid) { continue }
             if shouldSuppressClosedCodexDesktopDiscovery(info) {
                 continue
             }
@@ -4625,6 +4651,8 @@ final class AppState {
                 child.herdrPaneId = child.herdrPaneId ?? parent.session.herdrPaneId
                 child.herdrSocketPath = child.herdrSocketPath ?? parent.session.herdrSocketPath
                 child.herdrBinaryPath = child.herdrBinaryPath ?? parent.session.herdrBinaryPath
+                child.herdrTerminalId = child.herdrTerminalId ?? parent.session.herdrTerminalId
+                child.herdrTerminalSocket = child.herdrTerminalSocket ?? parent.session.herdrTerminalSocket
                 child.remoteHostId = child.remoteHostId ?? parent.session.remoteHostId
                 child.remoteHostName = child.remoteHostName ?? parent.session.remoteHostName
                 // Keep the child's own process identity only — the parent Cursor chat
@@ -5348,6 +5376,7 @@ final class AppState {
         var results: [DiscoveredSession] = []
         var seen: Set<String> = []
         for pid in kiroPids {
+            guard !KiroSessionRouting.isACPProcess(pid: pid) else { continue }
             guard let cwd = getCwd(for: pid), !cwd.isEmpty else { continue }
             let matches = files.filter { $0.pathExtension == "json" && $0.lastPathComponent != "" }
             for metadataURL in matches {

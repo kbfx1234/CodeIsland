@@ -38,13 +38,16 @@ public enum KiroAccountUsageParser {
               let state = root["kiro.resourceNotifications.usageState"] as? [String: Any],
               let breakdowns = state["usageBreakdowns"] as? [[String: Any]],
               let breakdown = breakdowns.first(where: { isCreditBreakdown($0) }),
-              let current = number(breakdown["currentUsage"]),
+              let current = preciseNumber(breakdown, preciseKey: "currentUsageWithPrecision", fallbackKey: "currentUsage"),
               let limit = number(breakdown["usageLimit"]),
-              current.isFinite, limit.isFinite, limit > 0,
+              current.isFinite, current >= 0, limit.isFinite, limit > 0,
               let resetAt = date(breakdown["resetDate"]) else { return nil }
 
-        let percentage = number(breakdown["percentageUsed"]) ?? current / limit * 100
-        let overages = number(breakdown["currentOverages"]) ?? max(0, current - limit)
+        // Derive the percentage from the same precise usage value displayed in
+        // the footer. Kiro also sends a rounded integer and a server-provided
+        // percentage, which can otherwise disagree by a few tenths.
+        let percentage = current / limit * 100
+        let overages = preciseNumber(breakdown, preciseKey: "currentOveragesWithPrecision", fallbackKey: "currentOverages") ?? max(0, current - limit)
         guard percentage.isFinite, overages.isFinite else { return nil }
         return KiroAccountUsageSnapshot(
             currentUsage: current,
@@ -68,6 +71,14 @@ public enum KiroAccountUsageParser {
         if let number = value as? NSNumber { return number.doubleValue }
         if let string = value as? String { return Double(string) }
         return nil
+    }
+
+    private static func preciseNumber(
+        _ value: [String: Any],
+        preciseKey: String,
+        fallbackKey: String
+    ) -> Double? {
+        number(value[preciseKey]) ?? number(value[fallbackKey])
     }
 
     private static func date(_ value: Any?) -> Date? {

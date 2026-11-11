@@ -44,6 +44,30 @@ final class KiroAccountUsageTests: XCTestCase {
         XCTAssertEqual(snapshot.currentUsage, 12.5, accuracy: 0.0001)
     }
 
+    func testPrefersPrecisionFieldsFromUsageLimitsResponse() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "kiro.resourceNotifications.usageState": [
+                "usageBreakdowns": [[
+                    "type": "CREDIT",
+                    "currentUsage": 1052,
+                    "currentUsageWithPrecision": 1052.31,
+                    "usageLimit": 1000,
+                    "currentOverages": 52,
+                    "currentOveragesWithPrecision": 52.31,
+                    "percentageUsed": 105.2,
+                    "resetDate": "2026-12-01T00:00:00Z",
+                ]],
+            ],
+        ])
+
+        guard let snapshot = KiroAccountUsageParser.parse(data: data) else {
+            return XCTFail("expected precise credit breakdown")
+        }
+        XCTAssertEqual(snapshot.currentUsage, 1052.31, accuracy: 0.0001)
+        XCTAssertEqual(snapshot.percentageUsed, 105.231, accuracy: 0.0001)
+        XCTAssertEqual(snapshot.currentOverages, 52.31, accuracy: 0.0001)
+    }
+
     func testRejectsMissingOrInvalidAccountUsage() throws {
         let missing = try JSONSerialization.data(withJSONObject: [:])
         XCTAssertNil(KiroAccountUsageParser.parse(data: missing))

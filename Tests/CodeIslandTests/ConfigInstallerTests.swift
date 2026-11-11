@@ -10,6 +10,8 @@ final class ConfigInstallerTests: XCTestCase {
         XCTAssertTrue(script.contains("CMUX_WORKSPACE_ID"))
         XCTAssertTrue(script.contains("_cmux_surface_id"))
         XCTAssertTrue(script.contains("_cmux_workspace_id"))
+        XCTAssertTrue(script.contains("HC_TERMINAL_ID"))
+        XCTAssertTrue(script.contains("_herdr_terminal_id"))
     }
 
     private func yamlRootDict(_ yaml: String, file: StaticString = #filePath, line: UInt = #line) throws -> [String: Any] {

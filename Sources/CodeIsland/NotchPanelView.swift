@@ -2098,13 +2098,17 @@ private struct KiroUsageFooterLine: View {
             Image(systemName: "gauge.with.needle")
             Text("Kiro").fontWeight(.semibold)
             if let account {
-                Text("本周期 \(exact(account.currentUsage))/\(exact(account.usageLimit)) credits")
+                Text("账户周期 \(exact(account.currentUsage))/\(exact(account.usageLimit)) credits")
                 Text("·").foregroundStyle(.white.opacity(0.25))
                 Text("\(String(format: "%.1f", account.percentageUsed))%")
                     .foregroundStyle(account.currentUsage > account.usageLimit ? .orange.opacity(0.8) : .white.opacity(0.45))
                 Text("·").foregroundStyle(.white.opacity(0.25))
-                Text("今日 \(todayCredits) credits")
-                if accountAgeMinutes(account) > 12 * 60 {
+                Text("本地今日 \(todayCredits) credits")
+                if accountMayLagBehindLocalUsage(account) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange.opacity(0.8))
+                        .help("本地今日记录高于账户缓存；Kiro 账户周期汇总可能尚未同步。打开 Kiro IDE 或运行 /usage 刷新")
+                } else if accountAgeMinutes(account) > 12 * 60 {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange.opacity(0.8))
                         .help("Kiro 账户额度缓存已超过 12 小时；打开 Kiro IDE 或运行 /usage 刷新")
@@ -2112,7 +2116,7 @@ private struct KiroUsageFooterLine: View {
             } else if let usage {
                 Text("本地 credits 5h \(KiroUsageScanner.formatCredits(usage.last5h.credits))")
                 Text("·").foregroundStyle(.white.opacity(0.25))
-                Text("今日 \(exact(usage.today.credits)) credits")
+                Text("本地今日 \(exact(usage.today.credits)) credits")
             }
             Spacer()
             if let notice = usage?.notice {
@@ -2142,6 +2146,14 @@ private struct KiroUsageFooterLine: View {
         return max(0, Int(Date().timeIntervalSince(updated) / 60))
     }
 
+    private func accountMayLagBehindLocalUsage(_ snapshot: KiroAccountUsageSnapshot) -> Bool {
+        guard let usage, usage.today.credits > snapshot.currentUsage + 0.01 else { return false }
+        // The local total is an estimate, so only flag the clearly impossible
+        // ordering when both values belong to the same current reset cycle.
+        guard snapshot.resetAt > Date() else { return false }
+        return true
+    }
+
     private var detail: String {
         var lines: [String] = []
         if let account {
@@ -2150,6 +2162,9 @@ private struct KiroUsageFooterLine: View {
                 minutes > 12 * 60 ? "缓存已过期（\(minutes / 60)h 前）" : "缓存 \(minutes)m 前"
             } ?? "缓存时间未知"
             lines.append("账户周期: \(exact(account.currentUsage)) / \(exact(account.usageLimit)) credits · 超额 \(exact(max(0, account.currentOverages))) · \(freshness)")
+            if accountMayLagBehindLocalUsage(account) {
+                lines.append("账户缓存可能落后于本地今日记录；打开 Kiro IDE 或运行 /usage 刷新")
+            }
         }
         if let usage {
             lines.append("本地 IDE + CLI: 5h \(KiroUsageScanner.formatCredits(usage.last5h.credits)) · 今日 \(KiroUsageScanner.formatCredits(usage.today.credits))")
