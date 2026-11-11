@@ -17,6 +17,7 @@ import CodeIslandCore
 /// - WezTerm: CLI pane query by TTY/CWD
 /// - Kaku: same shape as WezTerm (it's a fork)
 /// - Zellij: active pane id via `zellij action list-panes --json`
+/// - Herdr Desktop: focused terminal address via `herdr-app status`
 /// - kitty: CLI window query by ID/CWD
 /// - tmux: active pane match
 /// - Others: falls back to app-level only
@@ -29,6 +30,10 @@ struct TerminalVisibilityDetector {
     static func isTerminalFrontmostForSession(_ session: SessionSnapshot) -> Bool {
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return false }
         let frontBundleId = frontApp.bundleIdentifier?.lowercased() ?? ""
+
+        if session.hasHerdrDesktopRoute {
+            return frontBundleId == "dev.herdr.app"
+        }
 
         if isGhosttySessionVisibleInAnyWindow(session) {
             return true
@@ -81,6 +86,11 @@ struct TerminalVisibilityDetector {
         // for any app-level "do not disturb while focused" heuristic.
         if session.isIDETerminal {
             return true
+        }
+
+        if let terminal = session.herdrTerminalId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !terminal.isEmpty {
+            return HerdrDesktopController.isFocused(terminalId: terminal)
         }
 
         // Zellij multiplexer takes priority: it nests inside another terminal, so its pane

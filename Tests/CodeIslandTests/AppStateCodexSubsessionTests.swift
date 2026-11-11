@@ -58,6 +58,18 @@ final class AppStateCodexSubsessionTests: XCTestCase {
         )
     }
 
+    func testCodexSubagentTranscriptSessionIdUsesChildIdOverInheritedParentId() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-subagent-rollout-\(UUID().uuidString).jsonl")
+        try #"{"type":"session_meta","payload":{"session_id":"parent-thread","id":"child-thread","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-thread"}}}}}"#
+            .write(to: path, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: path) }
+        XCTAssertEqual(
+            AppState.codexTranscriptSessionId(path: path.path, fallback: "filename-id"),
+            "child-thread"
+        )
+    }
+
     func testDesktopProviderThreadRequiresAnExactExistingIdentifier() {
         XCTAssertFalse(AppState.providerSessionIdentifiersMayRepresentSameSession(
             existing: nil,
@@ -464,6 +476,63 @@ final class AppStateCodexSubsessionTests: XCTestCase {
         XCTAssertNil(appState.sessions["codexapp:parent-thread"]?.subagents["cli-child"])
         XCTAssertNotNil(appState.sessions["parent-thread"]?.subagents["cli-child"])
         XCTAssertNil(appState.sessions["parent-thread"]?.subagents["desktop-child"])
+    }
+
+    func testNestedCodexSubagentsFoldIntoRootWhenChildArrivesFirst() {
+        let previousMode = UserDefaults.standard.object(forKey: SettingsKey.pluginSessionMode)
+        UserDefaults.standard.set("merge", forKey: SettingsKey.pluginSessionMode)
+        defer {
+            if let previousMode {
+                UserDefaults.standard.set(previousMode, forKey: SettingsKey.pluginSessionMode)
+            } else {
+                UserDefaults.standard.removeObject(forKey: SettingsKey.pluginSessionMode)
+            }
+        }
+
+        let appState = AppState()
+        var root = SessionSnapshot()
+        root.source = "codex"
+        root.providerSessionId = "root-thread"
+        root.status = .processing
+        appState.sessions["root-thread"] = root
+
+        let now = Date()
+        appState.integrateDiscovered([
+            AppState.DiscoveredSession(
+                sessionId: "grandchild-thread",
+                cwd: "/repo",
+                tty: nil,
+                model: nil,
+                pid: nil,
+                modifiedAt: now,
+                recentMessages: [],
+                source: "codex",
+                parentSessionId: "child-thread",
+                agentType: "worker",
+                status: .processing,
+                providerSessionId: "grandchild-thread"
+            ),
+            AppState.DiscoveredSession(
+                sessionId: "child-thread",
+                cwd: "/repo",
+                tty: nil,
+                model: nil,
+                pid: nil,
+                modifiedAt: now,
+                recentMessages: [],
+                source: "codex",
+                parentSessionId: "root-thread",
+                agentType: "worker",
+                status: .processing,
+                providerSessionId: "child-thread"
+            ),
+        ])
+
+        XCTAssertNil(appState.sessions["child-thread"])
+        XCTAssertNil(appState.sessions["grandchild-thread"])
+        XCTAssertEqual(appState.sessions["root-thread"]?.subagents.count, 2)
+        XCTAssertNotNil(appState.sessions["root-thread"]?.subagents["child-thread"])
+        XCTAssertNotNil(appState.sessions["root-thread"]?.subagents["grandchild-thread"])
     }
 
     func testCodexHookSubagentChoosesParentInItsDesktopNamespace() throws {

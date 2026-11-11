@@ -30,6 +30,8 @@ struct PersistedSession: Codable {
     let herdrPaneId: String?
     let herdrSocketPath: String?
     let herdrBinaryPath: String?
+    let herdrTerminalId: String?
+    let herdrTerminalSocket: String?
     let cliPid: Int32?
     let cliStartTime: Date?
     let startTime: Date
@@ -90,6 +92,8 @@ enum SessionPersistence {
                 herdrPaneId: s.herdrPaneId,
                 herdrSocketPath: s.herdrSocketPath,
                 herdrBinaryPath: s.herdrBinaryPath,
+                herdrTerminalId: s.herdrTerminalId,
+                herdrTerminalSocket: s.herdrTerminalSocket,
                 cliPid: s.cliPid,
                 cliStartTime: s.cliStartTime,
                 startTime: s.startTime,

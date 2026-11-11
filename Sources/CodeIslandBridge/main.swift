@@ -403,6 +403,17 @@ let effectiveSource = cliPromoted ?? inferredSource
 if let source = effectiveSource {
     json["_source"] = source
 }
+if SessionSnapshot.normalizedSupportedSource(effectiveSource) == "kiro",
+   let kiroProcess = ancestry.first(where: {
+       ["kiro-cli", "kiro-cli-chat"].contains((($0.executablePath ?? "") as NSString).lastPathComponent)
+   }),
+   !KiroSessionRouting.shouldForwardHook(
+       source: effectiveSource,
+       isACPProcess: KiroSessionRouting.isACPProcess(pid: Int32(kiroProcess.pid))
+   ) {
+    debugLog("hook ignored reason=kiro-acp-internal")
+    exit(0)
+}
 // Mark events that arrived via a plugin proxy (no explicit --source but
 // ancestry inferred a real source — e.g. the omo OpenCode plugin firing
 // Claude hooks) so the host app can route them per pluginSessionMode.
@@ -437,13 +448,20 @@ if json["session_id"] == nil,
     // (e.g. Cursor IDE spawning multiple parallel agent subprocesses, #148)
     // collapse onto a single session card instead of fanning into N cards
     // (one per sub-agent ppid).
-    let sessionPID = CLIProcessResolver.resolvedSessionPID(
+    // Returns nil when the only source match in the ancestry is a GUI host
+    // process (e.g. Kiro.app's main binary, ppid 1, shared by every window and
+    // workspace). Its PID cannot identify a session, so the event is dropped by
+    // the guard below instead of piling onto a global ghost card.
+    if let sessionPID = CLIProcessResolver.fallbackSessionPID(
         immediateParentPID: Int32(immediateParentPID),
         source: effectiveSource ?? source,
         ancestry: coreAncestry
-    )
-    json["session_id"] = "\(source)-ppid-\(sessionPID)"
-    debugLog("session_id missing, generated fallback id: \(json["session_id"] ?? "")")
+    ) {
+        json["session_id"] = "\(source)-ppid-\(sessionPID)"
+        debugLog("session_id missing, generated fallback id: \(json["session_id"] ?? "")")
+    } else {
+        debugLog("session_id missing and ancestry is a GUI app host; refusing ppid fallback")
+    }
 }
 guard let sessionId = json["session_id"] as? String, !sessionId.isEmpty else {
     debugLog("no session_id, dropping")
@@ -520,6 +538,17 @@ if let cmuxSurface = env["CMUX_SURFACE_ID"], !cmuxSurface.isEmpty {
 if let cmuxWorkspace = env["CMUX_WORKSPACE_ID"], !cmuxWorkspace.isEmpty {
     json["_cmux_workspace_id"] = cmuxWorkspace
 }
+// A shared Codex app-server keeps the CMUX environment of its original
+// launcher. Its hooks must point at the live terminal client for this CWD.
+if effectiveSource == "codex", json["_cmux_surface_id"] != nil,
+   let target = CmuxTerminalResolver.codexTarget(
+       cwd: json["cwd"] as? String,
+       preferredSurfaceId: json["_cmux_surface_id"] as? String
+   ) {
+    json["_cmux_surface_id"] = target.surfaceId
+    json["_cmux_workspace_id"] = target.workspaceId
+    json["_ppid"] = target.pid
+}
 
 // Zellij multiplexer detection — pane id + optional session name for precise tab focus
 if let zellij = env["ZELLIJ"], !zellij.isEmpty {
@@ -547,6 +576,16 @@ if env["HERDR_ENV"] == "1",
     if let binary = env["HERDR_BIN_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines), !binary.isEmpty {
         json["_herdr_bin_path"] = binary
     }
+}
+
+// Herdr Desktop runs terminals through herdr-core. Capture its stable terminal
+// address so click-to-jump can use the app's pane.focus command even though the
+// PTY reports the outer Ghostty identity.
+if let terminal = env["HC_TERMINAL_ID"]?.trimmingCharacters(in: .whitespacesAndNewlines), !terminal.isEmpty {
+    json["_herdr_terminal_id"] = terminal
+}
+if let socket = env["HC_TERMINAL_SOCKET"]?.trimmingCharacters(in: .whitespacesAndNewlines), !socket.isEmpty {
+    json["_herdr_terminal_socket"] = socket
 }
 
 // Superset (Electron agent-orchestration terminal) — TERM_PROGRAM is spoofed to "kitty"

@@ -73,4 +73,19 @@ final class HookServerCodexCanonicalizationTests: XCTestCase {
 
         XCTAssertEqual(payload["_term_bundle"] as? String, "com.apple.Terminal")
     }
+
+    func testDesktopSubagentHookUsesChildTranscriptId() throws {
+        let transcript = try makeTranscript(firstLine: #"{"type":"session_meta","payload":{"session_id":"parent-thread","id":"child-thread","originator":"Codex Desktop","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-thread"}}}}}"#)
+        defer { try? FileManager.default.removeItem(at: transcript) }
+
+        let payload = try canonicalizedPayload([
+            "hook_event_name": "SessionStart",
+            "session_id": "parent-thread",
+            "_source": "codex",
+            "transcript_path": transcript.path,
+        ])
+
+        XCTAssertEqual(payload["session_id"] as? String, "child-thread")
+        XCTAssertEqual(payload["_term_bundle"] as? String, AppState.codexAppBundleId)
+    }
 }

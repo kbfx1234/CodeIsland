@@ -67,7 +67,7 @@ enum SettingsKey {
     // Session cards
     static let showGitBranch = "showGitBranch"
 
-    // Token-usage footer (local Claude transcript aggregation)
+    // Usage statistics footer (local activity plus optional official Codex quota)
     static let showUsageStats = "showUsageStats"
 
     // Completion notification: "expand" | "glance" | "off". Successor of the

@@ -74,6 +74,12 @@ public struct SessionSnapshot: Sendable {
         "stepfun",
         "antigravity",
         "google-antigravity",
+        // Kiro is an Electron IDE whose helper processes sit in the ancestry of
+        // anything launched from its integrated terminal, and the loose
+        // `/<source>` default rule matches every one of them via "/kiro". It
+        // reports itself through `--source kiro` from its own hooks, so it never
+        // needs ancestry inference either.
+        "kiro",
     ]
 
     public var status: AgentStatus = .idle
@@ -130,6 +136,8 @@ public struct SessionSnapshot: Sendable {
     public var herdrPaneId: String?       // Herdr pane identifier (wN:pN)
     public var herdrSocketPath: String?   // Owning Herdr server socket
     public var herdrBinaryPath: String?   // Herdr executable captured from pane env
+    public var herdrTerminalId: String?   // Herdr Desktop terminal address (tN)
+    public var herdrTerminalSocket: String? // Herdr core socket for that terminal
     public var supersetWorkspaceId: String? // Superset workspace UUID (from SUPERSET_WORKSPACE_ID env var); presence means running inside Superset
     public var supersetPaneId: String?  // Superset pane/terminal id (from SUPERSET_PANE_ID / SUPERSET_TERMINAL_ID env var)
     /// Orca terminal handle (ORCA_TERMINAL_HANDLE) — the argument `orca terminal
@@ -362,6 +370,18 @@ public struct SessionSnapshot: Sendable {
     }
 
     public mutating func addRecentMessage(_ msg: ChatMessage, maxCount: Int = 3) {
+        // A single logical reply can arrive through more than one provider
+        // channel (for example Codex's Stop hook and JSONL transcript). Keep
+        // the append operation idempotent for an immediately repeated row,
+        // while still allowing the same text in a later turn.
+        if let last = recentMessages.last,
+           last.isUser == msg.isUser,
+           last.text == msg.text {
+            if recentMessages.count > maxCount {
+                recentMessages.removeFirst(recentMessages.count - maxCount)
+            }
+            return
+        }
         recentMessages.append(msg)
         if recentMessages.count > maxCount {
             recentMessages.removeFirst(recentMessages.count - maxCount)
@@ -775,8 +795,17 @@ public struct SessionSnapshot: Sendable {
     public var multiplexerLabel: String? {
         if zellijPaneId != nil || zellijSessionName != nil { return "zellij" }
         if tmuxEnv != nil || tmuxPane != nil { return "tmux" }
+        if hasHerdrDesktopRoute { return nil }
         if hasHerdrRoute { return "herdr" }
         return nil
+    }
+
+    /// Herdr Desktop runs the terminal through herdr-core and exposes its
+    /// stable terminal address separately from the old pane API.
+    public var hasHerdrDesktopRoute: Bool {
+        guard let terminal = herdrTerminalId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !terminal.isEmpty else { return false }
+        return true
     }
 
     /// Herdr routing needs both halves: a pane id aimed at the wrong server is
@@ -794,6 +823,9 @@ public struct SessionSnapshot: Sendable {
     public var terminalName: String? {
         if isRemote {
             return remoteDisplayName ?? "Remote"
+        }
+        if hasHerdrDesktopRoute {
+            return "Herdr"
         }
         // If termBundleId is a known app, show app name (APP mode)
         if let bid = termBundleId, let name = Self.appBundleNames[bid] {
@@ -1278,6 +1310,12 @@ public func reduceEvent(
         if let herdrBinary = event.rawJSON["_herdr_bin_path"] as? String, !herdrBinary.isEmpty {
             sessions[sessionId]?.herdrBinaryPath = herdrBinary
         }
+        if let herdrTerminal = event.rawJSON["_herdr_terminal_id"] as? String, !herdrTerminal.isEmpty {
+            sessions[sessionId]?.herdrTerminalId = herdrTerminal
+        }
+        if let herdrSocket = event.rawJSON["_herdr_terminal_socket"] as? String, !herdrSocket.isEmpty {
+            sessions[sessionId]?.herdrTerminalSocket = herdrSocket
+        }
         if let supersetWs = event.rawJSON["_superset_workspace_id"] as? String, !supersetWs.isEmpty {
             sessions[sessionId]?.supersetWorkspaceId = supersetWs
         }
@@ -1439,6 +1477,14 @@ private func applyEnvMetadata(into sessions: inout [String: SessionSnapshot], se
        let worktree = env["ORCA_WORKTREE_ID"], !worktree.isEmpty {
         sessions[sessionId]?.orcaWorktreeId = worktree
     }
+    if sessions[sessionId]?.herdrTerminalId == nil,
+       let terminal = env["HC_TERMINAL_ID"], !terminal.isEmpty {
+        sessions[sessionId]?.herdrTerminalId = terminal
+    }
+    if sessions[sessionId]?.herdrTerminalSocket == nil,
+       let socket = env["HC_TERMINAL_SOCKET"], !socket.isEmpty {
+        sessions[sessionId]?.herdrTerminalSocket = socket
+    }
 }
 
 /// Fill identity fields on a parent card from a merged Task/subagent hook.
@@ -1505,6 +1551,14 @@ public func fillMissingParentMetadataFromSubagentEvent(
     if sessions[sessionId]?.herdrBinaryPath == nil,
        let binary = event.rawJSON["_herdr_bin_path"] as? String, !binary.isEmpty {
         sessions[sessionId]?.herdrBinaryPath = binary
+    }
+    if sessions[sessionId]?.herdrTerminalId == nil,
+       let terminal = event.rawJSON["_herdr_terminal_id"] as? String, !terminal.isEmpty {
+        sessions[sessionId]?.herdrTerminalId = terminal
+    }
+    if sessions[sessionId]?.herdrTerminalSocket == nil,
+       let socket = event.rawJSON["_herdr_terminal_socket"] as? String, !socket.isEmpty {
+        sessions[sessionId]?.herdrTerminalSocket = socket
     }
 }
 
@@ -1647,6 +1701,12 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     }
     if let herdrBinary = event.rawJSON["_herdr_bin_path"] as? String, !herdrBinary.isEmpty {
         sessions[sessionId]?.herdrBinaryPath = herdrBinary
+    }
+    if let herdrTerminal = event.rawJSON["_herdr_terminal_id"] as? String, !herdrTerminal.isEmpty {
+        sessions[sessionId]?.herdrTerminalId = herdrTerminal
+    }
+    if let herdrSocket = event.rawJSON["_herdr_terminal_socket"] as? String, !herdrSocket.isEmpty {
+        sessions[sessionId]?.herdrTerminalSocket = herdrSocket
     }
     // Superset workspace / pane (injected by bridge from SUPERSET_* env vars). Presence routes
     // activation to com.superset.desktop instead of the spoofed kitty TERM_PROGRAM. (#213)

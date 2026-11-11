@@ -10,6 +10,8 @@ final class ConfigInstallerTests: XCTestCase {
         XCTAssertTrue(script.contains("CMUX_WORKSPACE_ID"))
         XCTAssertTrue(script.contains("_cmux_surface_id"))
         XCTAssertTrue(script.contains("_cmux_workspace_id"))
+        XCTAssertTrue(script.contains("HC_TERMINAL_ID"))
+        XCTAssertTrue(script.contains("_herdr_terminal_id"))
     }
 
     private func yamlRootDict(_ yaml: String, file: StaticString = #filePath, line: UInt = #line) throws -> [String: Any] {
@@ -1369,7 +1371,7 @@ hooks:
 
         let contents = try String(contentsOf: piExtensionPath)
         XCTAssertTrue(contents.contains("CodeIsland pi extension"))
-        XCTAssertTrue(contents.contains("// version: v4"))
+        XCTAssertTrue(contents.contains("// version: v5"))
         XCTAssertTrue(contents.contains("__codeislandAllowedToolCalls"))
         XCTAssertTrue(contents.contains("@earendil-works/pi-coding-agent"))
         XCTAssertTrue(ConfigInstaller.isPiExtensionInstalled(piExtensionPath: piExtensionPath.path, fm: fm))
@@ -1466,7 +1468,7 @@ hooks:
             )
 
             let rewritten = try String(contentsOf: ompExtensionPath)
-            XCTAssertTrue(rewritten.contains("// version: v7"))
+            XCTAssertTrue(rewritten.contains("// version: v8"))
             XCTAssertTrue(
                 ConfigInstaller.isOmpExtensionInstalled(
                     ompExtensionPath: ompExtensionPath.path,
@@ -1494,7 +1496,7 @@ hooks:
 
         let contents = try String(contentsOf: ompExtensionPath)
         XCTAssertTrue(contents.contains("CodeIsland pi extension"))
-        XCTAssertTrue(contents.contains("// version: v7"))
+        XCTAssertTrue(contents.contains("// version: v8"))
         XCTAssertTrue(contents.contains("@oh-my-pi/pi-coding-agent"))
         XCTAssertFalse(contents.contains("@earendil-works/pi-coding-agent"))
         XCTAssertTrue(ConfigInstaller.isOmpExtensionInstalled(ompExtensionPath: ompExtensionPath.path, fm: fm))

@@ -400,6 +400,15 @@ class HookServer {
             return data
         }
         raw["_term_bundle"] = AppState.codexAppBundleId
+        // Desktop hooks inherit the root thread's session_id even for a
+        // subagent rollout. Use the child id from session_meta so the hook
+        // cannot create a root card backed by a child transcript.
+        if AppState.codexSubagentMetadata(inTranscriptPath: transcriptPath) != nil {
+            raw["session_id"] = AppState.codexTranscriptSessionId(
+                path: transcriptPath,
+                fallback: sessionId
+            )
+        }
         guard let rewritten = try? JSONSerialization.data(withJSONObject: raw) else {
             return data
         }
@@ -732,6 +741,18 @@ class HookServer {
         if let rawSource = event.rawJSON["_source"] as? String,
            SessionSnapshot.normalizedSupportedSource(rawSource) == nil {
             log.warning("hook ignored reason=unsupported-source source=\(rawSource, privacy: .public) event=\(event.eventName, privacy: .public)")
+            sendResponse(connection: connection, data: Data("{}".utf8))
+            return
+        }
+
+        // ACP transport requests belong to their client harness's card.
+        if event.rawJSON["_remote_host_id"] == nil,
+           KiroSessionRouting.isInternalSession(
+               source: event.rawJSON["_source"] as? String,
+               sessionId: event.sessionId,
+               pid: KiroSessionRouting.pid(from: event.rawJSON["_ppid"])
+           ) {
+            if let sessionId = event.sessionId { appState.removeSession(sessionId) }
             sendResponse(connection: connection, data: Data("{}".utf8))
             return
         }

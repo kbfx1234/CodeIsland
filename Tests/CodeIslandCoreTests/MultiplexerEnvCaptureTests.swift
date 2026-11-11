@@ -265,6 +265,25 @@ final class MultiplexerEnvCaptureTests: XCTestCase {
         XCTAssertEqual(sessions["sess-herdr-tmux"]?.terminalName, "Ghostty")
     }
 
+    func testHerdrDesktopTerminalIdentityOverridesGhosttyHost() {
+        let event = makeEvent([
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-herdr-desktop",
+            "_term_app": "ghostty",
+            "_term_bundle": "dev.herdr.app",
+            "_herdr_terminal_id": "t3",
+            "_herdr_terminal_socket": "/tmp/herdr.sock",
+        ])
+
+        var sessions: [String: SessionSnapshot] = [:]
+        _ = reduceEvent(sessions: &sessions, event: event, maxHistory: 100)
+
+        XCTAssertEqual(sessions["sess-herdr-desktop"]?.herdrTerminalId, "t3")
+        XCTAssertTrue(sessions["sess-herdr-desktop"]?.hasHerdrDesktopRoute == true)
+        XCTAssertEqual(sessions["sess-herdr-desktop"]?.terminalName, "Herdr")
+        XCTAssertNil(sessions["sess-herdr-desktop"]?.multiplexerLabel)
+    }
+
     func testSubagentMetadataFillsMissingHerdrRouteWithoutOverwritingParent() {
         var parent = SessionSnapshot()
         parent.herdrPaneId = "existing-pane"

@@ -618,9 +618,13 @@ class PanelWindowController: NSObject, NSWindowDelegate {
             return
         }
 
-        if !panel.isVisible {
-            panel.orderFrontRegardless()
-        }
+        // A panel can remain `isVisible` while WindowServer has left its surface
+        // associated with the previous Space. Re-front it on every visibility
+        // update so switching between ordinary desktops restores the island.
+        // Reasserting the collection behavior also repairs the association if a
+        // display/Space transition caused macOS to drop the all-Spaces flag.
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.orderFrontRegardless()
         MascotAnimationGate.shared.setPanelVisible(true)
         MascotAnimationGate.shared.setIdleSettled(isIslandSettled())
     }

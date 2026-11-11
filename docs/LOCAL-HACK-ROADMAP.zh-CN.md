@@ -2,6 +2,19 @@
 
 这个 fork 面向个人本地使用，优先覆盖 `Codex CLI + Kiro CLI + cmux`。
 
+## 当前开发分支进度
+
+`codex/codex-runtime-profile` 已完成第一轮 Codex/Kiro 用量基础能力：
+
+- Codex 从 `auth.json` 和 `config.toml` 识别官方订阅、API key 与公司 API Router。
+- 只有官方订阅才请求 5 小时 / 每周 quota；Router 和 API key 只显示本地活动统计。
+- Codex rollout 的 `last_token_usage` 按 `session_meta.model_provider` 分组，支持增量读取和复制记录去重。
+- Kiro IDE `messages.jsonl` 增量读取、CLI `.json` 的 metering credits 读取，跨文件去重，并报告不可读记录。
+- Kiro 账户周期累计、套餐上限和重置日来自只读 `state.vscdb` 共享缓存；CLI `/usage` 可刷新此缓存，缓存超过 12 小时会提示过期。
+- 设置页显示当前 Codex provider、endpoint host 和 quota 能力；不展示凭据内容。
+
+下一阶段是持久化用量 Ledger、睡眠/网络恢复和按 reset cycle 的额度提醒。
+
 ## Phase 1A：ChatGPT/Codex Desktop 跳转
 
 - 已支持 `Codex Desktop` 识别和 `codex://threads/<providerSessionId>` deep link。

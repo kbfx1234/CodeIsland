@@ -114,7 +114,7 @@ export default {
 
     function collectEnv() {
       const env = {};
-      for (const key of ["TERM_PROGRAM", "ITERM_SESSION_ID", "TERM_SESSION_ID", "TMUX", "TMUX_PANE", "KITTY_WINDOW_ID", "__CFBundleIdentifier"]) {
+      for (const key of ["TERM_PROGRAM", "ITERM_SESSION_ID", "TERM_SESSION_ID", "TMUX", "TMUX_PANE", "KITTY_WINDOW_ID", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_BIN_PATH", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "__CFBundleIdentifier"]) {
         if (process.env[key]) env[key] = process.env[key];
       }
       return env;
@@ -415,7 +415,7 @@ export default {
         await sendRemoteHook(mapped, 3000);
       },
       "shell.env": async (input, output) => {
-        for (const key of ["TERM_PROGRAM", "ITERM_SESSION_ID", "TERM_SESSION_ID", "TMUX", "TMUX_PANE", "KITTY_WINDOW_ID", "__CFBundleIdentifier"]) {
+        for (const key of ["TERM_PROGRAM", "ITERM_SESSION_ID", "TERM_SESSION_ID", "TMUX", "TMUX_PANE", "KITTY_WINDOW_ID", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_BIN_PATH", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "__CFBundleIdentifier"]) {
           if (process.env[key]) output.env["_CI_" + key] = process.env[key];
         }
       },

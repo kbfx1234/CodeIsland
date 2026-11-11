@@ -130,6 +130,60 @@ public enum CLIProcessResolver {
         return immediateParentPID
     }
 
+    /// True when `path` is the executable of a GUI application bundle — either
+    /// the app's own binary (`Foo.app/Contents/MacOS/Foo`) or one of its
+    /// embedded helper processes (`.../Contents/Frameworks/Foo Helper.app/...`).
+    ///
+    /// Deliberately does NOT match CLI binaries that merely ship inside a
+    /// bundle's resources (e.g. `ChatGPT.app/Contents/Resources/codex`): those
+    /// are one process per CLI session and remain valid session identities.
+    public static func isGUIApplicationHostPath(_ path: String?) -> Bool {
+        guard let path, !path.isEmpty else { return false }
+        let lowercased = path.lowercased()
+        guard lowercased.contains(".app/contents/") else { return false }
+        return lowercased.contains(".app/contents/macos/")
+            || lowercased.contains(".app/contents/frameworks/")
+    }
+
+    /// PID to build a `<source>-ppid-<pid>` fallback session id from, or `nil`
+    /// when no PID in the ancestry can legitimately identify a session.
+    ///
+    /// The distinction that matters: a CLI process is one-per-session, so its
+    /// PID is a usable identity (#148 — parallel `cursor-agent` sub-agents all
+    /// collapse onto the root CLI PID, giving one card instead of N). A GUI host
+    /// process is one-per-*application*: `/Applications/Kiro.app/Contents/MacOS/Kiro`
+    /// has `ppid == 1` and lives across every window, workspace, and session the
+    /// IDE ever opens. Keying a session on it produces a single global ghost card
+    /// that every session-id-less event from that IDE piles onto, sitting next to
+    /// the real cards.
+    ///
+    /// So when the root-most source match is a GUI host, refuse outright rather
+    /// than degrading to `immediateParentPID` — that degradation is equally
+    /// wrong, just noisier: it mints a fresh id per invoking shell, producing an
+    /// endless trickle of orphan cards instead of one persistent ghost. Desktop
+    /// IDEs always carry their own session id, so an event that reaches here
+    /// without one did not come from a real IDE session and has no card to own.
+    ///
+    /// `nil` is only returned for the GUI-host case; every other path keeps the
+    /// previous behavior, including the no-match degradation to the immediate
+    /// parent that non-IDE CLIs rely on.
+    public static func fallbackSessionPID(
+        immediateParentPID: Int32,
+        source: String?,
+        ancestry: [(pid: Int32, executablePath: String?)]
+    ) -> Int32? {
+        guard immediateParentPID > 0 else { return immediateParentPID }
+
+        if let rootMatch = ancestry.last(where: {
+            sourceMatchesExecutablePath($0.executablePath ?? "", source: source)
+        }) {
+            if isGUIApplicationHostPath(rootMatch.executablePath) { return nil }
+            return rootMatch.pid
+        }
+
+        return immediateParentPID
+    }
+
     /// Walk the process ancestry and return the first known CLI source whose binary
     /// appears along the chain. Used when a hook event reaches the bridge without a
     /// `--source` tag (e.g. omo plugin firing Claude hooks from inside OpenCode), so

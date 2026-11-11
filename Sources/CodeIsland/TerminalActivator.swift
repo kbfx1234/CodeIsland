@@ -3,7 +3,7 @@ import ApplicationServices
 import os
 import CodeIslandCore
 
-/// Activates the terminal window/tab running a specific Claude Code session.
+/// Activates the terminal window/tab or Herdr Desktop terminal running a session.
 /// Supports tab-level switching for: Ghostty, iTerm2, Terminal.app, WezTerm, kitty.
 /// Falls back to app-level activation for: Alacritty, Warp, Hyper, Tabby, Rio.
 struct TerminalActivator {
@@ -137,6 +137,21 @@ struct TerminalActivator {
             jumpLog.info("jump skipped route=remote session=\(sessionId ?? "-", privacy: .public)")
             return
         }
+        if let terminal = session.herdrTerminalId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !terminal.isEmpty {
+            DispatchQueue.global(qos: .userInitiated).async {
+                if HerdrDesktopController.focus(terminalId: terminal) {
+                    jumpLog.info("jump route=herdr-desktop result=accepted terminal=\(terminal, privacy: .public)")
+                } else {
+                    jumpLog.error("jump route=herdr-desktop result=rejected terminal=\(terminal, privacy: .public)")
+                    var fallback = session
+                    fallback.herdrTerminalId = nil
+                    fallback.herdrTerminalSocket = nil
+                    activate(session: fallback, sessionId: sessionId, allowHerdr: false)
+                }
+            }
+            return
+        }
         if allowHerdr && activateHerdrIfAvailable(session: session, sessionId: sessionId) {
             jumpLog.info("jump route=herdr session=\(sessionId ?? "-", privacy: .public)")
             return
@@ -149,7 +164,8 @@ struct TerminalActivator {
             jumpLog.info("jump route=cmux session=\(sessionId ?? "-", privacy: .public) surface=\(session.cmuxSurfaceId ?? "-", privacy: .public) workspace=\(session.cmuxWorkspaceId ?? "-", privacy: .public)")
             activateCmux(
                 surfaceId: session.cmuxSurfaceId,
-                workspaceId: session.cmuxWorkspaceId
+                workspaceId: session.cmuxWorkspaceId,
+                codexCwd: session.source == "codex" ? session.cwd : nil
             )
             return
         }
@@ -1458,7 +1474,7 @@ struct TerminalActivator {
         return args
     }
 
-    private static func activateCmux(surfaceId: String?, workspaceId: String?) {
+    private static func activateCmux(surfaceId: String?, workspaceId: String?, codexCwd: String? = nil) {
         // Reuse activateByBundleId: unified handling of Space switching, hidden state, app not running, etc.
         activateByBundleId("com.cmuxterm.app")
 
@@ -1479,10 +1495,16 @@ struct TerminalActivator {
 
         // Invoke focus-panel CLI asynchronously to avoid blocking the main thread
         DispatchQueue.global(qos: .userInitiated).async {
-            if runProcess(cmuxBin, args: args) == nil {
-                jumpLog.error("jump route=cmux result=focus-panel-failed binary=\(cmuxBin, privacy: .public) args=\(args.joined(separator: " "), privacy: .public)")
+            // Recheck saved snapshots too: they may still contain a shared
+            // Codex daemon's original terminal rather than the current TUI.
+            let target = CmuxTerminalResolver.codexTarget(cwd: codexCwd, preferredSurfaceId: surfaceId)
+            let resolvedArgs = target.flatMap {
+                cmuxFocusArguments(surfaceId: $0.surfaceId, workspaceId: $0.workspaceId)
+            } ?? args
+            if runProcess(cmuxBin, args: resolvedArgs) == nil {
+                jumpLog.error("jump route=cmux result=focus-panel-failed binary=\(cmuxBin, privacy: .public) args=\(resolvedArgs.joined(separator: " "), privacy: .public)")
             } else {
-                jumpLog.info("jump route=cmux result=focus-panel-accepted binary=\(cmuxBin, privacy: .public) args=\(args.joined(separator: " "), privacy: .public)")
+                jumpLog.info("jump route=cmux result=focus-panel-accepted binary=\(cmuxBin, privacy: .public) args=\(resolvedArgs.joined(separator: " "), privacy: .public)")
             }
         }
     }

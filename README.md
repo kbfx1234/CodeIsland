@@ -30,6 +30,8 @@ This is a personal public fork maintained by [kbfx1234](https://github.com/kbfx1
 ## What this fork adds
 
 - **Codex Desktop identity and routing** — Uses the real thread ID from transcript metadata, supports `codex://threads/<id>` deep links, filters internal review threads, and merges subagents into their parent session.
+- **Codex provider-aware usage** — Detects official OAuth, API-key, and custom API-router runtimes from local Codex config. Official subscriptions can show the provider's 5-hour and weekly quota; custom routers show local token activity only because their limits are controlled by the organization.
+- **Codex and Kiro usage** — Reads Codex rollout tokens and Kiro CLI/IDE session credits locally, while showing Kiro account-cycle credits from the read-only shared usage cache when available. Local activity and account quota stay separate.
 - **Codex duplicate-session protection** — Prevents rollout continuation filenames from creating a second island card for the same conversation, while keeping separate Desktop and CLI sessions isolated.
 - **Claude Code + cmux precision** — Carries `CMUX_SURFACE_ID` and `CMUX_WORKSPACE_ID` through the native bridge and shell fallback, then focuses the exact cmux surface when a card is clicked.
 - **Kiro CLI support** — Adds v2/v3 hook installation, session discovery, local usage reporting, and Kiro-specific health diagnostics.

@@ -147,21 +147,21 @@ final class KiroSupportTests: XCTestCase {
         XCTAssertEqual(entry["matcher"] as? String, ".*")
     }
 
-    func testKiroV3UsesStandalonePascalCaseSchema() {
+    func testKiroV3OnlyInstallsTurnBoundaryHooks() {
         XCTAssertEqual(ConfigInstaller.kiroV3EventNames, [
-            "AgentSpawn", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"
+            "UserPromptSubmit", "Stop"
         ])
 
-        let toolEntry = ConfigInstaller.kiroV3HookEntry(
-            trigger: "PreToolUse", name: "pre-tool-use",
+        let startEntry = ConfigInstaller.kiroV3HookEntry(
+            trigger: "UserPromptSubmit", name: "user-prompt-submit",
             command: "/tmp/codeisland-bridge --source kiro", timeout: 5
         )
-        XCTAssertEqual(toolEntry["name"] as? String, "codeisland-pre-tool-use")
-        XCTAssertEqual(toolEntry["trigger"] as? String, "PreToolUse")
-        XCTAssertEqual(toolEntry["matcher"] as? String, ".*")
-        XCTAssertEqual(toolEntry["timeout"] as? Int, 5)
-        XCTAssertEqual(toolEntry["enabled"] as? Bool, true)
-        let action = toolEntry["action"] as? [String: Any]
+        XCTAssertEqual(startEntry["name"] as? String, "codeisland-user-prompt-submit")
+        XCTAssertEqual(startEntry["trigger"] as? String, "UserPromptSubmit")
+        XCTAssertNil(startEntry["matcher"])
+        XCTAssertEqual(startEntry["timeout"] as? Int, 5)
+        XCTAssertEqual(startEntry["enabled"] as? Bool, true)
+        let action = startEntry["action"] as? [String: Any]
         XCTAssertEqual(action?["type"] as? String, "command")
         XCTAssertEqual(action?["command"] as? String, "/tmp/codeisland-bridge --source kiro")
 
@@ -170,6 +170,26 @@ final class KiroSupportTests: XCTestCase {
             command: "/tmp/codeisland-bridge --source kiro", timeout: 5
         )
         XCTAssertNil(lifecycleEntry["matcher"])
+    }
+
+    func testKiroV3MigratesLegacyToolHooksWithoutTouchingOtherHooks() {
+        let command = "/tmp/codeisland-bridge --source kiro"
+        let legacy = [("AgentSpawn", "agent-spawn"), ("UserPromptSubmit", "user-prompt-submit"),
+                      ("PreToolUse", "pre-tool-use"), ("PostToolUse", "post-tool-use"),
+                      ("Stop", "stop")].map {
+            ConfigInstaller.kiroV3HookEntry(trigger: $0.0, name: $0.1, command: command, timeout: 5)
+        }
+        let other: [String: Any] = ["name": "image-check", "trigger": "PreToolUse",
+                                    "action": ["type": "command", "command": "/usr/bin/true"]]
+        XCTAssertFalse(ConfigInstaller.kiroV3HooksInstalled(legacy + [other], command: command))
+
+        let updated = ConfigInstaller.kiroV3Hooks(replacingManaged: legacy + [other], command: command)
+        XCTAssertTrue(ConfigInstaller.kiroV3HooksInstalled(updated, command: command))
+        XCTAssertEqual(updated.count, 3)
+        XCTAssertEqual(updated.first?["name"] as? String, "image-check")
+        XCTAssertEqual(Set(updated.compactMap { $0["trigger"] as? String }),
+                       ["PreToolUse", "UserPromptSubmit", "Stop"])
+        XCTAssertEqual(updated.filter { ($0["name"] as? String)?.hasPrefix("codeisland-") == true }.count, 2)
     }
 
     func testKiroV2AndV3EventNamesStayDistinct() {
