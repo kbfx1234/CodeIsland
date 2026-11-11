@@ -251,6 +251,36 @@ public enum CLIProcessResolver {
         return immediateParentPID
     }
 
+    /// True when `path` is the executable of a GUI application bundle rather
+    /// than a CLI binary shipped inside an app's Resources directory.
+    public static func isGUIApplicationHostPath(_ path: String?) -> Bool {
+        guard let path, !path.isEmpty else { return false }
+        let lowercased = path.lowercased()
+        guard lowercased.contains(".app/contents/") else { return false }
+        return lowercased.contains(".app/contents/macos/")
+            || lowercased.contains(".app/contents/frameworks/")
+    }
+
+    /// PID to use when a hook has no stable session id. GUI host processes are
+    /// shared by every IDE window, so refusing that fallback avoids a global
+    /// ghost card; ordinary CLI processes keep the source-root PID behavior.
+    public static func fallbackSessionPID(
+        immediateParentPID: Int32,
+        source: String?,
+        ancestry: [(pid: Int32, executablePath: String?)]
+    ) -> Int32? {
+        guard immediateParentPID > 0 else { return immediateParentPID }
+
+        if let rootMatch = ancestry.last(where: {
+            sourceMatchesExecutablePath($0.executablePath ?? "", source: source)
+        }) {
+            if isGUIApplicationHostPath(rootMatch.executablePath) { return nil }
+            return rootMatch.pid
+        }
+
+        return immediateParentPID
+    }
+
     /// `_term_bundle` for a Codex hook that reached the bridge without one.
     /// ChatGPT starts Codex Desktop's app-server
     /// (`ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`)
