@@ -1,11 +1,75 @@
 import Foundation
 
+/// A running Codex process that session discovery maps rollouts to.
+public enum CodexProcessRole: Equatable, Sendable {
+    /// Codex Desktop's shared app-server: every Desktop thread, any cwd.
+    case desktopHost
+    /// A process that owns the rollouts started in its own cwd.
+    case session
+}
+
 public enum CLIProcessResolver {
+    /// Lowercased bundle markers of the Trae CN desktop IDE (bundle id
+    /// `cn.trae.app`). It has shipped as `Trae CN.app` since its first macOS
+    /// build (Homebrew `trae-cn` cask; TraeCode CN 3.3.104 still is), with
+    /// `Electron` as the main binary and `Trae CN Helper …` helpers — so the
+    /// generic `/traecn` substring rule never matched it. `TraeCode CN.app`
+    /// covers the product's new `nameAlias`, and `TraeCN.app` the name this
+    /// code first assumed. None of them matches the international `Trae.app`.
+    public static let traeCNBundlePathMarkers = [
+        "/trae cn.app/contents/",
+        "/traecode cn.app/contents/",
+        "/traecn.app/contents/",
+    ]
+
+    public static func isTraeCNBundlePath(_ path: String) -> Bool {
+        let lowercasedPath = path.lowercased()
+        return traeCNBundlePathMarkers.contains { lowercasedPath.contains($0) }
+    }
+
+    /// The MiMo Code CLI binary, however it was installed: the curl installer
+    /// writes `~/.mimocode/bin/mimo`; npm's `@mimo-ai/cli` keeps the real
+    /// binary at `bin/.mimocode` (its `bin/mimo` is a Node launcher, so the
+    /// process is `node`) or runs `@mimo-ai/mimocode-<os>-<arch>/bin/mimo`.
+    ///
+    /// Deliberately not the Xiaomi MiMo desktop app: it runs the same engine
+    /// inside its Electron main process and has an integrated terminal, so
+    /// claiming its bundle here would pin any agent started in that terminal
+    /// on MiMo during ancestry inference. The desktop reports itself through
+    /// the plugin's `_source` instead.
+    public static func isMimoCLIPath(_ path: String) -> Bool {
+        let lowercasedPath = path.lowercased()
+        let basename = (lowercasedPath as NSString).lastPathComponent
+        return basename == "mimo"
+            || (basename == ".mimocode" && lowercasedPath.contains("/@mimo-ai/cli/"))
+            || lowercasedPath.contains("/@mimo-ai/mimocode-")
+    }
+
+    /// Lowercased bundle markers of the Xiaomi MiMo desktop app: the mainland
+    /// edition (`Xiaomi MiMo.app`, com.xiaomi.mimo.desktop) and the overseas
+    /// one (`Xiaomi MiMo AI.app`, com.xiaomi.mimo.desktop-ai). Read from the
+    /// 26.929 builds' Info.plist and product table.
+    public static let mimoDesktopBundlePathMarkers = [
+        "/xiaomi mimo.app/contents/",
+        "/xiaomi mimo ai.app/contents/",
+    ]
+
+    public static func isMimoDesktopBundlePath(_ path: String) -> Bool {
+        let lowercasedPath = path.lowercased()
+        return mimoDesktopBundlePathMarkers.contains { lowercasedPath.contains($0) }
+    }
+
     public static func sourceMatchesExecutablePath(_ path: String, source: String?) -> Bool {
         guard let normalizedSource = SessionSnapshot.normalizedSupportedSource(source) else { return false }
         let lowercasedPath = path.lowercased()
 
         switch normalizedSource {
+        case "traecn":
+            // Trae CN runs hooks through `bash -c`, so the bridge's own parent
+            // is a throwaway shell. Matching the bundle lets `_ppid` resolve to
+            // the long-lived Trae CN process instead; tracking the shell would
+            // idle or drop the card as soon as each hook returns.
+            return isTraeCNBundlePath(lowercasedPath)
         case "traecli":
             return lowercasedPath.hasSuffix("/coco")
                 || lowercasedPath.hasSuffix("/traecli")
@@ -14,7 +78,10 @@ public enum CLIProcessResolver {
         case "codex":
             return lowercasedPath.hasSuffix("/codex") || lowercasedPath.contains("/codex ")
         case "claude":
+            // The native installer (Claude Code's default) runs the binary
+            // named by its version: ~/.local/share/claude/versions/2.1.294.
             return lowercasedPath.hasSuffix("/claude") || lowercasedPath.contains("/claude ")
+                || lowercasedPath.contains("/.local/share/claude/versions/")
         case "dsh":
             // DeepSeek Harness CLI ships a `dsh` binary. It has no shell hooks —
             // the dsh-island plugin forwards events over the socket directly.
@@ -57,6 +124,23 @@ public enum CLIProcessResolver {
             return lowercasedPath.hasSuffix("/agy")
                 || lowercasedPath.contains("/agy ")
                 || lowercasedPath.contains("/google-antigravity")
+        case "minimax":
+            // MiniMax Code CLI is `mcode` (npm @minimax-ai/code). The Node
+            // runtime renames the process title to `minimax-code`, so the
+            // renamed spelling shows up in argv where other CLIs carry their
+            // launch path; the npm layout covers launches that keep the
+            // original script path.
+            let basename = (lowercasedPath as NSString).lastPathComponent
+            return basename == "mcode"
+                || basename == "minimax-code"
+                || lowercasedPath.contains("/@minimax-ai/code/")
+        case "mimo":
+            return isMimoCLIPath(lowercasedPath)
+        case "pi":
+            // pi and Oh My Pi by name: as a substring, "/pi" is also pinentry,
+            // pip, pico, and every program under a home folder like /Users/pierre.
+            let basename = (lowercasedPath as NSString).lastPathComponent
+            return basename == "pi" || basename == "omp" || lowercasedPath.contains("/pi-coding-agent/")
         default:
             return lowercasedPath.contains("/\(normalizedSource)")
         }
@@ -87,6 +171,43 @@ public enum CLIProcessResolver {
             break
         }
         return nil
+    }
+
+    /// The source the bridge stamps on an event, and whether it came through
+    /// another agent's hook (`_via_plugin`).
+    ///
+    /// Declared = `--source`, or — for a direct plugin (OpenCode, MiMo Code,
+    /// Pi / OMP, OpenClaw) piping its own blocking request in without the flag
+    /// — the supported `_source` already in its payload. Only an undeclared
+    /// event is attributed by ancestry and marked as proxied. Treating a
+    /// plugin's own request as proxied let ancestry relabel it, and handed its
+    /// approval to Agent Sub-Sessions, whose "hide" mode answers `_via_plugin`
+    /// permission requests with an automatic allow.
+    ///
+    /// The one hook installed without `--source` is Claude Code's
+    /// (`codeisland-hook.sh`, so that another agent firing it — omo — is still
+    /// inferred). When the ancestry says Claude, it is Claude's own hook, not
+    /// a proxy: otherwise "hide" would auto-allow and hide every Claude Code
+    /// session whose binary ends in `/claude` (Homebrew cask, Claude Desktop).
+    ///
+    /// Cursor runs that hook too, as one of the Claude Code hooks it imports,
+    /// and hands it its own payload (`cursorPayload`, see ``CursorHookPayload``).
+    /// That is Cursor's event, declared the way its `--source cursor` hooks
+    /// are: its processes are never inferred (#220), so it used to fall to the
+    /// app's default and show as Claude (#377).
+    public static func bridgeSource(
+        sourceTag: String?,
+        payloadSource: String?,
+        cursorPayload: Bool = false,
+        ancestry: [(pid: Int32, executablePath: String?)]
+    ) -> (source: String?, viaPlugin: Bool) {
+        let declared = sourceTag
+            ?? SessionSnapshot.normalizedSupportedSource(payloadSource)
+            ?? (cursorPayload ? CursorHookPayload.source : nil)
+        let inferred = declared ?? inferSource(ancestry: ancestry)
+        let effective = cliVariantOverride(declaredSource: inferred, ancestry: ancestry) ?? inferred
+        let viaPlugin = declared == nil && effective != nil && effective != "claude"
+        return (effective, viaPlugin)
     }
 
     public static func resolvedTrackedPID(
@@ -130,58 +251,82 @@ public enum CLIProcessResolver {
         return immediateParentPID
     }
 
-    /// True when `path` is the executable of a GUI application bundle — either
-    /// the app's own binary (`Foo.app/Contents/MacOS/Foo`) or one of its
-    /// embedded helper processes (`.../Contents/Frameworks/Foo Helper.app/...`).
+    /// `_term_bundle` for a Codex hook that reached the bridge without one.
+    /// ChatGPT starts Codex Desktop's app-server
+    /// (`ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`)
+    /// without `__CFBundleIdentifier`, so its hooks were keyed as a CLI
+    /// thread next to the `codexapp:` card discovery makes for the same thread.
     ///
-    /// Deliberately does NOT match CLI binaries that merely ship inside a
-    /// bundle's resources (e.g. `ChatGPT.app/Contents/Resources/codex`): those
-    /// are one process per CLI session and remain valid session identities.
-    public static func isGUIApplicationHostPath(_ path: String?) -> Bool {
-        guard let path, !path.isEmpty else { return false }
-        let lowercased = path.lowercased()
-        guard lowercased.contains(".app/contents/") else { return false }
-        return lowercased.contains(".app/contents/macos/")
-            || lowercased.contains(".app/contents/frameworks/")
+    /// The binary cannot tell: it also runs Codex CLI from a terminal (ChatGPT's
+    /// `codex-cli/bin/codex` launcher) and the app-server Claude Code's Codex
+    /// plugin starts (#368), and its own outermost `.app` is ChatGPT.app every
+    /// time. So the nearest Codex process must run the `app-server` subcommand,
+    /// and its direct parent must be the app itself; `exec codex` in ChatGPT's
+    /// own terminal also leaves ChatGPT as the parent.
+    /// Bundled tool hosts share that outer bundle ID, so the parent must also
+    /// be an executable in the host app's own `Contents/MacOS` directory.
+    public static func codexDesktopTermBundle(ancestry: [ProcessAncestor]) -> String? {
+        guard let codexIndex = ancestry.firstIndex(where: {
+            sourceMatchesExecutablePath($0.executablePath ?? "", source: "codex")
+        }), isCodexAppServerInvocation(ancestry[codexIndex].arguments),
+              codexIndex + 1 < ancestry.count,
+              ancestry[codexIndex + 1].bundleIdentifier == "com.openai.codex",
+              let parentPath = ancestry[codexIndex + 1].executablePath,
+              let appPath = HostHarnessResolver.outermostAppBundlePath(forExecutable: parentPath),
+              URL(fileURLWithPath: parentPath).standardizedFileURL.deletingLastPathComponent().path
+                == URL(fileURLWithPath: appPath).standardizedFileURL.appendingPathComponent("Contents/MacOS").path else {
+            return nil
+        }
+        return "com.openai.codex"
     }
 
-    /// PID to build a `<source>-ppid-<pid>` fallback session id from, or `nil`
-    /// when no PID in the ancestry can legitimately identify a session.
-    ///
-    /// The distinction that matters: a CLI process is one-per-session, so its
-    /// PID is a usable identity (#148 — parallel `cursor-agent` sub-agents all
-    /// collapse onto the root CLI PID, giving one card instead of N). A GUI host
-    /// process is one-per-*application*: `/Applications/Kiro.app/Contents/MacOS/Kiro`
-    /// has `ppid == 1` and lives across every window, workspace, and session the
-    /// IDE ever opens. Keying a session on it produces a single global ghost card
-    /// that every session-id-less event from that IDE piles onto, sitting next to
-    /// the real cards.
-    ///
-    /// So when the root-most source match is a GUI host, refuse outright rather
-    /// than degrading to `immediateParentPID` — that degradation is equally
-    /// wrong, just noisier: it mints a fresh id per invoking shell, producing an
-    /// endless trickle of orphan cards instead of one persistent ghost. Desktop
-    /// IDEs always carry their own session id, so an event that reaches here
-    /// without one did not come from a real IDE session and has no card to own.
-    ///
-    /// `nil` is only returned for the GUI-host case; every other path keeps the
-    /// previous behavior, including the no-match degradation to the immediate
-    /// parent that non-IDE CLIs rely on.
-    public static func fallbackSessionPID(
-        immediateParentPID: Int32,
-        source: String?,
-        ancestry: [(pid: Int32, executablePath: String?)]
-    ) -> Int32? {
-        guard immediateParentPID > 0 else { return immediateParentPID }
+    /// Desktop runs `codex [-c key=value]… app-server …`. Anything else ahead
+    /// of `app-server` (`exec`, `--`, another option) means it is a prompt or
+    /// an option value, not the subcommand. argv[0] must be `codex` too: an
+    /// empty one is dropped by ProcArgsParser and shifts the rest left.
+    static func isCodexAppServerInvocation(_ arguments: [String]) -> Bool {
+        codexSubcommand(arguments) == "app-server"
+    }
 
-        if let rootMatch = ancestry.last(where: {
-            sourceMatchesExecutablePath($0.executablePath ?? "", source: source)
-        }) {
-            if isGUIApplicationHostPath(rootMatch.executablePath) { return nil }
-            return rootMatch.pid
+    /// The first word after `codex [-c key=value]…`, or nil when argv[0] is
+    /// not `codex` or that word is an option. A bare prompt reads as one too,
+    /// so callers only compare it against known subcommand names.
+    static func codexSubcommand(_ arguments: [String]) -> String? {
+        guard let program = arguments.first, (program as NSString).lastPathComponent == "codex" else {
+            return nil
         }
+        var index = 1
+        while index < arguments.count, arguments[index] == "-c" || arguments[index] == "--config" {
+            index += 2
+        }
+        guard index < arguments.count, !arguments[index].hasPrefix("-") else { return nil }
+        return arguments[index]
+    }
 
-        return immediateParentPID
+    /// Subcommands that never write a rollout. ChatGPT keeps `exec-server`
+    /// (cloud environments) running next to Desktop's app-server, from its
+    /// Resources directory.
+    static let codexNonSessionSubcommands: Set<String> = [
+        "exec-server", "login", "logout", "completion", "sandbox", "debug",
+        "apply", "cloud", "features", "mcp", "responses-api-proxy", "stdio-to-uds",
+    ]
+
+    /// What a process running ChatGPT's bundled Codex binary is to session
+    /// discovery, from its argv and its parent (`ancestry[0]` is the Codex
+    /// process). The same file runs Desktop's app-server, which hosts every
+    /// Desktop thread; ChatGPT's helpers, which host none and must not claim
+    /// rollouts by cwd; and everything else (a terminal TUI, `exec`, the
+    /// app-server Claude Code's Codex plugin starts), which owns its own.
+    public static func codexBundledProcessRole(ancestry: [ProcessAncestor]) -> CodexProcessRole? {
+        guard let process = ancestry.first else { return nil }
+        if codexDesktopTermBundle(ancestry: ancestry) != nil {
+            return .desktopHost
+        }
+        if let subcommand = codexSubcommand(process.arguments),
+           codexNonSessionSubcommands.contains(subcommand) {
+            return nil
+        }
+        return .session
     }
 
     /// Walk the process ancestry and return the first known CLI source whose binary
@@ -213,12 +358,26 @@ public enum CLIProcessResolver {
     }
 }
 
-public enum AgentStatus: Sendable {
+public enum AgentStatus: Sendable, Equatable {
     case idle
     case processing
     case running
     case waitingApproval
     case waitingQuestion
+}
+
+/// Stable activity groups used for compact status text. The raw tool name stays
+/// on ``HookEvent`` for permission routing and provider-specific behavior.
+public enum ToolActivityCategory: String, Sendable {
+    case reading
+    case searching
+    case editing
+    case shell
+    case browser
+    case mcp
+    case delegation
+    case question
+    case other
 }
 
 public struct HookEvent {
@@ -231,28 +390,21 @@ public struct HookEvent {
     public let rawJSON: [String: Any]  // Full payload for event-specific fields
 
     public init?(from data: Data) {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let eventName = HookEvent.firstString(in: json, keys: ["hook_event_name", "hookEventName", "event_name", "eventName"]) else {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        self.init(json: json)
+    }
+
+    /// A hook from its payload already parsed (HookServer parses one once to
+    /// route it under Agent Sub-Sessions).
+    public init?(json: [String: Any]) {
+        guard let eventName = HookEvent.firstString(in: json, keys: ["hook_event_name", "hookEventName", "event_name", "eventName"]) else {
             return nil
         }
         self.eventName = eventName
-        let rawSessionId = HookEvent.firstString(in: json, keys: ["session_id", "sessionId"])
-        if let rawSessionId,
-           let remoteHostId = json["_remote_host_id"] as? String,
-           !remoteHostId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            self.sessionId = "remote:\(remoteHostId):\(rawSessionId)"
-        } else if let rawSessionId,
-                  (json["_source"] as? String)?.lowercased() == "codex",
-                  json["_term_bundle"] as? String == "com.openai.codex" {
-            // Codex Desktop hooks, app-server notifications, rollout discovery,
-            // and state-DB polling must all address one card. Keep the provider's
-            // raw id in rawJSON for title lookup and persisted providerSessionId.
-            self.sessionId = rawSessionId.hasPrefix("codexapp:")
-                ? rawSessionId
-                : "codexapp:\(rawSessionId)"
-        } else {
-            self.sessionId = rawSessionId
-        }
+        self.sessionId = HookEvent.firstString(in: json, keys: ["session_id", "sessionId"])
+            .map { HookEvent.cardSessionId(forRawSessionId: $0, in: json) }
         self.toolName = HookEvent.firstString(in: json, keys: ["tool_name", "toolName", "tool", "name"])
             ?? HookEvent.firstString(inNestedDictionary: json, containerKeys: ["tool", "payload", "data"], keys: ["name", "tool_name", "toolName"])
             ?? HookEvent.firstString(inNestedDictionary: json, containerKeys: ["toolCall"], keys: ["name"])
@@ -269,11 +421,55 @@ public struct HookEvent {
         self.toolInput = HookEvent.firstDictionary(in: json, keys: ["tool_input", "toolInput", "input", "arguments", "args", "params"])
             ?? HookEvent.firstDictionary(inNestedDictionary: json, containerKeys: ["tool", "payload", "data"], keys: ["input", "tool_input", "toolInput", "arguments", "args", "params"])
             ?? HookEvent.firstDictionary(inNestedDictionary: json, containerKeys: ["toolCall"], keys: ["args"])
-        self.agentId = json["agent_id"] as? String
+        self.agentId = HookEvent.agentIdMarksSubagent(source: json["_source"] as? String)
+            ? json["agent_id"] as? String
+            : nil
         self.rawJSON = json
     }
 
+    /// The card a session id from a payload is filed under. Remote hosts get
+    /// a namespace of their own, and Codex Desktop hooks, app-server
+    /// notifications, rollout discovery and state-DB polling must all address
+    /// one `codexapp:` card. The provider's raw id stays in rawJSON for title
+    /// lookup and the persisted providerSessionId.
+    public static func cardSessionId(forRawSessionId rawSessionId: String, in json: [String: Any]) -> String {
+        if let remoteHostId = json["_remote_host_id"] as? String,
+           !remoteHostId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "remote:\(remoteHostId):\(rawSessionId)"
+        }
+        if (json["_source"] as? String)?.lowercased() == "codex",
+           json["_term_bundle"] as? String == "com.openai.codex" {
+            return rawSessionId.hasPrefix("codexapp:")
+                ? rawSessionId
+                : "codexapp:\(rawSessionId)"
+        }
+        return rawSessionId
+    }
+
+    /// Whether a payload's `agent_id` identifies a subagent working under the
+    /// session (Claude Code's contract, which the reducer's subagent routing
+    /// is built on).
+    ///
+    /// TRAE's desktop IDE (Trae / Trae CN) stamps EVERY hook with the id of
+    /// the agent running it — the main conversation included — as a common
+    /// field next to `agent_type` (docs.trae.cn/enterprise_hook-configuration-reference,
+    /// 请求体通用字段). The main agent's id is a stable built-in name such as
+    /// `solo_agent` or `builder_v3`, or a custom agent's id, and TraeCode has
+    /// no SubagentStart/SubagentStop events. Treated as a subagent, the whole
+    /// conversation was parked in `subagents` (SessionStart and prompts never
+    /// reached the card) and its first Stop tombstoned the id, so every later
+    /// turn was dropped. The raw id stays in `rawJSON`.
+    static func agentIdMarksSubagent(source: String?) -> Bool {
+        switch SessionSnapshot.normalizedSupportedSource(source) {
+        case "trae", "traecn": return false
+        default: return true
+        }
+    }
+
     public var toolDescription: String? {
+        if isCodexEvent {
+            return codexToolDescription
+        }
         if let input = toolInput {
             switch toolName {
             case "Bash", "execute_command", "run_command":
@@ -346,6 +542,221 @@ public struct HookEvent {
         return nil
     }
 
+    /// A concise, provider-neutral label for the current Codex action. Other
+    /// providers retain their original tool names to avoid changing established
+    /// display, color, permission, or history behavior.
+    public var activityLabel: String? {
+        guard let toolName else { return nil }
+        guard isCodexEvent else { return toolName }
+
+        switch activityCategory {
+        case .reading: return "Reading"
+        case .searching: return "Searching"
+        case .editing: return "Editing"
+        case .shell: return "Running command"
+        case .browser: return "Using browser"
+        case .mcp: return "Calling MCP"
+        case .delegation: return "Delegating"
+        case .question: return "Asking user"
+        case .other: return HookEvent.sanitizedSummary(toolName, limit: 48)
+        }
+    }
+
+    public var activityCategory: ToolActivityCategory {
+        guard isCodexEvent, let rawName = toolName?.lowercased() else { return .other }
+        let name = rawName.replacingOccurrences(of: "-", with: "_")
+
+        if name.hasPrefix("mcp__")
+            || name.contains("mcp_resource")
+            || name == "list_mcp_resources"
+            || name == "list_mcp_resource_templates" {
+            return .mcp
+        }
+        if name.contains("spawn_agent")
+            || name.contains("send_message")
+            || name.contains("followup_task")
+            || name.contains("wait_agent")
+            || name.contains("subagent")
+            || name == "task"
+            || name == "agent" {
+            return .delegation
+        }
+        if name.contains("request_user_input") || name.contains("ask_user") {
+            return .question
+        }
+        if name.contains("browser")
+            || name.contains("playwright")
+            || name.contains("navigate")
+            || name == "web_search"
+            || name == "web_fetch" {
+            return .browser
+        }
+        if name.contains("apply_patch")
+            || name.contains("edit_file")
+            || name.contains("write_file")
+            || name.contains("delete_file")
+            || name.contains("move_file")
+            || name.contains("replace_file") {
+            return .editing
+        }
+        if name.contains("grep")
+            || name.contains("glob")
+            || name.contains("search")
+            || name == "find"
+            || name.hasPrefix("rg_") {
+            return .searching
+        }
+        if name.contains("read_file")
+            || name.contains("view_file")
+            || name.contains("view_image")
+            || name.contains("list_dir") {
+            return .reading
+        }
+        if name.contains("exec_command")
+            || name.contains("write_stdin")
+            || name.contains("shell")
+            || name == "bash"
+            || name == "command"
+            || name == "run_command" {
+            return .shell
+        }
+        return .other
+    }
+
+    private var isCodexEvent: Bool {
+        (rawJSON["_source"] as? String)?.lowercased() == "codex"
+    }
+
+    private var codexToolDescription: String? {
+        let input = toolInput ?? [:]
+        switch activityCategory {
+        case .reading, .editing:
+            if let path = HookEvent.firstString(
+                in: input,
+                keys: ["file_path", "path", "filename", "AbsolutePath", "TargetFile"]
+            ) {
+                return HookEvent.sanitizedFilename(path)
+            }
+            return activityCategory == .editing ? "Applying changes" : nil
+        case .searching:
+            guard let query = HookEvent.firstString(in: input, keys: ["query", "pattern", "Query"]) else {
+                return nil
+            }
+            return HookEvent.sanitizedSummary(query, limit: 80)
+        case .shell:
+            guard let command = HookEvent.firstString(
+                in: input,
+                keys: ["command", "cmd", "CommandLine"]
+            ) else { return nil }
+            return HookEvent.sanitizedSummary(command, limit: 120)
+        case .browser:
+            if let rawURL = HookEvent.firstString(in: input, keys: ["url", "uri"]),
+               let host = URL(string: rawURL)?.host,
+               !host.isEmpty {
+                return host
+            }
+            if let query = HookEvent.firstString(in: input, keys: ["query", "search_query"]) {
+                return HookEvent.sanitizedSummary(query, limit: 72)
+            }
+            return nil
+        case .mcp:
+            guard let toolName else { return nil }
+            let pieces = toolName.components(separatedBy: "__").filter { !$0.isEmpty }
+            if pieces.count >= 3 {
+                return HookEvent.sanitizedSummary(pieces.dropFirst().joined(separator: " / "), limit: 72)
+            }
+            return nil
+        case .delegation:
+            if let detail = HookEvent.firstString(in: input, keys: ["task_name", "description", "agent_type"]) {
+                return HookEvent.sanitizedSummary(detail, limit: 72)
+            }
+            return nil
+        case .question:
+            return "Waiting for input"
+        case .other:
+            if let path = HookEvent.firstString(in: input, keys: ["file_path", "path"]) {
+                return HookEvent.sanitizedFilename(path)
+            }
+            if let detail = HookEvent.firstString(in: input, keys: ["description", "summary"]) {
+                return HookEvent.sanitizedSummary(detail, limit: 80)
+            }
+            return nil
+        }
+    }
+
+    private static func sanitizedFilename(_ path: String) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return sanitizedSummary((trimmed as NSString).lastPathComponent, limit: 80)
+    }
+
+    /// Credential / home-path redactions applied by ``sanitizedSummary(_:limit:)``,
+    /// compiled once — the summary runs on every Codex PreToolUse and approval.
+    ///
+    /// Keyed shapes only match where the key is plainly a credential slot — a
+    /// header, a `--flag`, an assignment, a quoted JSON key, a URL's userinfo
+    /// or query — never a bare word followed by a space, so prose like "the
+    /// token refresh" or "the auth module" (completion pushes run replies
+    /// through here) keeps its words.
+    private static let summaryRedactions: [(regex: NSRegularExpression, template: String)] = [
+        // scheme://user:password@host — git remotes, database URLs.
+        (#"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:"']+:[^\s/@"']+@"#, "$1[REDACTED]@"),
+        (#"(?i)(authorization\s*[:=]\s*(?:(?:bearer|basic|token|digest|negotiate|bot)\s+)?)([\"']?)[^\"'\s]+"#, "$1[REDACTED]"),
+        (#"(?i)((?:aws[-_]?secret[-_]?access[-_]?key|aws[-_]?(?:session|security)[-_]?token|x[-_]amz[-_]security[-_]token)\s*[:=]\s*)([\"']?)[^\"'\s]+"#, "$1[REDACTED]"),
+        (#"(?i)((?:x[-_])?(?:api[-_]?key|(?:auth|access|private|refresh|id|bearer|bot|deploy|session)[-_]?token|client[-_]?secret|secret|password|passwd)\s*:\s*)([\"']?)[^\"'\s]+"#, "$1[REDACTED]"),
+        // {"api_key": "…"}, {'password': '…'}
+        (#"(?i)(["'][a-z0-9_.-]*?(?:api[-_]?key|apikey|token|secret|password|passwd|private[-_]?key|access[-_]?key|credentials?)["']\s*:\s*["'])[^"']*(["'])"#, "$1[REDACTED]$2"),
+        // Cookie / Set-Cookie headers carry session credentials whole.
+        (#"(?i)((?:set-)?cookie\s*:\s*)[^"'\n]+"#, "$1[REDACTED]"),
+        // curl -u user:password, curl -b 'session=…'
+        (#"(?i)(\bcurl\b[^|;&]*?\s(?:-u\s*|--user(?:\s+|=)))(["']?)([^\s:"']*):[^\s"']+"#, "$1$2$3:[REDACTED]"),
+        (#"(?i)(\bcurl\b[^|;&]*?\s(?:-b|--cookie)(?:\s+|=))(["']?)[^\s"']+"#, "$1$2[REDACTED]"),
+        // mysql -phunter2 (a bare -p prompts instead), sshpass -p hunter2
+        (#"(\bmysql\w*\b[^|;&]*?\s-p)([^\s"'-][^\s"']*)"#, "$1[REDACTED]"),
+        (#"(\bsshpass\b[^|;&]*?\s-p\s*)([^\s"']+)"#, "$1[REDACTED]"),
+        (#"(?i)(--(?:api[-_]?key|token|secret|password|passwd|auth|auth[-_]?token|access[-_]?token)(?:\s+|=))([\"']?)[^\s\"']+"#, "$1$2[REDACTED]"),
+        // TOKEN=…, DB_PASSWORD=…, password="…"
+        (#"(?i)((?:api[-_]?key|apikey|token|secret|password|passwd)=)([\"']?)[^\s\"'&]+"#, "$1$2[REDACTED]"),
+        (#"(?i)([?&](?:api[-_]?key|apikey|key|access[-_]?key|secret[-_]?key|token|access[-_]?token|auth[-_]?token|refresh[-_]?token|id[-_]?token|private[-_]?token|secret|client[-_]?secret|signature|sig|sign|password|passwd|auth)=)[^&\s\"'#]+"#, "$1[REDACTED]"),
+        (#"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|(?:AKIA|ASIA)[A-Z0-9]{16})\b"#, "[REDACTED]"),
+        // GitLab, Slack, Google API key / OAuth, npm, Hugging Face, Stripe,
+        // SendGrid, PyPI, JWTs.
+        (#"\b(?:glpat-[A-Za-z0-9_-]{20,}|xox[abposre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|ya29\.[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{36}|hf_[A-Za-z0-9]{30,}|[rs]k_(?:live|test)_[A-Za-z0-9]{16,}|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|pypi-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})"#, "[REDACTED]"),
+        // Telegram bot token, bare or in a /bot<token>/ URL path.
+        (#"\b(?:bot)?\d{6,12}:[A-Za-z0-9_-]{30,}"#, "[REDACTED]"),
+        (#"/(?:Users|home)/[^/\s]+"#, "~"),
+        (#"\b[A-Za-z0-9_\-+/=]{48,}\b"#, "[REDACTED]"),
+    ].compactMap { pattern, template in
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            assertionFailure("invalid redaction pattern: \(pattern)")
+            return nil
+        }
+        return (regex, template)
+    }
+
+    /// Removes common credential shapes and home-directory usernames before a
+    /// bounded detail string reaches the notch, companion payloads, history,
+    /// or a phone push (PushMessageFormatter).
+    static func sanitizedSummary(_ value: String, limit: Int) -> String? {
+        var result = value
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !result.isEmpty else { return nil }
+
+        for (regex, template) in summaryRedactions {
+            let range = NSRange(result.startIndex..., in: result)
+            result = regex.stringByReplacingMatches(
+                in: result,
+                range: range,
+                withTemplate: template
+            )
+        }
+
+        guard result.count > limit, limit > 3 else { return result }
+        return String(result.prefix(limit - 3)) + "..."
+    }
+
     private static func normalizedMultilineString(_ value: Any?) -> String? {
         guard let text = value as? String else { return nil }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -402,14 +813,31 @@ public struct SubagentState: Sendable {
     public let agentId: String
     public let agentType: String
     public var status: AgentStatus = .running
-    public var currentTool: String?
+    public var currentTool: String? {
+        didSet { if currentTool != oldValue { currentToolUseId = nil } }
+    }
+    /// As ``SessionSnapshot/currentToolUseId``, for this subagent's tool.
+    public var currentToolUseId: String?
     public var toolDescription: String?
     public var startTime: Date = Date()
     public var lastActivity: Date = Date()
+    /// The subagent's own model and effort — never copied from the parent,
+    /// since a Task routinely runs on a different model than its caller.
+    public var model: String?
+    public var reasoningEffort: String?
+    /// Set when this row is a child session folded into the card (see
+    /// ``SubsessionLink``) rather than the agent's own subagent; the child's
+    /// later hooks follow it here.
+    public var subsessionKind: SubsessionLink.Kind?
 
     public init(agentId: String, agentType: String) {
         self.agentId = agentId
         self.agentType = agentType
+    }
+
+    /// As ``SessionSnapshot/finishesAnotherToolUse(_:)``, for this subagent.
+    public func finishesAnotherToolUse(_ event: HookEvent) -> Bool {
+        SessionSnapshot.isStep(event, ofAnotherToolUseThan: currentToolUseId, showing: currentTool)
     }
 }
 
