@@ -3558,6 +3558,7 @@ private struct SessionListFooter: View {
     var appState: AppState
     let showUsageStats: Bool
     let showClaudeQuota: Bool
+    @ObservedObject private var kiroAccount = KiroAccountUsageStore.shared
 
     var body: some View {
         let usage = UsageFooterText.shownUsage(appState.claudeUsage, enabled: showUsageStats)
@@ -3578,7 +3579,48 @@ private struct SessionListFooter: View {
         if content.quotaMessage, let error {
             QuotaFooterMessage(error: error)
         }
+        if showUsageStats,
+           let usage = appState.kiroUsage,
+           !(usage.last5h.isEmpty && usage.today.isEmpty) {
+            KiroUsageFooterLine(usage: usage, account: kiroAccount.snapshot)
+        }
+        if showUsageStats {
+            Color.clear
+                .frame(height: 0)
+                .onAppear { kiroAccount.startAutoRefresh() }
+        }
     }
+}
+
+private struct KiroUsageFooterLine: View {
+    let usage: KiroUsageScanner.Snapshot
+    let account: KiroAccountUsageSnapshot?
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "gauge.with.needle")
+                .font(.system(size: 9, weight: .semibold))
+            Text("Kiro").fontWeight(.semibold)
+            if let account {
+                Text("账户 (format(account.currentUsage))/(format(account.usageLimit)) credits")
+                Text("·").foregroundStyle(.white.opacity(0.25))
+                Text(String(format: "%.1f%%", account.percentageUsed))
+            } else {
+                Text("本地 5h (KiroUsageScanner.formatCredits(usage.last5h.credits))")
+                Text("·").foregroundStyle(.white.opacity(0.25))
+                Text("今日 (KiroUsageScanner.formatCredits(usage.today.credits))")
+            }
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 10, weight: .medium, design: .monospaced))
+        .foregroundStyle(.white.opacity(0.55))
+        .padding(.horizontal, 14)
+        .padding(.top, 5)
+        .padding(.bottom, 8)
+        .help("Kiro 本地活动 credits；账户周期来自 Kiro 本地缓存")
+    }
+
+    private func format(_ value: Double) -> String { String(format: "%.2f", value) }
 }
 
 /// Plan limits on one line, what can stop you first: each window's bar,

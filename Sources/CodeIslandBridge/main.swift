@@ -310,6 +310,17 @@ if intake.sessionIdIsFallback {
     bridgeLog.note("session_id missing, generated fallback id: \(BridgeLog.field(intake.sessionId))")
 }
 
+// Kiro's ACP helper emits hook-shaped lifecycle traffic while serving its
+// own protocol. It is not a user-facing coding session, so keep it out of
+// the island and let the real Kiro CLI session carry the card.
+if KiroSessionRouting.isInternalSession(
+    source: intake.source,
+    sessionId: intake.sessionId,
+    pid: KiroSessionRouting.pid(from: intake.payload["_ppid"])
+) {
+    exit(0)
+}
+
 // agy wired through Gemini-style hooks names the event on stdin, not in --event.
 writeImmediateStdout(intake.immediateStdout)
 
