@@ -196,6 +196,19 @@ public enum AppleCompanionCommandType: String, Codable, Equatable, Sendable {
     case skipCurrentQuestion
     case answerQuestion
     case focus
+
+    /// Whether the command answers a request on the user's behalf. The Mac
+    /// accepts every iPhone Buddy that finds it, unauthenticated, so any
+    /// nearby device running it could send these; until Buddy pairs with the
+    /// Mac they are ignored, and Buddy only shows the sessions.
+    public var decidesForTheUser: Bool {
+        switch self {
+        case .approveCurrentPermission, .denyCurrentPermission, .skipCurrentQuestion, .answerQuestion:
+            return true
+        case .requestCurrentState, .focus:
+            return false
+        }
+    }
 }
 
 public struct AppleCompanionCommandPayload: Codable, Equatable, Sendable {

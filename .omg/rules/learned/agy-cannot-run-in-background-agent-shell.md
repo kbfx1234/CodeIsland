@@ -25,7 +25,9 @@ indefinitely or error out before it even starts a session.
 
 1. **User opens their own interactive terminal**
 2. User runs: `~/.local/bin/agy "a prompt that triggers tool usage"`
-3. Agent watches for events in the bridge log (`/tmp/codeisland-bridge.log`)
+3. Agent watches for events in the bridge log (`/tmp/codeisland-bridge.log`: a
+   line per hook with its event, source, session and tool; whole payloads only
+   when the bridge runs with `CODEISLAND_DEBUG=1`)
    or in the CodeIsland notch UI
 
 ### Simulating hook events from the agent shell
@@ -34,12 +36,12 @@ To test the bridge itself without needing `agy`, pipe a mock JSON payload
 directly to the bridge binary:
 
 ```bash
-CODEISLAND_DEBUG=1 echo '{
+echo '{
   "hook_event_name": "PreToolUse",
   "session_id": "test-sess",
   "tool_name": "Bash",
   "tool_input": {"command": "rm -rf bar"}
-}' | /Users/matthewgold/.codeisland/codeisland-bridge \
+}' | CODEISLAND_DEBUG=1 /Users/matthewgold/.codeisland/codeisland-bridge \
       --source gemini \
       --event BeforeTool
 ```

@@ -4,12 +4,16 @@ import CodeIslandCore
 
 /// One-click diagnostics export for bug reports.
 /// Collects app metadata, settings, session state, CLI configs, and recent logs into a zip.
+/// A bug report's zip ends up on a public issue: the configs and the saved
+/// session list go in redacted (DiagnosticsRedaction), and the save panel
+/// says what the zip holds (`export_diagnostics_desc`).
 struct DiagnosticsExporter {
 
     static func export() {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "CodeIsland-Diagnostics-\(timestamp()).zip"
         panel.allowedContentTypes = [.zip]
+        panel.message = L10n.shared["export_diagnostics_desc"]
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         DispatchQueue.global(qos: .userInitiated).async {
@@ -50,7 +54,7 @@ struct DiagnosticsExporter {
         let hookEventsJSON = DispatchQueue.main.sync { recentHookEvents() }
         writeJSON(hookEventsJSON, to: root.appendingPathComponent("state/hook-events.json"))
 
-        // 3. CLI config files
+        // 3. CLI config files and the saved session list, redacted
         let home = fm.homeDirectoryForCurrentUser.path
         let configs: [(source: String, dest: String)] = [
             (ClaudeConfigPaths.settingsPath(), "configs/claude-settings.json"),
@@ -60,16 +64,20 @@ struct DiagnosticsExporter {
             ("\(home)/.qoder/settings.json", "configs/qoder-settings.json"),
             ("\(home)/.factory/settings.json", "configs/factory-settings.json"),
             ("\(home)/.codebuddy/settings.json", "configs/codebuddy-settings.json"),
-            ("\(home)/.codeisland/sessions.json", "configs/persisted-sessions.json"),
         ]
-        for item in configs {
-            copyIfExists(from: item.source, to: root.appendingPathComponent(item.dest))
-        }
+        writeConfigs(configs, sessionsFile: SessionPersistence.filePath, to: root)
 
         // 4. Socket status
         let socketPath = SocketPath.path
         let socketExists = fm.fileExists(atPath: socketPath)
-        let socketInfo = "path: \(socketPath)\nexists: \(socketExists)\n"
+        let holder: String
+        switch SocketPath.holder(of: socketPath) {
+        case .thisUser: holder = "a socket of this user's"
+        case .nobody: holder = "nothing"
+        case .notASocket: holder = "not a socket"
+        case .otherUser(let uid): holder = "another user's, uid \(uid): hooks send nothing to it"
+        }
+        let socketInfo = "path: \(socketPath)\nexists: \(socketExists)\nholder: \(holder)\n"
         try? socketInfo.write(to: root.appendingPathComponent("state/socket.txt"), atomically: true, encoding: .utf8)
 
         // 5. Unified system logs (last 2 hours)
@@ -143,7 +151,7 @@ struct DiagnosticsExporter {
             if let source = event.source { dict["source"] = source }
             if let sessionId = event.sessionId { dict["sessionId"] = String(sessionId.prefix(12)) }
             if let toolName = event.toolName { dict["toolName"] = toolName }
-            if let preview = event.promptPreview { dict["promptPreview"] = preview }
+            if let preview = event.promptPreview { dict["promptPreview"] = DiagnosticsRedaction.redactSecrets(in: preview) }
             return dict
         }
     }
@@ -182,11 +190,26 @@ struct DiagnosticsExporter {
         }
     }
 
-    private static func copyIfExists(from path: String, to url: URL) {
+    /// The CLI configs and the saved session list, under `root`: redacted
+    /// (DiagnosticsRedaction), never copied as they are. One that cannot be
+    /// read as JSON is left out, with a note saying so.
+    static func writeConfigs(_ configs: [(source: String, dest: String)], sessionsFile: String, to root: URL) {
+        for item in configs {
+            writeRedacted(from: item.source, to: root.appendingPathComponent(item.dest), DiagnosticsRedaction.redactedConfig)
+        }
+        writeRedacted(
+            from: sessionsFile,
+            to: root.appendingPathComponent("configs/persisted-sessions.json"),
+            DiagnosticsRedaction.redactedPersistedSessions
+        )
+    }
+
+    private static func writeRedacted(from path: String, to url: URL, _ redact: (Data) -> Data?) {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: path) else { return }
+        guard let data = fm.contents(atPath: path) else { return }
         try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? fm.copyItem(atPath: path, toPath: url.path)
+        let note = #"{"leftOut": "not JSON that this export can redact (\#(data.count) bytes)"}"#
+        try? (redact(data) ?? Data(note.utf8)).write(to: url, options: .atomic)
     }
 
     private static func runCommand(_ executable: String, args: [String]) -> String {

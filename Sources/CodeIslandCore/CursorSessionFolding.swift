@@ -56,13 +56,8 @@ public enum CursorSessionFolding {
     }
 }
 
-/// How to handle a Cursor Task/subagent hook under Agent Sub-Sessions.
-public enum CursorSubsessionRouteDecision: Equatable {
-    case leave
-    case hide
-    case merge(parentSessionId: String, childSessionId: String)
-}
-
+/// Cursor's half of Agent Sub-Sessions: the chat a Cursor Agent Task works
+/// for (``SubsessionLink``), and what tells a Task card from a chat.
 public enum CursorSubsessionRouter {
     /// `cursor` / `cursor-cli` after normalization.
     public static func isCursorFamilySource(_ source: String?) -> Bool {
@@ -85,83 +80,78 @@ public enum CursorSubsessionRouter {
         return normalized == nil || normalized == "claude"
     }
 
-    /// Positive process id from `_ppid` (Int / Int32 / NSNumber / decimal String).
-    public static func positivePpid(from raw: [String: Any]) -> Int? {
-        let parsed: Int?
-        if let p = raw["_ppid"] as? Int {
-            parsed = p
-        } else if let p = raw["_ppid"] as? Int32 {
-            parsed = Int(p)
-        } else if let p = raw["_ppid"] as? NSNumber {
-            parsed = p.intValue
-        } else if let s = raw["_ppid"] as? String {
-            parsed = Int(s.trimmingCharacters(in: .whitespacesAndNewlines))
-        } else {
-            parsed = nil
-        }
-        guard let parsed, parsed > 0 else { return nil }
-        return parsed
-    }
-
-    /// Apply Agent Sub-Sessions (`separate` / `merge` / `hide`) to Cursor hooks.
-    /// Same three modes as Codex and plugin children.
-    public static func decide(raw: [String: Any], mode: String) -> CursorSubsessionRouteDecision {
+    /// The chat this Cursor hook's session is a Task of.
+    ///
+    /// The transcript path names it (`agent-transcripts/<chat>/…` under a
+    /// session id other than the chat's). A Task's own hooks carry no
+    /// transcript path — Cursor resolves one only for a top-level
+    /// conversation — so for those the chat is the one card left on the same
+    /// IDE process: a guess (``SubsessionLink/isInferred``), made only for a
+    /// session with no card of its own yet.
+    public static func link(
+        in raw: [String: Any],
+        context: SubsessionContext,
+        now: Date = Date()
+    ) -> SubsessionLink? {
         let declared = (raw["_source"] as? String) ?? (raw["source"] as? String)
-        let path = transcriptPath(from: raw)
-        guard shouldTreatAsCursorFamily(declaredSource: declared, transcriptPath: path) else {
-            return .leave
+        let path = SubsessionRouter.transcriptPath(in: raw)
+        guard shouldTreatAsCursorFamily(declaredSource: declared, transcriptPath: path),
+              let childSessionId = SubsessionRouter.sessionId(in: raw) else {
+            return nil
         }
+        let childCardId = HookEvent.cardSessionId(forRawSessionId: childSessionId, in: raw)
 
-        guard let childSessionId = sessionId(from: raw) else { return .leave }
-
-        guard let parentId = CursorSessionFolding.foldTarget(
+        if let parentId = CursorSessionFolding.foldTarget(
             childSessionId: childSessionId,
             transcriptPath: path
-        ) else {
-            return .leave
+        ) {
+            // Transcript parent UUID may differ from the AppState session key.
+            // A Task card that reused the parent's id as its provider session
+            // id is not the parent.
+            let parentKey = HookEvent.cardSessionId(forRawSessionId: parentId, in: raw)
+            let found = SubsessionCards.cardId(forProviderSessionId: parentId, in: context.cards)
+            return SubsessionLink(
+                kind: .cursorTask,
+                childCardId: childCardId,
+                agentId: childSessionId,
+                parentCardId: found.flatMap { $0 == childCardId ? nil : $0 } ?? parentKey
+            )
         }
 
-        switch mode {
-        case "hide":
-            return .hide
-        case "merge":
-            return .merge(parentSessionId: parentId, childSessionId: childSessionId)
-        default:
-            // separate (or unknown): leave as its own session card
-            return .leave
+        guard shouldAttemptPpidParentFallback(raw: raw),
+              // Established top-level card for this session_id = main chat continuing.
+              // Never `_ppid`-fold it onto a sibling Task (that freezes parent chat text).
+              !cursorSessionCardExists(for: childSessionId, in: context.cards),
+              let parentCardId = ppidParentCardId(in: raw, cards: context.cards, now: now) else {
+            return nil
         }
+        return SubsessionLink(
+            kind: .cursorTask,
+            childCardId: childCardId,
+            agentId: childSessionId,
+            parentCardId: parentCardId,
+            isInferred: true
+        )
     }
 
-    /// Rewrite the hook onto the parent session and attach `agent_id` = child.
-    public static func applyMerge(
-        to raw: inout [String: Any],
-        parentSessionId: String,
-        childSessionId: String
-    ) {
-        raw["session_id"] = parentSessionId
-        raw["agent_id"] = nonEmptyString(raw["agent_id"]) ?? childSessionId
-        if nonEmptyString(raw["agent_type"]) == nil {
-            raw["agent_type"] = "cursor-subagent"
-        }
-        raw["_cursor_subagent"] = true
-        // Misbranded Claude-default Task hooks must land as Cursor on the parent.
-        if !isCursorFamilySource((raw["_source"] as? String) ?? (raw["source"] as? String)) {
-            raw["_source"] = "cursor"
-        }
-    }
-
-    /// Whether merge/hide may resolve a parent via `_ppid` after transcript fold
-    /// returned `.leave`.
+    /// Whether a parent may be resolved via `_ppid` when the transcript path
+    /// names none.
     ///
     /// True with Cursor family (including misbranded Claude-default + Cursor
     /// transcript path) + session id + positive `_ppid` and **no** parseable
     /// parent UUID in `transcript_path`.
+    ///
+    /// Never for `sessionStart` / `sessionEnd`: Cursor sends those for a
+    /// composer conversation, not a Task, and a new chat's `sessionStart`
+    /// comes before Cursor has a transcript for it — a lone sibling chat on
+    /// the same IDE pid would adopt the new chat as its Task.
     public static func shouldAttemptPpidParentFallback(raw: [String: Any]) -> Bool {
         let declared = (raw["_source"] as? String) ?? (raw["source"] as? String)
-        let path = transcriptPath(from: raw)
+        let path = SubsessionRouter.transcriptPath(in: raw)
         guard shouldTreatAsCursorFamily(declaredSource: declared, transcriptPath: path),
-              sessionId(from: raw) != nil,
-              positivePpid(from: raw) != nil else {
+              SubsessionRouter.sessionId(in: raw) != nil,
+              SubsessionRouter.positivePpid(in: raw) != nil,
+              !isConversationLifecycleEvent(raw) else {
             return false
         }
         if let path,
@@ -266,17 +256,101 @@ public enum CursorSubsessionRouter {
         return sorted[0].sessionId
     }
 
-    public static func sessionId(from raw: [String: Any]) -> String? {
-        nonEmptyString(raw["session_id"]) ?? nonEmptyString(raw["sessionId"])
+    /// Resolve the parent via `_ppid` when the transcript path names none.
+    /// Only call when ``shouldAttemptPpidParentFallback(raw:)`` is true.
+    ///
+    /// Requires a **unique** active same-PID Cursor card for the preferred source
+    /// (then sibling). If two chats share the IDE process, guessing is unsafe —
+    /// leave the Task separate until `transcript_path` can fold it.
+    static func ppidParentCardId(
+        in raw: [String: Any],
+        cards: [String: SessionSnapshot],
+        now: Date
+    ) -> String? {
+        guard let source = SessionSnapshot.normalizedSupportedSource(raw["_source"] as? String),
+              isCursorFamilySource(source),
+              let childSessionId = SubsessionRouter.sessionId(in: raw),
+              let ppid = SubsessionRouter.positivePpid(in: raw) else {
+            return nil
+        }
+        let cutoff = now.addingTimeInterval(-SubsessionCards.samePidActivityWindow)
+        for src in parentSourceSearchOrder(primarySource: source) {
+            if let match = uniqueActiveSamePidCursorSession(
+                source: src,
+                ppid: ppid,
+                remoteHostId: SubsessionRouter.remoteHostId(in: raw),
+                excluding: childSessionId,
+                activeSince: cutoff,
+                in: cards
+            ) {
+                return match
+            }
+        }
+        return nil
     }
 
-    public static func transcriptPath(from raw: [String: Any]) -> String? {
-        nonEmptyString(raw["transcript_path"]) ?? nonEmptyString(raw["transcriptPath"])
+    /// Sole suitable same-PID session for `source`, or `nil` when zero / ambiguous.
+    /// Prefers main chats over orphan Task cards; idle mains remain eligible.
+    private static func uniqueActiveSamePidCursorSession(
+        source: String,
+        ppid: Int,
+        remoteHostId: String?,
+        excluding excludedSessionId: String,
+        activeSince cutoff: Date,
+        in cards: [String: SessionSnapshot]
+    ) -> String? {
+        guard let pid = pid_t(exactly: ppid) else { return nil }
+        let normalized = SessionSnapshot.normalizedSupportedSource(source)
+        let candidates: [(sessionId: String, status: AgentStatus, startTime: Date, isMain: Bool, isTask: Bool)] =
+            cards.compactMap { sessionId, snap in
+                let snapSource = SessionSnapshot.normalizedSupportedSource(snap.source)
+                guard snapSource == normalized,
+                      snap.processId(onHost: remoteHostId) == pid,
+                      SubsessionCards.isCard(sessionId, onHost: remoteHostId),
+                      sessionId != excludedSessionId else {
+                    return nil
+                }
+                // Recent activity, or idle with live IDE pid (main often idles while
+                // a Task keeps the process busy).
+                guard snap.lastActivity >= cutoff || snap.status == .idle else {
+                    return nil
+                }
+                let isTask = isLikelyCursorTaskCard(
+                    sessionId: sessionId,
+                    providerSessionId: snap.providerSessionId,
+                    transcriptPath: snap.transcriptPath
+                )
+                let isMain = isLikelyCursorMainCard(
+                    sessionId: sessionId,
+                    providerSessionId: snap.providerSessionId,
+                    transcriptPath: snap.transcriptPath,
+                    hasSubagents: !snap.subagents.isEmpty
+                )
+                return (sessionId, snap.status, snap.startTime, isMain, isTask)
+            }
+        return choosePpidFallbackParentId(candidates: candidates)
     }
 
-    private static func nonEmptyString(_ value: Any?) -> String? {
-        guard let string = value as? String else { return nil }
-        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+    /// True when `sessionId` already names a top-level Cursor card (exact key
+    /// or `providerSessionId` match).
+    static func cursorSessionCardExists(for sessionId: String, in cards: [String: SessionSnapshot]) -> Bool {
+        if let snap = cards[sessionId], isCursorFamilySource(snap.source) {
+            return true
+        }
+        if let key = SubsessionCards.cardId(forProviderSessionId: sessionId, in: cards),
+           let snap = cards[key],
+           isCursorFamilySource(snap.source) {
+            return true
+        }
+        return false
+    }
+
+    private static func isConversationLifecycleEvent(_ raw: [String: Any]) -> Bool {
+        guard let name = SubsessionRouter.nonEmptyString(raw["hook_event_name"])
+                ?? SubsessionRouter.nonEmptyString(raw["hookEventName"]) else {
+            return false
+        }
+        let normalized = EventNormalizer.normalize(name)
+        return normalized == "SessionStart" || normalized == "SessionEnd"
     }
 }

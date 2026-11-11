@@ -160,6 +160,11 @@ final class ESP32StatePublisher {
 
     private func scheduleInteractiveRetriesIfNeeded() {
         interactiveRetryTask?.cancel()
+        // The retries only re-flush, which needs a Buddy (as `flush` checks).
+        // Without one, computing the key re-segmented the whole message on the
+        // main thread on every hook while a card was up: 140 ms a hook for a
+        // 1 MB prompt, and the Buddy is off by default.
+        guard bridge.status == .connected, bridge.selectedBuddyIdentifier != nil else { return }
         guard let appState, let deliveryKey = appState.esp32InteractiveDeliveryKey() else { return }
         interactiveRetryTask = Task { [weak self] in
             let delays: [UInt64] = [600_000_000, 1_800_000_000]
@@ -212,7 +217,7 @@ extension AppState {
         if let pending = pendingPermission {
             let sessionId = pending.event.sessionId ?? activeSessionId ?? "default"
             let pendingSession = sessions[sessionId]
-            var messages = pendingSession?.recentMessages ?? []
+            var messages = Self.companionMessages(pendingSession?.recentMessages ?? [])
             let detailText = (pending.event.toolDescription ?? pendingSession?.toolDescription)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if let detailText, !detailText.isEmpty, messages.last?.text != detailText {
@@ -230,7 +235,7 @@ extension AppState {
         if let pending = pendingQuestion {
             let sessionId = pending.event.sessionId ?? activeSessionId ?? "default"
             let pendingSession = sessions[sessionId]
-            var messages = pendingSession?.recentMessages ?? []
+            var messages = Self.companionMessages(pendingSession?.recentMessages ?? [])
             // Secret prompts (Codex `isSecret`) must not stream their text off-device. (#209)
             let rawQuestionText = pending.question.isSecret
                 ? Self.secretQuestionPlaceholder
@@ -263,7 +268,7 @@ extension AppState {
                 ? session?.currentTool
                 : nil,
             workspace: session?.projectDisplayName,
-            messages: Array((session?.recentMessages ?? []).suffix(3)),
+            messages: Self.companionMessages(Array((session?.recentMessages ?? []).suffix(3))),
         )
     }
 
@@ -283,7 +288,7 @@ extension AppState {
         let previews = esp32DisplayContext(session: session).messages
         let flattened = previews.flatMap { message in
             esp32MessagePreviewSegments(text: message.text).map { ChatMessage(isUser: message.isUser, text: $0) }
-        }
+        }.prefix(ESP32Protocol.maxMessagePreviewSegments)
         guard !flattened.isEmpty else {
             return [BuddyMessagePreviewPayload(index: 0, total: 0, isUser: false, text: nil)]
         }
@@ -396,7 +401,7 @@ extension AppState {
         }
 
         return sorted.prefix(5).map { sessionId, session in
-            let messages = session.recentMessages.suffix(2).compactMap { message -> AppleCompanionMessagePreview? in
+            let messages = Self.companionMessages(Array(session.recentMessages.suffix(2))).compactMap { message -> AppleCompanionMessagePreview? in
                 let text = Self.appleCompanionPreviewText(message.text)
                 guard !text.isEmpty else { return nil }
                 return AppleCompanionMessagePreview(role: message.isUser ? .user : .assistant, text: text)
@@ -421,10 +426,13 @@ extension AppState {
         if let pending = permissionQueue.first(where: { ($0.event.sessionId ?? "default") == sessionId }) {
             return Self.appleCompanionPreviewText(pending.event.toolDescription ?? session.toolDescription)
         }
-        if let text = session.recentMessages.last?.text {
-            return Self.appleCompanionPreviewText(text)
+        if let last = session.recentMessages.last {
+            return Self.appleCompanionPreviewText(Self.companionMessages([last])[0].text)
         }
-        return Self.appleCompanionPreviewText(session.lastAssistantMessage ?? session.lastUserPrompt)
+        if let reply = session.lastAssistantMessage {
+            return Self.appleCompanionPreviewText(Self.companionReplyText(reply))
+        }
+        return Self.appleCompanionPreviewText(session.lastUserPrompt)
     }
 
     private func appleCompanionSessionPriority(_ status: AgentStatus) -> Int {
@@ -493,6 +501,25 @@ extension AppState {
     /// Shown to remote peripherals in place of a secret prompt's real text.
     private static let secretQuestionPlaceholder = "Sensitive prompt — answer on Mac"
 
+    /// Chat messages as companion devices (iPhone / Watch, Buddy) show them.
+    /// Assistant replies are Markdown: send the island's marker-free one-line
+    /// preview instead of `##`, `**` and table pipes that a small screen
+    /// can't render. User prompts stay literal, exactly as the island shows
+    /// them.
+    ///
+    /// Only for real chat history — synthesized entries (a pending approval's
+    /// command, a question) go out verbatim, since flattening would eat
+    /// characters like `\` or `*` out of a shell command.
+    static func companionMessages(_ messages: [ChatMessage]) -> [ChatMessage] {
+        messages.map { message in
+            message.isUser ? message : ChatMessage(isUser: false, text: companionReplyText(message.text))
+        }
+    }
+
+    static func companionReplyText(_ text: String) -> String {
+        String(ChatMessageTextFormatter.markdownPreview(text, singleLine: true).characters)
+    }
+
     private static func appleCompanionPreviewText(_ text: String?) -> String {
         guard let text else { return "" }
         let collapsed = text
@@ -511,6 +538,9 @@ extension AppState {
         var currentCount = 0
 
         for character in trimmed {
+            // Frames past the 255th can't be numbered; stop instead of
+            // walking the rest of a long message.
+            if segments.count >= ESP32Protocol.maxMessagePreviewSegments { break }
             let scalar = String(character)
             let byteCount = scalar.lengthOfBytes(using: .utf8)
             if currentCount > 0 && currentCount + byteCount > ESP32Protocol.maxMessagePreviewBytes {
@@ -534,6 +564,6 @@ extension AppState {
             segments.append(current)
         }
 
-        return segments
+        return Array(segments.prefix(ESP32Protocol.maxMessagePreviewSegments))
     }
 }

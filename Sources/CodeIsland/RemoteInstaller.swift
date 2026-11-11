@@ -3,6 +3,36 @@ import Foundation
 struct RemoteInstallResult: Sendable {
     let ok: Bool
     let message: String
+    /// The island's socket on the host could not be vouched for: the tunnel
+    /// that leads there must not stay up. Nothing was installed.
+    var socketProblem: RemoteSocketCheckFailure? = nil
+}
+
+/// What stops the island's socket on a remote host from being one only the
+/// SSH user can reach — or, on a host whose agents run as other users, one
+/// they can reach through a folder nobody else can change.
+enum RemoteSocketCheckFailure: Error, Equatable, Sendable {
+    /// The check could not run: ssh's own words (the host is unreachable,
+    /// refused the login, has no python3).
+    case unreachable(String)
+    /// The folder the socket goes in (`path`) is not, and cannot be made,
+    /// the SSH user's alone: what was found.
+    case folderUnsafe(path: String, detail: String)
+    /// The socket the tunnel made at `path` is not the SSH user's, in that
+    /// folder, or could not be given the mode the host needs.
+    case socketUnverified(path: String, detail: String)
+
+    /// What Settings → Remote shows for the host.
+    func message(_ l10n: L10n) -> String {
+        switch self {
+        case .unreachable(let detail):
+            return detail
+        case .folderUnsafe(let path, let detail):
+            return String(format: l10n["remote_host_socket_folder_unsafe"], path, detail)
+        case .socketUnverified(let path, let detail):
+            return String(format: l10n["remote_host_socket_unverified"], path, detail)
+        }
+    }
 }
 
 private struct RemoteCommandResult: Sendable {
@@ -14,10 +44,16 @@ private struct RemoteCommandResult: Sendable {
 }
 
 enum RemoteInstaller {
-    private static let remoteHookVersion = "0.1.4"
-    private static let remoteOpencodePluginVersion = "v3"
+    private static let remoteHookVersion = "0.4.4"
+    private static let remoteOpencodePluginVersion = "v9"
 
     static func installAll(host: RemoteHost, remoteSocketPath: String) async -> RemoteInstallResult {
+        // First the socket the tunnel has just made: until it is vouched
+        // for, nothing else happens, and the tunnel goes.
+        if let problem = await verifyRemoteSocket(host: host, remoteSocketPath: remoteSocketPath) {
+            return RemoteInstallResult(ok: false, message: "Socket not verified", socketProblem: problem)
+        }
+
         guard let source = remoteHookSource() else {
             return RemoteInstallResult(ok: false, message: "Missing remote hook resource")
         }
@@ -44,26 +80,305 @@ enum RemoteInstaller {
         return RemoteInstallResult(ok: true, message: summary)
     }
 
-    /// Probe the remote user's UID and return a per-user socket path so that multiple
-    /// OS users on a shared host don't collide on a single `/tmp/codeisland.sock` (#193).
-    /// Falls back to the legacy shared path when the probe fails (older / restricted host).
-    static func prepareRemoteSocketPath(host: RemoteHost) async -> String {
-        // `id -u` is a bare external command, so it returns the remote uid identically
-        // under any login shell (bash / zsh / fish / csh). A fancier `$(...)` pipeline
-        // would break under non-POSIX login shells like fish and silently fall back.
-        let probe = await runSSH(host: host, command: "id -u", timeout: 8)
-        let uid = probe.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        if probe.ok, !uid.isEmpty, uid.allSatisfy({ $0.isNumber }) {
-            return "/tmp/codeisland-\(uid).sock"
-        }
-        // Probe failed (old / restricted host) — fall back to the legacy shared path.
-        // StreamLocalBindUnlink=yes on the forward already clears any stale socket, so
-        // we avoid a second SSH round-trip here (it would just add latency on a host
-        // that's likely failing to connect anyway).
-        return host.remoteSocketPath
+    /// Makes, before anything is forwarded, the folder on the host the
+    /// island's socket goes in (``remoteSocketPath(forUID:)``), and returns
+    /// the socket's path there.
+    ///
+    /// sshd makes the forwarded socket with a mode of its own choosing
+    /// (StreamLocalBindMask, in sshd_config), and the install that used to
+    /// set it ran later, if at all. In a folder only the SSH user can enter,
+    /// the socket's mode no longer matters: the folder is made 0700 by that
+    /// user — 0711 on a host whose agents run as other users, who may then
+    /// reach the socket by name and nothing else — and checked to be theirs,
+    /// that mode and no symlink. Per user (#193), so users sharing a host
+    /// never meet. A folder that is not, and cannot be made, the SSH user's
+    /// alone fails the connect: nothing is forwarded.
+    static func prepareRemoteSocketPath(host: RemoteHost) async -> Result<String, RemoteSocketCheckFailure> {
+        let probe = await runSSH(
+            host: host,
+            command: pythonCommand(prepareRemoteSocketFolderScript(agentsRunAsOtherUsers: host.agentsRunAsOtherUsers)),
+            timeout: 15
+        )
+        return preparedSocketPath(fromProbe: probe.stdout, errorOutput: probe.stderr, exitCode: probe.exitCode)
     }
 
-    private static func remoteHookSource() -> String? {
+    /// Where the island's sockets go on a remote host: a folder per SSH
+    /// user beneath it.
+    static let remoteSocketBase = "/tmp"
+
+    /// The folder on the remote host for the SSH user `uid`'s socket.
+    static func remoteSocketFolder(forUID uid: String, base: String = remoteSocketBase) -> String {
+        "\(base)/codeisland-\(uid)"
+    }
+
+    /// The island's socket on the remote host for the SSH user `uid`
+    /// (#193), in that user's folder.
+    static func remoteSocketPath(forUID uid: String, base: String = remoteSocketBase) -> String {
+        remoteSocketFolder(forUID: uid, base: base) + "/island.sock"
+    }
+
+    /// The SSH user's uid, as the socket's path names it
+    /// (``remoteSocketPath(forUID:base:)``); nil for any other path.
+    static func loginUID(inRemoteSocketPath path: String) -> String? {
+        let prefix = remoteSocketBase + "/codeisland-", suffix = "/island.sock"
+        guard path.hasPrefix(prefix), path.hasSuffix(suffix),
+              path.count > prefix.count + suffix.count else { return nil }
+        let uid = String(path.dropFirst(prefix.count).dropLast(suffix.count))
+        return isUID(uid) ? uid : nil
+    }
+
+    /// Checks, once the tunnel is up, the socket it made on the host
+    /// (``verifyRemoteSocketScript(socketPath:agentsRunAsOtherUsers:waitForSocket:)``):
+    /// nil once it is vouched for. The tunnel counts as up before its
+    /// forward is, so the check waits a while for the socket to appear; and
+    /// a check ssh could not run at all (a dropped connection, sshd's
+    /// MaxStartups) is tried once more before the socket counts as not
+    /// vouched for.
+    static func verifyRemoteSocket(host: RemoteHost, remoteSocketPath: String) async -> RemoteSocketCheckFailure? {
+        let command = pythonCommand(verifyRemoteSocketScript(
+            socketPath: remoteSocketPath,
+            agentsRunAsOtherUsers: host.agentsRunAsOtherUsers
+        ))
+        for attempt in 1...2 {
+            let check = await runSSH(host: host, command: command, timeout: 45)
+            if attempt == 2 || markedAnswer(in: check.stdout, marker: socketCheckMarker) != nil {
+                return socketProblem(fromCheck: check.stdout, errorOutput: check.stderr, exitCode: check.exitCode, socketPath: remoteSocketPath)
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+        return nil
+    }
+
+    /// What the folder check on the host (``prepareRemoteSocketFolderScript(agentsRunAsOtherUsers:base:)``)
+    /// found: the socket's path in a folder that passed, or why not.
+    static func preparedSocketPath(
+        fromProbe output: String,
+        errorOutput: String,
+        exitCode: Int32,
+        base: String = remoteSocketBase
+    ) -> Result<String, RemoteSocketCheckFailure> {
+        guard let answer = markedAnswer(in: output, marker: socketFolderMarker) else {
+            return .failure(.unreachable(commandFailure(errorOutput: errorOutput, exitCode: exitCode)))
+        }
+        guard let uid = answer["uid"] as? Int, uid >= 0,
+              let folder = answer["folder"] as? String,
+              folder == remoteSocketFolder(forUID: String(uid), base: base) else {
+            return .failure(.unreachable("Unexpected answer from the host: \(String(output.suffix(200)))"))
+        }
+        if let problem = answer["problem"] as? String {
+            return .failure(.folderUnsafe(path: folder, detail: problem))
+        }
+        return .success(remoteSocketPath(forUID: String(uid), base: base))
+    }
+
+    /// What the socket check on the host (``verifyRemoteSocketScript(socketPath:agentsRunAsOtherUsers:)``)
+    /// found: nil once the socket at `socketPath` is vouched for.
+    static func socketProblem(
+        fromCheck output: String,
+        errorOutput: String,
+        exitCode: Int32,
+        socketPath: String
+    ) -> RemoteSocketCheckFailure? {
+        guard let answer = markedAnswer(in: output, marker: socketCheckMarker) else {
+            return .socketUnverified(path: socketPath, detail: commandFailure(errorOutput: errorOutput, exitCode: exitCode))
+        }
+        if answer["ok"] as? Bool == true { return nil }
+        return .socketUnverified(path: socketPath, detail: answer["problem"] as? String ?? "unknown")
+    }
+
+    private static let socketFolderMarker = "CODEISLAND-SOCKET-FOLDER "
+    private static let socketCheckMarker = "CODEISLAND-SOCKET-CHECK "
+
+    /// The JSON object on the last line of `output` that starts with
+    /// `marker`: whatever a login shell prints first is skipped.
+    private static func markedAnswer(in output: String, marker: String) -> [String: Any]? {
+        guard let line = output
+            .split(whereSeparator: \.isNewline)
+            .last(where: { $0.hasPrefix(marker) }) else { return nil }
+        let json = Data(line.dropFirst(marker.count).utf8)
+        return (try? JSONSerialization.jsonObject(with: json)) as? [String: Any]
+    }
+
+    private static func commandFailure(errorOutput: String, exitCode: Int32) -> String {
+        let trimmed = errorOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "ssh exited (\(exitCode))" : String(trimmed.suffix(300))
+    }
+
+    /// A command any login shell (sh, bash, zsh, fish, csh) runs as the same
+    /// `python3` program: base64 carries the script, and has nothing a shell
+    /// reads.
+    static func pythonCommand(_ script: String) -> String {
+        let encoded = Data(script.utf8).base64EncodedString()
+        return "python3 -c \"import base64;exec(base64.b64decode('\(encoded)'))\""
+    }
+
+    /// Run on the host, as the SSH user, before the tunnel starts: makes the
+    /// folder for the island's socket beneath `base`, or finds it, and
+    /// prints on a line of its own, after ``socketFolderMarker``, the user's
+    /// uid, the folder, and why it cannot be used, if it cannot. The folder
+    /// must be the user's, not a symlink, with the mode the host needs —
+    /// narrowed (or widened to 0711) through the descriptor that was
+    /// checked — and `base` must not let another user move it away.
+    static func prepareRemoteSocketFolderScript(agentsRunAsOtherUsers: Bool, base: String = remoteSocketBase) -> String {
+        """
+        import errno, json, os, stat, sys
+
+        base = \(pythonStringLiteral(base))
+        shared = \(agentsRunAsOtherUsers ? "True" : "False")
+        uid = os.getuid()
+        folder = base + "/codeisland-%d" % uid
+        # The SSH user's alone; where agents run as other users, they may also
+        # pass through it to the socket, by name, and do nothing else there.
+        mode = 0o711 if shared else 0o700
+
+        def answer(problem=None):
+            print(\(pythonStringLiteral(socketFolderMarker)) + json.dumps({"uid": uid, "folder": folder, "problem": problem}))
+            sys.exit(0)
+
+        try:
+            parent = os.stat(base)
+        except OSError as e:
+            answer(base + ": " + e.strerror)
+        # Whoever may write to `base` may move a folder out of it, unless the
+        # sticky bit keeps each user's entries their own (as /tmp's does).
+        if parent.st_uid not in (0, uid) or (parent.st_mode & 0o022 and not parent.st_mode & stat.S_ISVTX):
+            answer(base + " lets other users move what is in it")
+        try:
+            os.mkdir(folder, 0o700)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                answer(e.strerror)
+        try:
+            fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as e:
+            if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                answer("not a folder (a symlink or a file)")
+            answer(e.strerror)
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            answer("not a folder")
+        if info.st_uid != uid:
+            answer("it belongs to uid %d" % info.st_uid)
+        if stat.S_IMODE(info.st_mode) != mode:
+            try:
+                os.fchmod(fd, mode)
+            except OSError as e:
+                answer("its mode cannot be set: " + e.strerror)
+        answer()
+        """
+    }
+
+    /// Run on the host, as the SSH user, once the tunnel is up: checks that
+    /// the socket at `socketPath` is the SSH user's, in the folder made
+    /// before the tunnel started and still that user's alone, and, where
+    /// agents run as other users, gives it the mode they need (0666) — never
+    /// through a symlink. A socket not there yet is waited for, up to
+    /// `waitForSocket` seconds: the tunnel counts as up a moment after ssh
+    /// starts, before sshd has made its forward. Prints on a line of its
+    /// own, after ``socketCheckMarker``, whether it passed, and why not.
+    static func verifyRemoteSocketScript(
+        socketPath: String,
+        agentsRunAsOtherUsers: Bool,
+        waitForSocket: TimeInterval = 20
+    ) -> String {
+        """
+        import errno, json, os, stat, sys, time
+
+        path = \(pythonStringLiteral(socketPath))
+        shared = \(agentsRunAsOtherUsers ? "True" : "False")
+        wait_for_socket = \(max(0, waitForSocket))
+        uid = os.getuid()
+        folder, name = os.path.split(path)
+        folder_mode = 0o711 if shared else 0o700
+
+        def answer(problem=None):
+            print(\(pythonStringLiteral(socketCheckMarker)) + json.dumps({"ok": problem is None, "problem": problem}))
+            sys.exit(0)
+
+        def socket_info(fd, wait=0):
+            deadline = time.time() + wait
+            while True:
+                try:
+                    return os.stat(name, dir_fd=fd, follow_symlinks=False)
+                except OSError as e:
+                    if e.errno != errno.ENOENT or time.time() >= deadline:
+                        answer("the socket: " + e.strerror)
+                time.sleep(0.2)
+
+        def set_shared_mode(fd, checked):
+            # Never through a symlink. Where chmod cannot leave a symlink alone
+            # (Linux before glibc 2.32: Python raises NotImplementedError, or
+            # ValueError with dir_fd), a descriptor of the socket itself
+            # (O_PATH) is changed through /proc instead. The last resort
+            # follows a symlink only in a folder nobody but this user can
+            # write to.
+            try:
+                os.chmod(name, 0o666, dir_fd=fd, follow_symlinks=False)
+                return
+            except (NotImplementedError, ValueError):
+                pass
+            except OSError as e:
+                if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL):
+                    answer("the socket's mode cannot be set: " + e.strerror)
+            if hasattr(os, "O_PATH"):
+                try:
+                    handle = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=fd)
+                except OSError as e:
+                    answer("the socket: " + e.strerror)
+                try:
+                    now = os.fstat(handle)
+                    if (now.st_dev, now.st_ino) != (checked.st_dev, checked.st_ino):
+                        answer("the socket changed while it was checked")
+                    os.chmod("/proc/self/fd/%d" % handle, 0o666)
+                    return
+                except OSError:
+                    pass
+                finally:
+                    os.close(handle)
+            now = socket_info(fd)
+            if (now.st_dev, now.st_ino) != (checked.st_dev, checked.st_ino) or not stat.S_ISSOCK(now.st_mode):
+                answer("the socket changed while it was checked")
+            try:
+                os.chmod(name, 0o666, dir_fd=fd)
+            except OSError as e:
+                answer("the socket's mode cannot be set: " + e.strerror)
+
+        try:
+            fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as e:
+            answer(folder + ": " + e.strerror)
+        info = os.fstat(fd)
+        if info.st_uid != uid:
+            answer(folder + " belongs to uid %d" % info.st_uid)
+        if stat.S_IMODE(info.st_mode) != folder_mode:
+            answer(folder + " has mode %o" % stat.S_IMODE(info.st_mode))
+        found = socket_info(fd, wait_for_socket)
+        if not stat.S_ISSOCK(found.st_mode):
+            answer("not a socket")
+        if found.st_uid != uid:
+            answer("the socket belongs to uid %d" % found.st_uid)
+        if shared and stat.S_IMODE(found.st_mode) != 0o666:
+            set_shared_mode(fd, found)
+        answer()
+        """
+    }
+
+    private static func isUID(_ value: String) -> Bool {
+        !value.isEmpty && value.allSatisfy { ("0"..."9").contains($0) }
+    }
+
+    /// The uid the remote OpenCode plugin is told owns the island's socket:
+    /// the SSH user's, for a host whose agents run as other users, so a
+    /// plugin run as another user uses that user's socket. Empty otherwise,
+    /// and when the probe could not name the SSH user: the plugin then uses
+    /// only a socket of its own user's. (The hook commands get the uid from
+    /// the install script, which runs as the SSH user.)
+    static func socketOwnerUID(for host: RemoteHost, remoteSocketPath: String) -> String {
+        guard host.agentsRunAsOtherUsers else { return "" }
+        return loginUID(inRemoteSocketPath: remoteSocketPath) ?? ""
+    }
+
+    static func remoteHookSource() -> String? {
         if let url = Bundle.appModule.url(forResource: "codeisland-remote-hook", withExtension: "py", subdirectory: "Resources"),
            let src = try? String(contentsOf: url) {
             return src
@@ -75,7 +390,7 @@ enum RemoteInstaller {
         return nil
     }
 
-    private static func remoteOpencodePluginSource() -> String? {
+    static func remoteOpencodePluginSource() -> String? {
         if let url = Bundle.appModule.url(forResource: "codeisland-opencode-remote", withExtension: "js", subdirectory: "Resources"),
            let src = try? String(contentsOf: url) {
             return src
@@ -119,7 +434,8 @@ print(target)
     private static func configureRemoteHooks(host: RemoteHost, remoteSocketPath: String) async -> RemoteCommandResult {
         let py = configureRemoteHooksScript(host: host, remoteSocketPath: remoteSocketPath)
         // Run via the remote user's login shell so ~/.zprofile / ~/.bash_profile etc. are
-        // sourced — that's how $CODEX_HOME (and similar) reach a non-interactive ssh session.
+        // sourced — that's how $CODEX_HOME / $CLAUDE_CONFIG_DIR (and similar) reach a
+        // non-interactive ssh session. Interactive-only rc files (.bashrc/.zshrc) are not.
         // base64 keeps the script intact regardless of shell quoting.
         let encoded = Data(py.utf8).base64EncodedString()
         let inner = "echo '\(encoded)' | base64 -d | python3"
@@ -137,10 +453,16 @@ print(target)
         let version = pythonStringLiteral(remoteHookVersion)
         let opencodePluginVersion = pythonStringLiteral(remoteOpencodePluginVersion)
         let socketPath = pythonStringLiteral(remoteSocketPath ?? host.remoteSocketPath)
+        let agentsRunAsOtherUsers = host.agentsRunAsOtherUsers ? "True" : "False"
         let customCLIsLiteral = remoteCustomCLIsLiteral(customCLIs)
+        let unsupportedCustomCLIsLiteral = "[" + customCLIs
+            .filter { !isRemoteSupportedCustomFormat($0.format) }
+            .map { pythonStringLiteral($0.name) }
+            .joined(separator: ", ") + "]"
         return """
 import json
 import pathlib
+import shlex
 import shutil
 import os
 import re
@@ -152,7 +474,9 @@ host_name = \(hostName)
 version = \(version)
 opencode_plugin_version = \(opencodePluginVersion)
 socket_path = \(socketPath)
+agents_run_as_other_users = \(agentsRunAsOtherUsers)
 custom_clis = \(customCLIsLiteral)
+unsupported_custom_clis = \(unsupportedCustomCLIsLiteral)
 
 def _codex_home():
     raw = (os.environ.get("CODEX_HOME") or "").strip()
@@ -160,6 +484,30 @@ def _codex_home():
         return home / ".codex"
     expanded = os.path.expanduser(raw)
     return pathlib.Path(expanded)
+
+def _claude_config_dir():
+    # Claude Code reads $CLAUDE_CONFIG_DIR as one verbatim path, else ~/.claude (#271).
+    # None means "unset" and the caller keeps the ~/.claude default. Same rules as the
+    # Mac-side ClaudeConfigPaths.normalized() (trim, expand ~, absolute only) EXCEPT
+    # Unicode normalization: ext4/xfs are byte-preserving, so an NFC-normalized path
+    # can name a directory that does not exist. Never normalize here. Mirrored in
+    # codeisland-remote-hook.py, which must resolve the same dir.
+    raw = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if not raw:
+        return None
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded) or expanded.strip("/") == "":
+        return None
+    return pathlib.Path(expanded)
+
+def _display_path(path):
+    # Remote-home-relative form for the status line, so a skip reason names the
+    # exact directory that was checked on the remote host.
+    try:
+        rel = str(path.relative_to(home))
+    except ValueError:
+        return str(path)
+    return "~" if rel == "." else "~/" + rel
 
 def ensure_json(path):
     if path.exists():
@@ -229,8 +577,25 @@ def write_text_atomic(path, text):
 def write_opencode_config(path, data):
     write_json(path, data)
 
+# sshd makes the island's socket here as the SSH user, which is who runs this
+# script. A hook uses only a socket its own user owns; on a host whose agents
+# run as other users (containers, sudo), the hooks are told the SSH user owns
+# it, so one run as another user uses that socket, and still nobody else's.
+socket_owner_uid = str(os.getuid()) if agents_run_as_other_users else ""
+
 def command_for(source):
-    return f"CODEISLAND_SOCKET_PATH={socket_path} CODEISLAND_REMOTE_HOST_ID={json.dumps(host_id)} CODEISLAND_REMOTE_HOST_NAME={json.dumps(host_name)} CODEISLAND_SOURCE={source} python3 ~/.codeisland/codeisland-remote-hook.py"
+    # The agent runs this line in a shell: every value is quoted for it, so
+    # a host named `$(...)` or with a backtick is a name, never a command run
+    # on this host (double quotes, as json.dumps gave, let both run).
+    assignments = ["CODEISLAND_SOCKET_PATH=" + shlex.quote(socket_path)]
+    if socket_owner_uid:
+        assignments.append("CODEISLAND_SOCKET_OWNER_UID=" + shlex.quote(socket_owner_uid))
+    assignments += [
+        "CODEISLAND_REMOTE_HOST_ID=" + shlex.quote(host_id),
+        "CODEISLAND_REMOTE_HOST_NAME=" + shlex.quote(host_name),
+        "CODEISLAND_SOURCE=" + shlex.quote(source),
+    ]
+    return " ".join(assignments) + " python3 ~/.codeisland/codeisland-remote-hook.py"
 
 def append_our_hooks(hooks, event, entries):
     # Preserve user-authored entries (#242): remove_our_hooks() already dropped our
@@ -457,7 +822,13 @@ def _remove_managed_traecli_hooks(contents):
                     cmd_value = _parse_scalar(nxt_stripped.split(":", 1)[1])
                 j += 1
 
-            if cmd_value and _normalize_cmd(cmd_value) == _normalize_cmd(command_for("traecli")):
+            # Ours in any form: the command changes with the host's name and
+            # with who may use its socket (CODEISLAND_SOCKET_OWNER_UID).
+            ours = cmd_value and (
+                _normalize_cmd(cmd_value) == _normalize_cmd(command_for("traecli"))
+                or ("codeisland-remote-hook.py" in cmd_value and "CODEISLAND_SOURCE=traecli" in cmd_value)
+            )
+            if ours:
                 # Remove adjacent same-indent comment lines already appended.
                 while result:
                     prev = result[-1]
@@ -531,9 +902,15 @@ def _merge_traecli_hooks(contents, cmd):
     return merged
 
 def install_claude():
-    claude_root = home / ".claude"
+    configured_root = _claude_config_dir()
+    claude_root = configured_root or home / ".claude"
+    # One guard for both cases, no early return: with $CLAUDE_CONFIG_DIR set, a host
+    # where Claude Code is on PATH but has never run has no config dir yet, and it
+    # must still get hooks (#271).
     if not claude_root.exists() and shutil.which("claude") is None:
-        return "Claude skipped"
+        if configured_root is None:
+            return "Claude skipped"
+        return "Claude skipped (config dir not found: " + _display_path(claude_root) + ")"
 
     settings_path = claude_root / "settings.json"
     data = ensure_json(settings_path)
@@ -557,7 +934,11 @@ def install_claude():
     append_our_hooks(hooks, "PreCompact", precompact)
     data["hooks"] = hooks
     write_json(settings_path, data)
-    return "Claude ok"
+    if configured_root is None:
+        return "Claude ok"
+    # Name the dir: it is the only way to see that $CLAUDE_CONFIG_DIR actually
+    # reached the non-interactive login shell this script runs in.
+    return "Claude ok (" + _display_path(claude_root) + ")"
 
 def install_qoder():
     qoder_root = home / ".qoder"
@@ -591,11 +972,38 @@ def install_qoder():
 # Hermes (Nous Research) is NOT a Claude Code fork. It reads shell hooks from
 # ~/.hermes/config.yaml under a `hooks:` MAP keyed by snake_case event names whose
 # values are lists of { command, timeout }. settings.json is never parsed (#226).
+def hermes_command():
+    # Hermes runs a hook command without a shell: shlex.split, then exec
+    # (agent/shell_hooks.py). command_for()'s `VAR=value python3 ~/...` form was
+    # taken for a program named `CODEISLAND_SOCKET_PATH=...` and never ran, and
+    # `~` is never expanded. `env` sets the variables; the hook path is absolute.
+    args = [
+        "env",
+        "CODEISLAND_SOCKET_PATH=" + socket_path,
+    ] + (["CODEISLAND_SOCKET_OWNER_UID=" + socket_owner_uid] if socket_owner_uid else []) + [
+        "CODEISLAND_REMOTE_HOST_ID=" + host_id,
+        "CODEISLAND_REMOTE_HOST_NAME=" + host_name,
+        "CODEISLAND_SOURCE=hermes",
+        "python3",
+        str(hook_path),
+    ]
+    return " ".join(shlex.quote(a) for a in args)
+
+def _is_managed_hermes_cmd(c, target_cmd):
+    # Ours in either form: the current one, or the shell form earlier installs wrote.
+    if _normalize_hook_cmd(c) == target_cmd:
+        return True
+    s = c or ""
+    return "codeisland-remote-hook.py" in s and "CODEISLAND_SOURCE=hermes" in s
+
 HERMES_EVENTS = [
     ("pre_tool_call", 5),
     ("post_tool_call", 5),
+    ("pre_llm_call", 5),
+    ("post_llm_call", 5),
     ("on_session_start", 5),
     ("on_session_end", 5),
+    ("on_session_finalize", 5),
     ("subagent_stop", 5),
 ]
 
@@ -717,7 +1125,7 @@ def _merge_hermes_hooks(contents, cmd):
                     cur = len(bl) - len(bl.lstrip(" "))
                     block.append(" " * (4 + (cur - base)) + bl.lstrip(" "))
                 # Drop our prior managed entries; keep user entries.
-                if not (cmd_value is not None and _normalize_hook_cmd(cmd_value) == target_cmd):
+                if not (cmd_value is not None and _is_managed_hermes_cmd(cmd_value, target_cmd)):
                     events[current_event].append(block)
                 j = k
                 continue
@@ -763,42 +1171,332 @@ def install_hermes():
         original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     except Exception:
         return "Hermes read failed"
-    cmd = command_for("hermes")
+    cmd = hermes_command()
     merged = _merge_hermes_hooks(original, cmd)
     write_text_atomic(config_path, merged)
     return "Hermes ok"
 
-def ensure_toml_codex_hooks(path):
-    content = path.read_text() if path.exists() else ""
-    current_hooks_pattern = r"(?m)^\\s*hooks\\s*=\\s*(true|false)\\s*(#.*)?$"
-    hooks_true_pattern = r"(?m)^\\s*hooks\\s*=\\s*true\\s*(#.*)?$"
-    hooks_false_pattern = r"(?m)^\\s*hooks\\s*=\\s*false\\s*(#.*)?$"
-    legacy_hooks_pattern = r"(?m)^\\s*codex_hooks\\s*=\\s*(true|false)\\s*(#.*)?$"
-    has_current_hooks = re.search(current_hooks_pattern, content) is not None
-    had_legacy_hooks = re.search(legacy_hooks_pattern, content) is not None
-    if re.search(legacy_hooks_pattern, content):
-        replacement = "" if has_current_hooks else "hooks = true"
-        content = re.sub(legacy_hooks_pattern, replacement, content)
-    if re.search(hooks_true_pattern, content):
-        if had_legacy_hooks:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content.rstrip() + "\\n")
-        return
-    if re.search(hooks_false_pattern, content):
-        content = re.sub(hooks_false_pattern, "hooks = true", content)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content.rstrip() + "\\n")
-        return
-    lines = content.splitlines()
+# Codex TOML editing (#354).
+def _codex_toml_string(text, i, allow_multiline=False):
+    quote = text[i]
+    triple = text.startswith(quote * 3, i)
+    if triple and not allow_multiline:
+        raise ValueError("multiline key")
+    i += 3 if triple else 1
+    out = []
+    escapes = {'b': '\\b', 't': '\\t', 'n': '\\n', 'f': '\\f', 'r': '\\r', '"': '"', '\\\\': '\\\\'}
+    while i < len(text):
+        ch = text[i]
+        if ch == quote:
+            end = i + 1
+            if triple:
+                while end < len(text) and text[end] == quote:
+                    end += 1
+                count = end - i
+                if count < 3:
+                    out.append(quote * count)
+                    i = end
+                    continue
+                if count > 5:
+                    raise ValueError("quote run")
+                out.append(quote * (count - 3))
+            return end, ''.join(out)
+        if ch == '\\\\' and quote == '"':
+            i += 1
+            if i == len(text):
+                break
+            ch = text[i]
+            if triple and ch in ' \\t\\r\\n':
+                end = i
+                while end < len(text) and text[end] in ' \\t\\r\\n':
+                    if text[end] == '\\r' and not text.startswith('\\r\\n', end):
+                        raise ValueError("bare carriage return")
+                    end += 1
+                if '\\n' not in text[i:end]:
+                    raise ValueError("invalid continuation")
+                i = end
+                continue
+            if ch in escapes:
+                out.append(escapes[ch])
+                i += 1
+                continue
+            if ch in ('u', 'U'):
+                end = i + (5 if ch == 'u' else 9)
+                digits = text[i + 1:end]
+                if len(digits) != end - i - 1 or any(c not in '0123456789abcdefABCDEF' for c in digits):
+                    raise ValueError("unicode escape")
+                value = int(digits, 16)
+                if value > 0x10ffff or 0xd800 <= value <= 0xdfff:
+                    raise ValueError("unicode scalar")
+                out.append(chr(value))
+                i = end
+                continue
+            raise ValueError("escape")
+        if ch in '\\r\\n' and not triple:
+            raise ValueError("newline in ordinary string")
+        if ch == '\\r' and not text.startswith('\\r\\n', i):
+            raise ValueError("bare carriage return")
+        if (ord(ch) < 32 and ch not in '\\t\\r\\n') or ord(ch) == 127:
+            raise ValueError("control character")
+        out.append(ch)
+        i += 1
+    raise ValueError("unclosed string")
+
+def _codex_toml_statements(text):
+    # Source ranges include their newline. This is a lexer, not a TOML serializer.
+    ranges, stack = [], []
+    start = i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch in ('"', "'"):
+            i, _ = _codex_toml_string(text, i, True)
+            continue
+        if ch == '#':
+            end = text.find('\\n', i)
+            i = len(text) if end < 0 else end
+            continue
+        if ch in '[{':
+            stack.append(ch)
+        elif ch in ']}':
+            if not stack or stack.pop() != ('[' if ch == ']' else '{'):
+                raise ValueError("mismatched delimiter")
+        elif ch == '\\r' and not text.startswith('\\r\\n', i):
+            raise ValueError("bare carriage return")
+        elif (ord(ch) < 32 and ch not in '\\t\\r\\n') or ord(ch) == 127:
+            raise ValueError("control character")
+        if ch == '\\n' and not stack:
+            ranges.append((start, i + 1))
+            start = i + 1
+        i += 1
+    if stack:
+        raise ValueError("unclosed delimiter")
+    if start < len(text):
+        ranges.append((start, len(text)))
+    return ranges
+
+def _codex_toml_key(text, i):
+    path = []
+    while True:
+        i += len(text[i:]) - len(text[i:].lstrip(' \\t'))
+        if i == len(text):
+            raise ValueError("missing key")
+        if text[i] in ('"', "'"):
+            i, name = _codex_toml_string(text, i)
+        else:
+            start = i
+            while i < len(text) and text[i] in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-':
+                i += 1
+            if i == start:
+                raise ValueError("invalid key")
+            name = text[start:i]
+        path.append(name)
+        key_end = i
+        i += len(text[i:]) - len(text[i:].lstrip(' \\t'))
+        if i == len(text) or text[i] != '.':
+            return tuple(path), key_end, i
+        i += 1
+
+def _codex_toml_tail(text, i):
+    tail = text[i:].lstrip(' \\t\\r\\n')
+    return not tail or tail.startswith('#')
+
+def _codex_is_features_header(text):
+    i = len(text) - len(text.lstrip(' \\t'))
+    if text.startswith('[[', i):
+        return False
+    key, _, pos = _codex_toml_key(text, i + 1)
+    return key == ('features',) and text.startswith(']', pos)
+
+def _codex_without_appended_features(content, ranges):
+    # CodeIsland 1.0.35 and earlier appended [features] + hooks = true at EOF
+    # whenever its line regex missed the flag or the header, even when root dotted
+    # features.* keys or a spelling such as "[features] # note" already defined
+    # that table: a duplicate key that stops Codex from starting (#354). Drop
+    # exactly that trailing block and the blank line before it; else None.
+    features_defined, last_header = False, None
+    for index, (start, end) in enumerate(ranges):
+        text = content[start:end]
+        i = len(text) - len(text.lstrip(' \\t'))
+        if i == len(text) or text[i] in '#\\r\\n':
+            continue
+        if text[i] == '[':
+            # Every header but the final one may be the earlier definition.
+            if last_header is not None and _codex_is_features_header(content[ranges[last_header][0]:ranges[last_header][1]]):
+                features_defined = True
+            last_header = index
+        elif last_header is None:
+            key = _codex_toml_key(text, i)[0]
+            if len(key) > 1 and key[0] == 'features':
+                features_defined = True
+    if not features_defined or last_header is None:
+        return None
+    start, end = ranges[last_header]
+    text = content[start:end]
+    i = len(text) - len(text.lstrip(' \\t'))
+    if not text.startswith('[features]', i) or text[i + 10:].strip(' \\t\\r\\n'):
+        return None
+    flags = 0
+    for body_start, body_end in ranges[last_header + 1:]:
+        text = content[body_start:body_end]
+        if not text.strip(' \\t\\r\\n'):
+            continue
+        i = len(text) - len(text.lstrip(' \\t'))
+        if text[i] == '#':
+            return None
+        key, _, pos = _codex_toml_key(text, i)
+        if key != ('hooks',) or not text.startswith('=', pos):
+            return None
+        pos += 1
+        pos += len(text[pos:]) - len(text[pos:].lstrip(' \\t'))
+        if not any(text.startswith(v, pos) and not text[pos + len(v):].strip(' \\t\\r\\n') for v in ('true', 'false')):
+            return None
+        flags += 1
+    if flags != 1:
+        return None
+    if last_header > 0:
+        blank_start, blank_end = ranges[last_header - 1]
+        if not content[blank_start:blank_end].strip(' \\t\\r\\n'):
+            start = blank_start
+    return content[:start]
+
+def _codex_hooks_toml(content, heal=True):
+    # Narrow source editor: root features.hooks only; opaque values stay verbatim.
+    # tomllib, when available, validates both documents. Older Python still gets
+    # lexical, key/scope and conflicting-layout guards, not a full TOML parser.
     try:
-        idx = next(i for i, line in enumerate(lines) if line.strip() == "[features]")
-        lines.insert(idx + 1, "hooks = true")
-    except StopIteration:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.extend(["[features]", "hooks = true"])
+        import tomllib
+    except ImportError:
+        tomllib = None
+    try:
+        if heal:
+            healed = _codex_without_appended_features(content, _codex_toml_statements(content))
+            if healed is not None:
+                return _codex_hooks_toml(healed, False)
+        if tomllib is not None:
+            tomllib.loads(content)
+        scope = ()
+        current = legacy = features_header = first_table = None
+        root_dotted = False
+        for start, end in _codex_toml_statements(content):
+            text = content[start:end]
+            i = len(text) - len(text.lstrip(' \\t'))
+            if i == len(text) or text[i] in '#\\r\\n':
+                continue
+            if text[i] == '[':
+                array = text.startswith('[[', i)
+                scope, _, pos = _codex_toml_key(text, i + (2 if array else 1))
+                closing = ']]' if array else ']'
+                if not text.startswith(closing, pos) or not _codex_toml_tail(text, pos + len(closing)):
+                    return None
+                if scope[:2] == ('features', 'hooks') or (array and scope == ('features',)):
+                    return None
+                if first_table is None:
+                    first_table = start
+                if scope == ('features',):
+                    if features_header is not None:
+                        return None
+                    features_header = end
+                continue
+            key_start = i
+            key, key_end, pos = _codex_toml_key(text, i)
+            if pos == len(text) or text[pos] != '=':
+                return None
+            pos += 1
+            pos += len(text[pos:]) - len(text[pos:].lstrip(' \\t'))
+            if pos == len(text) or text[pos] in '#\\r\\n':
+                return None
+            if not scope and len(key) > 1 and key[0] == 'features':
+                root_dotted = True
+            absolute = scope + key
+            if absolute == ('features',) or (absolute[:2] == ('features', 'hooks') and len(absolute) > 2):
+                return None
+            if absolute not in (('features', 'hooks'), ('features', 'codex_hooks')):
+                continue
+            value = next((v for v in ('true', 'false') if text.startswith(v, pos) and _codex_toml_tail(text, pos + len(v))), None)
+            if value is None:
+                return None
+            flag = (start, end, start + key_start, start + key_end, start + pos, start + pos + len(value), len(key))
+            if absolute == ('features', 'hooks'):
+                if current is not None:
+                    return None
+                current = flag
+            else:
+                if legacy is not None:
+                    return None
+                legacy = flag
+        # Root dotted features.* keys already define the table; an explicit
+        # [features] header too is a duplicate key Codex refuses to load.
+        if features_header is not None and root_dotted:
+            return None
+        edits = []
+        if current is not None:
+            edits.append((current[4], current[5], 'true'))
+            if legacy is not None:
+                edits.append((legacy[0], legacy[1], ''))
+        elif legacy is not None:
+            name = 'hooks' if legacy[6] == 1 else 'features.hooks'
+            edits.extend([(legacy[2], legacy[3], name), (legacy[4], legacy[5], 'true')])
+        else:
+            newline = '\\r\\n' if '\\r\\n' in content else '\\n'
+            if features_header is not None:
+                pos = features_header
+                addition = ('' if content[:pos].endswith('\\n') else newline) + 'hooks = true' + newline
+            elif first_table is not None:
+                pos = first_table
+                addition = 'features.hooks = true' + newline
+            else:
+                pos = len(content)
+                addition = (newline if content and not content.endswith('\\n') else '') + 'features.hooks = true' + newline
+            edits.append((pos, pos, addition))
+        candidate = content
+        for start, end, replacement in sorted(edits, reverse=True):
+            candidate = candidate[:start] + replacement + candidate[end:]
+        if tomllib is not None:
+            features = tomllib.loads(candidate).get('features')
+            if not isinstance(features, dict) or features.get('hooks') is not True:
+                return None
+        return candidate
+    except (ValueError, TypeError):
+        return None
+
+def _write_codex_toml(path, content):
+    import stat
+    import tempfile
+    # A unique sibling avoids collisions and pre-existing .tmp symlinks. Keep
+    # private configs private, including when the config path itself is a link.
+    path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\\n".join(lines).rstrip() + "\\n")
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(content)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+def ensure_toml_codex_hooks(path):
+    try:
+        # newline='' avoids read_text's universal-newline normalization.
+        with path.open('r', encoding='utf-8', newline='') as stream:
+            content = stream.read()
+    except FileNotFoundError:
+        content = ''
+    except (OSError, UnicodeError):
+        return False
+    result = _codex_hooks_toml(content)
+    if result is None:
+        return False
+    if result != content:
+        try:
+            _write_codex_toml(path, result)
+        except (OSError, UnicodeError, RuntimeError):
+            return False
+    return True
 
 def install_codex():
     codex_root = _codex_home()
@@ -812,22 +1510,26 @@ def install_codex():
 
     cmd = command_for("codex")
     entry = [{"hooks": [{"type": "command", "command": cmd, "timeout": 60}]}]
-    # Codex fires PermissionRequest before shell escalation / managed-network
-    # approvals. Remote Codex registered only the three lifecycle events, so the
-    # approval never left the remote terminal while remote Claude — same host,
-    # same tunnel — worked fine (#306). Long timeout for the same reason as the
-    # local installer: the user may take minutes to decide.
+    # PermissionRequest blocks on a human, so it receives the long timeout. The
+    # other entries mirror Codex's complete public lifecycle surface, keeping
+    # remote status fidelity identical to local sessions.
     blocking_entry = [{"hooks": [{"type": "command", "command": cmd, "timeout": 86400}]}]
-    append_our_hooks(hooks, "SessionStart", entry)
-    append_our_hooks(hooks, "SessionEnd", entry)
-    append_our_hooks(hooks, "UserPromptSubmit", entry)
-    append_our_hooks(hooks, "PreToolUse", entry)
-    append_our_hooks(hooks, "PostToolUse", entry)
+    # Codex caps SessionEnd / Interrupt hooks at 3 s and warns about any
+    # longer configured timeout, so match the local installer's 3 s there.
+    teardown_entry = [{"hooks": [{"type": "command", "command": cmd, "timeout": 3}]}]
+    for event in [
+        "PreToolUse", "PostToolUse", "PreCompact", "PostCompact",
+        "SessionStart", "SubagentStart", "SubagentStop",
+        "UserPromptSubmit", "Stop",
+    ]:
+        append_our_hooks(hooks, event, entry)
     append_our_hooks(hooks, "PermissionRequest", blocking_entry)
-    append_our_hooks(hooks, "Stop", entry)
+    append_our_hooks(hooks, "SessionEnd", teardown_entry)
+    append_our_hooks(hooks, "Interrupt", teardown_entry)
     data["hooks"] = hooks
     write_json(hooks_path, data)
-    ensure_toml_codex_hooks(codex_root / "config.toml")
+    if not ensure_toml_codex_hooks(codex_root / "config.toml"):
+        return "Codex config update failed"
     return "Codex ok"
 
 def install_codebuddy():
@@ -920,9 +1622,12 @@ def install_custom():
     results = []
     for cli in custom_clis:
         source = cli["source"]
+        # config_path arrives home-relative (or absolute) — the Mac side already
+        # stripped `~/` and its own home prefix so this resolves against the REMOTE
+        # $HOME (#342).
         config_path = home / cli["config_path"]
         if not config_path.parent.exists() and shutil.which(source) is None:
-            results.append(cli["name"] + " skipped")
+            results.append(cli["name"] + " skipped (config dir not found: " + _display_path(config_path.parent) + ")")
             continue
         data = ensure_json(config_path)
         if not isinstance(data, dict):
@@ -942,6 +1647,8 @@ def install_custom():
         data[cli["config_key"]] = hooks
         write_json(config_path, data)
         results.append(cli["name"] + " ok")
+    for name in unsupported_custom_clis:
+        results.append(name + " skipped (template not supported remotely)")
     return results
 
 parts = [install_claude(), install_qoder(), install_hermes(), install_codex(), install_codebuddy(), install_traecli(), install_opencode()] + install_custom()
@@ -950,7 +1657,7 @@ print(" · ".join(parts))
     }
 
     private static func runSSH(host: RemoteHost, command: String, timeout: TimeInterval) async -> RemoteCommandResult {
-        guard !host.sshTarget.isEmpty else {
+        guard !host.sshTarget.isEmpty, host.unsafeSSHField == nil else {
             return RemoteCommandResult(stdout: "", stderr: "invalid host", exitCode: -1)
         }
         return await withCheckedContinuation { continuation in
@@ -984,14 +1691,18 @@ print(" · ".join(parts))
                 timeoutTask.cancel()
                 let outData = stdout.fileHandleForReading.readDataToEndOfFile()
                 let errData = stderr.fileHandleForReading.readDataToEndOfFile()
-                let out = String(data: outData, encoding: .utf8) ?? ""
-                let err = String(data: errData, encoding: .utf8) ?? ""
+                // Lossy: one byte a login shell prints in another encoding must not
+                // hide the answer line after it.
+                let out = String(decoding: outData, as: UTF8.self)
+                let err = String(decoding: errData, as: UTF8.self)
                 continuation.resume(returning: RemoteCommandResult(stdout: out, stderr: err, exitCode: process.terminationStatus))
             }
         }
     }
 
-    private static func sshArguments(host: RemoteHost) -> [String] {
+    /// ssh's arguments up to the remote command: options, then `--`, which
+    /// ends them, then the host — never read as an option, whatever it says.
+    static func sshArguments(host: RemoteHost) -> [String] {
         var args: [String] = [
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=8",
@@ -1005,16 +1716,43 @@ print(" · ".join(parts))
         if !trimmedIdentity.isEmpty {
             args += ["-i", trimmedIdentity]
         }
-        args.append(host.sshTarget)
+        args += ["--", host.sshTarget]
         return args
     }
 
-    /// Serialize custom CLI configs into a Python list literal for the remote install
-    /// script. Only `.claude` / `.nested` formats are emitted — their stdin carries
-    /// `hook_event_name`, so the remote hook handles them with no `--event` flag.
-    /// Other formats (flat/Cursor, traecli, copilot, kimi, …) are skipped remotely (#192).
+    /// Only `.claude` / `.nested` custom CLIs can be installed remotely — their stdin
+    /// carries `hook_event_name`, so the remote hook handles them with no `--event`
+    /// flag. Other formats (flat/Cursor, traecli, copilot, kimi, …) are not (#192);
+    /// they are listed in the status line as skipped instead of vanishing (#342).
+    private static func isRemoteSupportedCustomFormat(_ format: HookFormat) -> Bool {
+        format == .claude || format == .nested
+    }
+
+    /// A custom CLI's config path is typed on the Mac, where `~/x`, `x` and
+    /// `<Mac home>/x` all mean "under my home". The remote script joins it onto the
+    /// REMOTE `$HOME` with pathlib, which neither expands `~` (`~/x` became the
+    /// literal `$HOME/~/x`) nor knows the Mac home (`/Users/me/x` does not exist on a
+    /// Linux host) — so the config dir never existed and the CLI was always
+    /// "skipped" (#342). Rewrite both to home-relative; any other absolute path is
+    /// kept verbatim.
+    static func remoteCustomConfigPath(_ configPath: String, localHome: String = NSHomeDirectory()) -> String {
+        let path = configPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        var relative: Substring
+        if path.hasPrefix("~/") {
+            relative = path.dropFirst(2)
+        } else if !localHome.isEmpty, localHome != "/", path.hasPrefix(localHome + "/") {
+            relative = path.dropFirst(localHome.count + 1)
+        } else {
+            return path
+        }
+        while relative.hasPrefix("/") { relative = relative.dropFirst() }
+        return String(relative)
+    }
+
+    /// Serialize the remotely installable custom CLI configs into a Python list
+    /// literal for the remote install script.
     private static func remoteCustomCLIsLiteral(_ clis: [CLIConfig]) -> String {
-        let supported = clis.filter { $0.format == .claude || $0.format == .nested }
+        let supported = clis.filter { isRemoteSupportedCustomFormat($0.format) }
         let entries = supported.map { cli -> String in
             let fmt = cli.format == .claude ? "claude" : "nested"
             let events = cli.events
@@ -1023,7 +1761,7 @@ print(" · ".join(parts))
             return "{"
                 + "\"name\": \(pythonStringLiteral(cli.name)), "
                 + "\"source\": \(pythonStringLiteral(cli.source)), "
-                + "\"config_path\": \(pythonStringLiteral(cli.configPath)), "
+                + "\"config_path\": \(pythonStringLiteral(remoteCustomConfigPath(cli.configPath))), "
                 + "\"config_key\": \(pythonStringLiteral(cli.configKey)), "
                 + "\"format\": \(pythonStringLiteral(fmt)), "
                 + "\"events\": [\(events)]"
@@ -1033,11 +1771,43 @@ print(" · ".join(parts))
     }
 
     private static func pythonStringLiteral(_ value: String) -> String {
-        let escaped = value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\n", with: "\\n")
+        quotedLiteral(value)
+    }
+
+    /// `value` as a double-quoted string literal that Python and JavaScript
+    /// both read back as `value`: backslash and quote escaped, and every
+    /// control character and line separator written as an escape (`\n`,
+    /// `\r`, `\t`, else `\uXXXX`), so nothing in it ends the literal, or the
+    /// line it is on.
+    static func quotedLiteral(_ value: String) -> String {
+        var escaped = ""
+        for scalar in value.unicodeScalars {
+            switch scalar {
+            case "\\": escaped += "\\\\"
+            case "\"": escaped += "\\\""
+            case "\n": escaped += "\\n"
+            case "\r": escaped += "\\r"
+            case "\t": escaped += "\\t"
+            case _ where scalar.value < 0x20 || (0x7F...0x9F).contains(scalar.value)
+                || scalar.value == 0x2028 || scalar.value == 0x2029:
+                escaped += String(format: "\\u%04x", scalar.value)
+            default:
+                escaped.unicodeScalars.append(scalar)
+            }
+        }
         return "\"\(escaped)\""
+    }
+
+    /// `value` as one word for the shell on a remote host: as it is when it
+    /// holds nothing a shell reads, else in single quotes — each single quote
+    /// in it spelled `'\''` — inside which no shell (sh, bash, zsh, fish,
+    /// csh) expands `$`, a backtick or anything else.
+    static func shellWord(_ value: String) -> String {
+        let plain = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@%+=:,./_-")
+        if !value.isEmpty, value.unicodeScalars.allSatisfy({ plain.contains($0) }) {
+            return value
+        }
+        return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     static func remoteOpencodePluginForInstall(source: String, host: RemoteHost, remoteSocketPath: String? = nil) -> String {
@@ -1055,26 +1825,14 @@ print(" · ".join(parts))
                 of: #"const REMOTE_HOST_NAME = process.env.CODEISLAND_REMOTE_HOST_NAME || "";"#,
                 with: #"const REMOTE_HOST_NAME = \#(jsonStringLiteral(host.name));"#
             )
+            .replacingOccurrences(
+                of: #"const SOCKET_OWNER_UID = process.env.CODEISLAND_SOCKET_OWNER_UID || "";"#,
+                with: #"const SOCKET_OWNER_UID = \#(jsonStringLiteral(socketOwnerUID(for: host, remoteSocketPath: socketPath)));"#
+            )
     }
 
     private static func jsonStringLiteral(_ value: String) -> String {
-        let escaped = value.reduce(into: "") { result, ch in
-            switch ch {
-            case "\\":
-                result += "\\\\"
-            case "\"":
-                result += "\\\""
-            case "\n":
-                result += "\\n"
-            case "\r":
-                result += "\\r"
-            case "\t":
-                result += "\\t"
-            default:
-                result.append(ch)
-            }
-        }
-        return "\"\(escaped)\""
+        quotedLiteral(value)
     }
 }
 

@@ -29,11 +29,15 @@ enum SessionTitleStore {
     }
 
     static func codexThreadName(sessionId: String) -> String? {
-        let path = NSHomeDirectory() + "/.codex/session_index.jsonl"
-        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
-            return nil
+        // Each Codex root (CODEX_HOME / account) keeps its own thread index.
+        for root in SessionDiscovery.codexStateRoots() {
+            let path = root + "/session_index.jsonl"
+            guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            if let title = try? codexThreadName(sessionId: sessionId, indexContents: contents) {
+                return title
+            }
         }
-        return try? codexThreadName(sessionId: sessionId, indexContents: contents)
+        return nil
     }
 
     static func codexThreadName(sessionId: String, indexContents: String) throws -> String? {
@@ -72,9 +76,9 @@ enum SessionTitleStore {
         guard let cwd else { return nil }
 
         let projectDir = cwd.claudeProjectDirEncoded()
-        let path = "\(ClaudeConfigPaths.projectsDir())/\(projectDir)/\(sessionId).jsonl"
-
-        guard let handle = FileHandle(forReadingAtPath: path) else {
+        // The transcript sits under whichever config dir (account) ran it.
+        guard let path = ClaudeConfigPaths.transcriptPath(projectDir: projectDir, sessionId: sessionId),
+              let handle = FileHandle(forReadingAtPath: path) else {
             return nil
         }
         defer { handle.closeFile() }

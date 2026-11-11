@@ -388,8 +388,10 @@ enum JSONMinimalEditor {
     /// - Parameter keyIndent: The indentation of the key's own line; nested lines get the same prefix.
     /// - Returns: JSON text ready to be placed after `"key": `, or `nil` if the value cannot be serialized.
     ///
-    /// Intentionally omits `.sortedKeys` so NSDictionary iteration order is preserved (unstable for dicts we
-    /// constructed ourselves, but stable enough to not force alphabetical reordering of user-adjacent data).
+    /// Intentionally omits `.sortedKeys` so NSDictionary iteration order is preserved rather than forcing
+    /// alphabetical reordering of user-adjacent data. Dicts we construct ourselves come out in a different
+    /// order in each process, so a caller that runs on every launch compares documents before writing
+    /// (`ConfigInstaller.isSameJSONDocument`).
     static func serializeValue(_ value: Any, keyIndent: String) -> String? {
         if JSONSerialization.isValidJSONObject(value) {
             let opts: JSONSerialization.WritingOptions = [.prettyPrinted, .withoutEscapingSlashes]

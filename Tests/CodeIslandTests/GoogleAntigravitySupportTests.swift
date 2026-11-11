@@ -154,37 +154,137 @@ final class GoogleAntigravitySupportTests: XCTestCase {
         XCTAssertFalse(ConfigInstaller.hasNestedAntigravityModelEvent(fixed))
     }
 
-    func testGoogleAntigravityPreToolUseRoutesToPermission() async throws {
-        let payload: [String: Any] = [
-            "hook_event_name": "PreToolUse",
-            "session_id": "test-sess",
-            "_source": "google-antigravity",
-            "tool_name": "Bash",
-            "tool_input": ["command": "rm -rf foo"]
-        ]
-        let data = try JSONSerialization.data(withJSONObject: payload)
-        let event = try XCTUnwrap(HookEvent(from: data))
-        
+    // MARK: - PreToolUse is observed, never held for an island card (#339)
+
+    /// Antigravity ignores a hook's `allow` (it prompts natively anyway) and
+    /// runs PreToolUse for every tool, so an island card here only stacked a
+    /// second, useless approval in front of each call.
+    func testGoogleAntigravityPreToolUseRoutesAsActivityNotPermission() async throws {
+        let event = try makeAgyEvent(["hook_event_name": "PreToolUse", "_source": "google-antigravity"])
         let kind = await MainActor.run { HookServer.routeKind(for: event) }
-        XCTAssertEqual(kind, .permission)
+        XCTAssertEqual(kind, .event)
     }
 
-    func testGeminiSourcePreToolUseRoutesToPermission() async throws {
-        // agy CLI uses --source gemini and sends hook_event_name: "PreToolUse" in
-        // its JSON payload, overriding the --event BeforeTool fallback.
-        let payload: [String: Any] = [
-            "hook_event_name": "PreToolUse",
-            "session_id": "test-gemini-sess",
-            "_source": "gemini",
-            "tool_name": "run_command",
-            "tool_input": ["CommandLine": "rm -rf bar"]
-        ]
-        let data = try JSONSerialization.data(withJSONObject: payload)
-        let event = try XCTUnwrap(HookEvent(from: data))
-
+    func testGeminiTaggedPreToolUseFromAgyRoutesAsActivityNotPermission() async throws {
+        // agy reading hooks wired with --source gemini names the event
+        // PreToolUse on stdin; Gemini CLI itself never does.
+        let event = try makeAgyEvent(["hook_event_name": "PreToolUse", "_source": "gemini"])
         let kind = await MainActor.run { HookServer.routeKind(for: event) }
-        XCTAssertEqual(kind, .permission,
-            "agy CLI (--source gemini) PreToolUse must be treated as a blocking permission event")
+        XCTAssertEqual(kind, .event)
+    }
+
+    func testGeminiCLIBeforeToolStillRoutesToPermission() async throws {
+        let payload: [String: Any] = [
+            "hook_event_name": "BeforeTool",
+            "session_id": "gemini-cli-sess",
+            "_source": "gemini",
+            "tool_name": "run_shell_command",
+        ]
+        let event = try XCTUnwrap(HookEvent(from: JSONSerialization.data(withJSONObject: payload)))
+        let kind = await MainActor.run { HookServer.routeKind(for: event) }
+        XCTAssertEqual(kind, .permission, "Gemini CLI's own approval hook keeps its card")
+    }
+
+    /// The whole Antigravity tool round trip leaves nothing to click: the call
+    /// shows as running, and whatever the user answers in Antigravity, the next
+    /// tool/model event moves the session on by itself.
+    @MainActor
+    func testAntigravityToolCallShowsRunningWithoutACardAndClearsOnTheNextEvent() throws {
+        let appState = AppState()
+        let sessionId = "agy-conv-339"
+
+        appState.handleEvent(try makeAgyEvent([
+            "hook_event_name": "PreToolUse",
+            "_source": "google-antigravity",
+            "conversationId": sessionId,
+            "session_id": sessionId,
+        ]))
+        XCTAssertTrue(appState.permissionQueue.isEmpty, "no approval card for Antigravity")
+        XCTAssertEqual(appState.surface, .collapsed)
+        XCTAssertEqual(appState.sessions[sessionId]?.status, .running)
+        XCTAssertEqual(appState.sessions[sessionId]?.currentTool, "run_command")
+        XCTAssertEqual(appState.sessions[sessionId]?.toolDescription, "npm test")
+
+        // Approved in Antigravity → the tool ran → PostToolUse.
+        appState.handleEvent(try makeAgyEvent([
+            "hook_event_name": "PostToolUse",
+            "_source": "google-antigravity",
+            "session_id": sessionId,
+        ]))
+        XCTAssertEqual(appState.sessions[sessionId]?.status, .processing)
+        XCTAssertNil(appState.sessions[sessionId]?.currentTool)
+
+        // A call denied in Antigravity never reaches PostToolUse; the turn's
+        // Stop settles the session instead of leaving it on the tool.
+        appState.handleEvent(try makeAgyEvent([
+            "hook_event_name": "PreToolUse",
+            "_source": "google-antigravity",
+            "session_id": sessionId,
+        ]))
+        XCTAssertEqual(appState.sessions[sessionId]?.status, .running)
+        let stop: [String: Any] = [
+            "hook_event_name": "Stop",
+            "_source": "google-antigravity",
+            "session_id": sessionId,
+            "fullyIdle": true,
+        ]
+        appState.handleEvent(try XCTUnwrap(HookEvent(from: JSONSerialization.data(withJSONObject: stop))))
+        XCTAssertEqual(appState.sessions[sessionId]?.status, .idle)
+        XCTAssertNil(appState.sessions[sessionId]?.currentTool)
+        XCTAssertTrue(appState.permissionQueue.isEmpty)
+    }
+
+    /// The hook no longer waits on the island, and a PreToolUse hook Antigravity
+    /// has to kill counts as a denial — no day-long ceiling.
+    func testAntigravityPreToolUseTimeoutIsNotABlockingCeiling() throws {
+        let preToolUse = try XCTUnwrap(
+            ConfigInstaller.defaultEvents(for: .antigravityNamed).first { $0.0 == "PreToolUse" }
+        )
+        XCTAssertLessThanOrEqual(preToolUse.1, 30)
+        XCTAssertGreaterThanOrEqual(preToolUse.1, 10, "must outlast the bridge's own ~9s self-deadline")
+    }
+
+    // MARK: - Bridge stdout (the real binary, never the user's live socket)
+
+    /// Antigravity denies the tool call when PreToolUse prints no decision, so
+    /// the answer must be on stdout even when CodeIsland is not running.
+    func testBridgeAnswersAskEvenWhenTheIslandIsNotRunning() throws {
+        let bridge = try bridgeBinary()
+        let socketPath = NSTemporaryDirectory() + "no-island-\(UUID().uuidString).sock"
+        let result = try runBridge(bridge, args: ["--source", "google-antigravity", "--event", "PreToolUse"],
+                                   env: ["CODEISLAND_SOCKET_PATH": socketPath])
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(result.stdout, #"{"decision":"ask"}"#)
+
+        let skipped = try runBridge(bridge, args: ["--source", "google-antigravity", "--event", "PreToolUse"],
+                                    env: ["CODEISLAND_SOCKET_PATH": socketPath, "CODEISLAND_SKIP": "1"])
+        XCTAssertEqual(skipped.stdout, #"{"decision":"ask"}"#, "CODEISLAND_SKIP must not refuse tools")
+
+        let post = try runBridge(bridge, args: ["--source", "google-antigravity", "--event", "PostToolUse"],
+                                 env: ["CODEISLAND_SOCKET_PATH": socketPath])
+        XCTAssertEqual(post.stdout, "", "only PreToolUse owes Antigravity a decision")
+    }
+
+    /// With the island up, the event is still forwarded (so the notch shows the
+    /// tool) but the bridge neither waits for a decision nor relays one: an
+    /// island `allow` would be ignored by Antigravity anyway.
+    func testBridgeForwardsWithoutWaitingOrRelayingAnIslandDecision() throws {
+        let bridge = try bridgeBinary()
+        let allow = Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#.utf8)
+        let server = try XCTUnwrap(OneShotUnixServer(reply: allow))
+
+        let result = try runBridge(bridge, args: ["--source", "google-antigravity", "--event", "PreToolUse"],
+                                   env: ["CODEISLAND_SOCKET_PATH": server.path])
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(result.stdout, #"{"decision":"ask"}"#)
+
+        XCTAssertTrue(server.waitUntilServed(timeout: 5))
+        let forwarded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: server.received) as? [String: Any]
+        )
+        XCTAssertEqual(forwarded["hook_event_name"] as? String, "PreToolUse")
+        XCTAssertEqual(forwarded["session_id"] as? String, "agy-conv-bridge")
+        XCTAssertEqual(forwarded["_source"] as? String, "google-antigravity")
     }
 
     func testAgyToolCallParsing() throws {
@@ -205,6 +305,133 @@ final class GoogleAntigravitySupportTests: XCTestCase {
         XCTAssertEqual(event.toolName, "run_command")
         XCTAssertEqual(event.toolInput?["CommandLine"] as? String, "ls -la")
         XCTAssertEqual(event.toolDescription, "ls -la")
+    }
+
+    // MARK: - Helpers
+
+    private func makeAgyEvent(_ overrides: [String: Any]) throws -> HookEvent {
+        var payload: [String: Any] = [
+            "conversationId": "agy-conv",
+            "session_id": "agy-conv",
+            "stepIdx": 4,
+            "toolCall": ["name": "run_command", "args": ["CommandLine": "npm test"]],
+        ]
+        payload.merge(overrides) { _, new in new }
+        return try XCTUnwrap(HookEvent(from: JSONSerialization.data(withJSONObject: payload)))
+    }
+
+    private func bridgeBinary() throws -> URL {
+        let url = Bundle(for: Self.self).bundleURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("codeisland-bridge")
+        guard FileManager.default.isExecutableFile(atPath: url.path) else {
+            throw XCTSkip("codeisland-bridge not built next to the test bundle")
+        }
+        return url
+    }
+
+    private func runBridge(
+        _ bridge: URL,
+        args: [String],
+        env: [String: String]
+    ) throws -> (status: Int32, stdout: String) {
+        let process = Process()
+        process.executableURL = bridge
+        process.arguments = args
+        // The bridge's debug log goes to a temp file, not the shared
+        // /tmp/codeisland-bridge.log the user's real hooks write.
+        let log = NSTemporaryDirectory() + "codeisland-bridge-test-\(getpid()).log"
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: log) }
+        process.environment = env.merging([
+            "PATH": "/usr/bin:/bin",
+            "CODEISLAND_BRIDGE_LOG": log,
+        ]) { current, _ in current }
+        let stdin = Pipe()
+        let stdout = Pipe()
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let payload: [String: Any] = [
+            "conversationId": "agy-conv-bridge",
+            "stepIdx": 1,
+            "toolCall": ["name": "run_command", "args": ["CommandLine": "npm test"]],
+        ]
+        stdin.fileHandleForWriting.write(try JSONSerialization.data(withJSONObject: payload))
+        try stdin.fileHandleForWriting.close()
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(decoding: output, as: UTF8.self))
+    }
+}
+
+/// Minimal Unix-socket stand-in for HookServer: accepts one bridge connection,
+/// reads the event to EOF, answers with `reply`, closes.
+final class OneShotUnixServer {
+    let path: String
+    private let served = DispatchSemaphore(value: 0)
+    private let request = ReceivedRequest()
+    /// What the client sent; read it after `waitUntilServed`.
+    var received: Data { request.data }
+
+    /// Filled by the accept thread, which must not hold the server: a client
+    /// that never connected kept it alive, and its socket file stayed in /tmp.
+    private final class ReceivedRequest: @unchecked Sendable {
+        var data = Data()
+    }
+
+    /// How long the accept thread waits for a client before giving up.
+    private static let acceptTimeoutMilliseconds: Int32 = 15_000
+
+    init?(reply: Data) {
+        // sun_path is 104 bytes; NSTemporaryDirectory() can be too long for it.
+        path = "/tmp/ci-bridge-\(UUID().uuidString.prefix(8)).sock"
+        let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard listener >= 0 else { return nil }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutablePointer(to: &addr.sun_path.0) { ptr in
+            path.withCString { _ = strcpy(ptr, $0) }
+        }
+        let bound = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard bound == 0, listen(listener, 1) == 0 else {
+            close(listener)
+            return nil
+        }
+        // The thread owns the listener and closes it: closing it from deinit
+        // would not wake a blocked accept, and its number could be reused.
+        DispatchQueue.global().async { [request, served] in
+            defer { close(listener) }
+            var pending = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+            let client = poll(&pending, 1, Self.acceptTimeoutMilliseconds) > 0
+                ? accept(listener, nil, nil)
+                : -1
+            if client >= 0 {
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                var data = Data()
+                while true {
+                    let n = read(client, &buffer, buffer.count)
+                    if n <= 0 { break }
+                    data.append(contentsOf: buffer[..<n])
+                }
+                request.data = data
+                _ = reply.withUnsafeBytes { write(client, $0.baseAddress, reply.count) }
+                close(client)
+            }
+            served.signal()
+        }
+    }
+
+    func waitUntilServed(timeout: TimeInterval) -> Bool {
+        served.wait(timeout: .now() + timeout) == .success
+    }
+
+    deinit {
+        unlink(path)
     }
 }
 

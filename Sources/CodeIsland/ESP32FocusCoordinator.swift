@@ -46,7 +46,7 @@ enum ESP32FocusCoordinator {
             return
         }
 
-        if let bundleId = TerminalActivator.sourceToNativeAppBundleId[targetSource],
+        if let bundleId = TerminalActivator.desktopAppBundleId(forSource: targetSource),
            let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleId }) {
             log.info("Focus \(targetSource): no session, activating desktop app \(bundleId)")
             if app.isHidden { app.unhide() }

@@ -1,4 +1,5 @@
 import AppKit
+import CodeIslandCore
 import Combine
 import Sparkle
 import os.log
@@ -37,6 +38,16 @@ final class UpdateChecker: NSObject, ObservableObject {
         let path = Bundle.main.bundlePath
         return path.contains("/Caskroom/") || path.contains("/homebrew/")
     }
+
+    /// Non-nil when the running bundle sits somewhere Sparkle cannot write
+    /// (translocated, the DMG itself, a read-only volume). The About page
+    /// explains it instead of letting the update fail with a generic error.
+    /// Resolved once: a running app does not move.
+    let readOnlyInstallReason: AppInstallLocation.ReadOnlyReason? = {
+        let bundleURL = Bundle.main.bundleURL
+        let readOnly = (try? bundleURL.resourceValues(forKeys: [.volumeIsReadOnlyKey]))?.volumeIsReadOnly ?? false
+        return AppInstallLocation.readOnlyReason(bundlePath: bundleURL.path, volumeIsReadOnly: readOnly)
+    }()
 
     // MARK: - Lifecycle
 

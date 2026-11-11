@@ -70,9 +70,8 @@ build_watch() {
 
 build_mac() {
     echo "Building $APP_NAME (arm64 only)..."
-    swift build -c release --arch arm64
-
-    ARM_DIR=".build/arm64-apple-macosx/release"
+    source scripts/swiftpm-release.sh
+    ARM_DIR=$(swiftpm_release_build arm64)
 
     echo "Creating app bundle..."
     rm -rf "$APP_BUNDLE"
@@ -118,13 +117,8 @@ build_mac() {
     fi
     cp "Sources/CodeIsland/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 
-    # Copy SPM resource bundles into Contents/Resources/ (required for code signing)
-    for bundle in .build/*/release/*.bundle; do
-        if [ -e "$bundle" ]; then
-            cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"
-            break
-        fi
-    done
+    # Copy the SPM resource bundle into Contents/Resources/ (required for code signing)
+    cp -R "$ARM_DIR/CodeIsland_CodeIsland.bundle" "$APP_BUNDLE/Contents/Resources/"
 
     ENTITLEMENTS="CodeIsland.entitlements"
 

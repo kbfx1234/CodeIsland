@@ -49,14 +49,24 @@ final class CursorSessionFoldingTests: XCTestCase {
         )
     }
 
-    func testRouterLeavesCursorChildWhenModeIsSeparate() {
+    /// Where Agent Sub-Sessions puts this Cursor hook, with no cards on the island.
+    private func placement(_ raw: [String: Any], _ mode: SubsessionMode) -> SubsessionPlacement? {
+        let context = StubSubsessionContext()
+        guard let link = CursorSubsessionRouter.link(in: raw, context: context) else { return nil }
+        return SubsessionRouter.placement(for: link, mode: mode, cards: context.cards, isBlockingRequest: { false })
+    }
+
+    /// A Task its transcript names stays on its own card, linked to its chat:
+    /// it was a card that rang and popped completions of its own before
+    /// Agent Sub-Sessions treated every kind of child the same way.
+    func testSeparateModeKeepsCursorTaskOnItsOwnLinkedCard() {
         let raw: [String: Any] = [
             "_source": "cursor",
             "session_id": "2528cb91-6379-48f2-aff8-40f4b804dafa",
             "transcript_path": "/Users/u/.cursor/projects/x/agent-transcripts/e1247fd5-d9a0-48ef-8457-0304606b1833/e1247fd5-d9a0-48ef-8457-0304606b1833.jsonl",
             "hook_event_name": "beforeReadFile",
         ]
-        XCTAssertEqual(CursorSubsessionRouter.decide(raw: raw, mode: "separate"), .leave)
+        XCTAssertEqual(placement(raw, .separate), .ownCard(linkedTo: "e1247fd5-d9a0-48ef-8457-0304606b1833"))
     }
 
     func testRouterMergesCursorChildWhenModeIsMerge() {
@@ -66,13 +76,12 @@ final class CursorSessionFoldingTests: XCTestCase {
             "transcript_path": "/Users/u/.cursor/projects/x/agent-transcripts/e1247fd5-d9a0-48ef-8457-0304606b1833/e1247fd5-d9a0-48ef-8457-0304606b1833.jsonl",
             "hook_event_name": "beforeReadFile",
         ]
-        XCTAssertEqual(
-            CursorSubsessionRouter.decide(raw: raw, mode: "merge"),
-            .merge(
-                parentSessionId: "e1247fd5-d9a0-48ef-8457-0304606b1833",
-                childSessionId: "2528cb91-6379-48f2-aff8-40f4b804dafa"
-            )
-        )
+        let link = CursorSubsessionRouter.link(in: raw, context: StubSubsessionContext())
+        XCTAssertEqual(link?.agentId, "2528cb91-6379-48f2-aff8-40f4b804dafa")
+        XCTAssertEqual(link?.isInferred, false)
+        // The transcript names the chat's own session id, so its card is the
+        // one Merge folds into even before the chat's hooks build it.
+        XCTAssertEqual(placement(raw, .merge), .fold(into: "e1247fd5-d9a0-48ef-8457-0304606b1833"))
     }
 
     func testRouterHidesCursorChildWhenModeIsHide() {
@@ -81,7 +90,7 @@ final class CursorSessionFoldingTests: XCTestCase {
             "session_id": "2528cb91-6379-48f2-aff8-40f4b804dafa",
             "transcript_path": "/Users/u/.cursor/projects/x/agent-transcripts/e1247fd5-d9a0-48ef-8457-0304606b1833/e1247fd5-d9a0-48ef-8457-0304606b1833.jsonl",
         ]
-        XCTAssertEqual(CursorSubsessionRouter.decide(raw: raw, mode: "hide"), .hide)
+        XCTAssertEqual(placement(raw, .hide), .hidden)
     }
 
     func testRouterLeavesUnrelatedCursorSession() {
@@ -90,7 +99,7 @@ final class CursorSessionFoldingTests: XCTestCase {
             "session_id": "e1247fd5-d9a0-48ef-8457-0304606b1833",
             "transcript_path": "/Users/u/.cursor/projects/x/agent-transcripts/e1247fd5-d9a0-48ef-8457-0304606b1833/e1247fd5-d9a0-48ef-8457-0304606b1833.jsonl",
         ]
-        XCTAssertEqual(CursorSubsessionRouter.decide(raw: raw, mode: "merge"), .leave)
+        XCTAssertNil(placement(raw, .merge))
     }
 
     func testRouterLeavesNonCursorSourcesWithoutCursorTranscript() {
@@ -99,14 +108,14 @@ final class CursorSessionFoldingTests: XCTestCase {
             "session_id": "2528cb91-6379-48f2-aff8-40f4b804dafa",
             "transcript_path": "/Users/u/.cursor/projects/x/agent-transcripts/e1247fd5-d9a0-48ef-8457-0304606b1833/subagents/2528cb91-6379-48f2-aff8-40f4b804dafa.jsonl",
         ]
-        XCTAssertEqual(CursorSubsessionRouter.decide(raw: raw, mode: "merge"), .leave)
+        XCTAssertNil(placement(raw, .merge))
 
         let claudeElsewhere: [String: Any] = [
             "_source": "claude",
             "session_id": "2528cb91-6379-48f2-aff8-40f4b804dafa",
             "transcript_path": "/Users/u/.claude/projects/-tmp/2528cb91-6379-48f2-aff8-40f4b804dafa.jsonl",
         ]
-        XCTAssertEqual(CursorSubsessionRouter.decide(raw: claudeElsewhere, mode: "merge"), .leave)
+        XCTAssertNil(placement(claudeElsewhere, .merge))
     }
 
     func testShouldAttemptPpidFallbackOnlyWithoutParseableTranscriptParent() {
@@ -271,7 +280,7 @@ final class CursorSessionFoldingTests: XCTestCase {
         )
     }
 
-    func testRouterMergesMisbrandedClaudeDefaultCursorTask() {
+    func testRouterMergesMisbrandedClaudeDefaultCursorTask() throws {
         let parentId = "e1247fd5-d9a0-48ef-8457-0304606b1833"
         let childId = "2528cb91-6379-48f2-aff8-40f4b804dafa"
         let path = "/Users/u/.cursor/projects/x/agent-transcripts/\(parentId)/subagents/\(childId).jsonl"
@@ -280,18 +289,12 @@ final class CursorSessionFoldingTests: XCTestCase {
             "session_id": childId,
             "transcript_path": path,
         ]
-        XCTAssertEqual(
-            CursorSubsessionRouter.decide(raw: raw, mode: "merge"),
-            .merge(parentSessionId: parentId, childSessionId: childId)
-        )
+        XCTAssertEqual(placement(raw, .merge), .fold(into: parentId))
         var rewritten = raw
-        CursorSubsessionRouter.applyMerge(
-            to: &rewritten,
-            parentSessionId: parentId,
-            childSessionId: childId
-        )
+        let link = try XCTUnwrap(CursorSubsessionRouter.link(in: raw, context: StubSubsessionContext()))
+        XCTAssertTrue(SubsessionRouter.fold(&rewritten, link: link, into: parentId))
         XCTAssertEqual(rewritten["_source"] as? String, "cursor")
-        XCTAssertEqual(rewritten["_cursor_subagent"] as? Bool, true)
+        XCTAssertEqual(rewritten[SubsessionRouter.foldedKey] as? String, "cursor")
     }
 
     func testShouldTreatAsCursorFamilyForMisbrandedClaudePath() {
@@ -313,20 +316,23 @@ final class CursorSessionFoldingTests: XCTestCase {
 
     func testApplyMergeRewritesSessionAndSetsAgentId() {
         var raw: [String: Any] = [
+            "_source": "cursor",
             "session_id": "2528cb91-6379-48f2-aff8-40f4b804dafa",
             "hook_event_name": "beforeShellExecution",
         ]
-        CursorSubsessionRouter.applyMerge(
-            to: &raw,
-            parentSessionId: "e1247fd5-d9a0-48ef-8457-0304606b1833",
-            childSessionId: "2528cb91-6379-48f2-aff8-40f4b804dafa"
+        let link = SubsessionLink(
+            kind: .cursorTask,
+            childCardId: "2528cb91-6379-48f2-aff8-40f4b804dafa",
+            agentId: "2528cb91-6379-48f2-aff8-40f4b804dafa",
+            parentCardId: "e1247fd5-d9a0-48ef-8457-0304606b1833"
         )
+        XCTAssertTrue(SubsessionRouter.fold(&raw, link: link, into: "e1247fd5-d9a0-48ef-8457-0304606b1833"))
         XCTAssertEqual(raw["session_id"] as? String, "e1247fd5-d9a0-48ef-8457-0304606b1833")
         XCTAssertEqual(raw["agent_id"] as? String, "2528cb91-6379-48f2-aff8-40f4b804dafa")
         XCTAssertEqual(raw["agent_type"] as? String, "cursor-subagent")
-        XCTAssertEqual(raw["_cursor_subagent"] as? Bool, true)
-        XCTAssertNil(raw["_cursor_subagent_session_id"])
-        XCTAssertNil(raw["_cursor_subagent_event"])
+        XCTAssertEqual(raw[SubsessionRouter.foldedKey] as? String, "cursor")
+        XCTAssertNil(raw[SubsessionRouter.linkedParentKey])
+        XCTAssertEqual(raw["_source"] as? String, "cursor")
     }
 
     func testMergedCursorSubagentAfterAgentResponseUpdatesParentChatWithoutCompleting() throws {
@@ -380,7 +386,7 @@ final class CursorSessionFoldingTests: XCTestCase {
             "session_id": parentId,
             "_source": "cursor",
             "agent_id": childId,
-            "_cursor_subagent": true,
+            SubsessionRouter.foldedKey: "cursor",
             "prompt": "continue after the root cause",
         ] as [String: Any])
         let event = try XCTUnwrap(HookEvent(from: data))
@@ -692,7 +698,7 @@ final class CursorSessionFoldingTests: XCTestCase {
             "_source": "cursor",
             "agent_id": childId,
             "agent_type": "cursor-subagent",
-            "_cursor_subagent": true,
+            SubsessionRouter.foldedKey: "cursor",
             "transcript_path": transcriptPath,
             "_ppid": 42_424,
             "tool_name": "Read",
@@ -750,7 +756,7 @@ final class CursorSessionFoldingTests: XCTestCase {
             "_source": "cursor",
             "agent_id": childId,
             "agent_type": "cursor-subagent",
-            "_cursor_subagent": true,
+            SubsessionRouter.foldedKey: "cursor",
             "prompt": "retry the task",
         ] as [String: Any])
         let event = try XCTUnwrap(HookEvent(from: data))

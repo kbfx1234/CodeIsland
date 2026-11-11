@@ -1,5 +1,6 @@
 import XCTest
 @testable import CodeIsland
+import CodeIslandCore
 
 final class SessionPersistenceTests: XCTestCase {
     func testPersistedSessionDecodesWithoutCliStartTimeForBackwardCompatibility() throws {
@@ -283,4 +284,57 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertEqual(decoded.herdrBinaryPath, "/opt/homebrew/bin/herdr")
     }
 
+    /// A file written by a newer version, read back after a downgrade: one
+    /// entry this build cannot decode must not take every session with it.
+    func testDecodeDropsOnlyTheEntryThatCannotBeRead() {
+        let json = """
+        [
+          {"sessionId":"good","source":"claude","startTime":"2026-04-09T10:00:00Z","lastActivity":"2026-04-09T10:01:00Z"},
+          {"sessionId":"broken","source":"claude","startTime":"not a date","lastActivity":"2026-04-09T10:01:00Z"},
+          {"sessionId":"future-status","source":"codex","startTime":"2026-04-09T10:00:00Z","lastActivity":"2026-04-09T10:01:00Z",
+           "agentTasks":{"items":[
+             {"id":"step:0","title":"Read","status":"completed"},
+             {"id":"step:1","title":"Patch","status":"blocked_on_review"}
+           ]}}
+        ]
+        """
+
+        let sessions = SessionPersistence.decode(Data(json.utf8))
+
+        XCTAssertEqual(sessions.map(\.sessionId), ["good", "future-status"])
+        XCTAssertEqual(
+            sessions.last?.agentTasks?.items.map(\.status),
+            [.completed, .pending],
+            "a status this build does not know reads as pending"
+        )
+    }
+
+    func testDecodeOfAFileThatIsNotAListYieldsNothing() {
+        XCTAssertTrue(SessionPersistence.decode(Data("{}".utf8)).isEmpty)
+        XCTAssertTrue(SessionPersistence.decode(Data("garbage".utf8)).isEmpty)
+    }
+
+    /// A pasted log as the prompt: the file keeps the start of it, not all of
+    /// it re-encoded on every save.
+    func testSavedPromptAndReplyKeepOnlyTheirStart() throws {
+        let dir = NSTemporaryDirectory() + "ci-persist-\(UUID().uuidString.prefix(8))"
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let limit = SessionPersistence.maxPersistedTextLength
+        var long = SessionSnapshot()
+        long.cwd = "/tmp/project"
+        long.lastUserPrompt = String(repeating: "log line\n", count: 300_000)
+        long.lastAssistantMessage = String(repeating: "回复", count: 200_000)
+        var short = long
+        short.lastUserPrompt = "fix the build"
+        short.lastAssistantMessage = "Done."
+        SessionPersistence.save(["long": long, "short": short], directory: dir)
+
+        let restored = Dictionary(uniqueKeysWithValues: SessionPersistence.load(directory: dir).map { ($0.sessionId, $0) })
+        let prompt = try XCTUnwrap(restored["long"]?.lastUserPrompt)
+        XCTAssertEqual(prompt.count, limit)
+        XCTAssertTrue(long.lastUserPrompt?.hasPrefix(prompt) == true)
+        XCTAssertEqual(restored["long"]?.lastAssistantMessage?.count, limit)
+        XCTAssertEqual(restored["short"]?.lastUserPrompt, "fix the build")
+        XCTAssertEqual(restored["short"]?.lastAssistantMessage, "Done.")
+    }
 }

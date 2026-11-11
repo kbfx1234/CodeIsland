@@ -35,7 +35,7 @@ final class KimiCodeSessionDiscoveryTests: XCTestCase {
             encoding: .utf8
         )
 
-        let discovered = AppState.discoverKimiCodeSessionFromIndexForTesting(
+        let discovered = KimiDiscovery.discoverKimiCodeSessionFromIndexForTesting(
             home: home.path,
             cwd: cwd,
             pid: 4242,
@@ -64,7 +64,7 @@ final class KimiCodeSessionDiscoveryTests: XCTestCase {
         try #"{"status":"running"}"#
             .write(to: sessionDir.appendingPathComponent("state.json"), atomically: true, encoding: .utf8)
 
-        let discovered = AppState.discoverKimiCodeSessionFromIndexForTesting(
+        let discovered = KimiDiscovery.discoverKimiCodeSessionFromIndexForTesting(
             home: home.path,
             cwd: "/tmp/project-a",
             pid: 1,
@@ -91,7 +91,7 @@ final class KimiCodeSessionDiscoveryTests: XCTestCase {
         let old = Date().addingTimeInterval(-3600)
         try fm.setAttributes([.modificationDate: old], ofItemAtPath: stateURL.path)
 
-        let discovered = AppState.discoverKimiCodeSessionFromIndexForTesting(
+        let discovered = KimiDiscovery.discoverKimiCodeSessionFromIndexForTesting(
             home: home.path,
             cwd: cwd,
             pid: 1,
@@ -139,7 +139,7 @@ final class KimiCodeSessionDiscoveryTests: XCTestCase {
             ofItemAtPath: newerState.path
         )
 
-        let discovered = AppState.discoverKimiCodeSessionFromIndexForTesting(
+        let discovered = KimiDiscovery.discoverKimiCodeSessionFromIndexForTesting(
             home: home.path,
             cwd: cwd,
             pid: 7,
@@ -171,7 +171,7 @@ final class KimiCodeSessionDiscoveryTests: XCTestCase {
             ofItemAtPath: stateURL.path
         )
 
-        let rejected = AppState.discoverKimiCodeSessionFromIndexForTesting(
+        let rejected = KimiDiscovery.discoverKimiCodeSessionFromIndexForTesting(
             home: home.path,
             cwd: cwd,
             pid: 1,
@@ -180,7 +180,7 @@ final class KimiCodeSessionDiscoveryTests: XCTestCase {
         )
         XCTAssertNil(rejected)
 
-        let acceptedWithProcessStart = AppState.discoverKimiCodeSessionFromIndexForTesting(
+        let acceptedWithProcessStart = KimiDiscovery.discoverKimiCodeSessionFromIndexForTesting(
             home: home.path,
             cwd: cwd,
             pid: 1,

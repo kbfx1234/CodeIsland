@@ -5,42 +5,57 @@ import XCTest
 @MainActor
 final class AppStateCodexAppServerTests: XCTestCase {
     func testCodexExecutablePathRecognizesChatGPTDesktopBundle() {
-        XCTAssertTrue(AppState.isCodexExecutablePath(
+        XCTAssertTrue(AgentProcessFinder.isCodexExecutablePath(
             "/Applications/ChatGPT.app/Contents/Resources/codex"
         ))
     }
 
     func testCodexExecutablePathRejectsUnrelatedResourceBinary() {
-        XCTAssertFalse(AppState.isCodexExecutablePath(
+        XCTAssertFalse(AgentProcessFinder.isCodexExecutablePath(
             "/Applications/OtherAgent.app/Contents/Resources/codex"
         ))
     }
 
+    /// Newer ChatGPT releases moved the binary into `codex-cli/CodexCLI.app`.
+    /// It also runs Codex CLI, so its path says Codex but not Desktop.
+    func testBundledCodexCLIPathIsCodexButNotDesktopByPath() {
+        let bundled = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        XCTAssertTrue(AgentProcessFinder.isBundledCodexCLIPath(bundled))
+        XCTAssertFalse(AgentProcessFinder.isCodexExecutablePath(bundled))
+        XCTAssertFalse(AgentProcessFinder.isBundledCodexCLIPath(
+            "/Applications/OtherAgent.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        ))
+        XCTAssertFalse(AgentProcessFinder.isBundledCodexCLIPath("/Applications/ChatGPT.app/Contents/Resources/codex"))
+        XCTAssertFalse(AgentProcessFinder.isBundledCodexCLIPath(
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+        ))
+    }
+
     func testCodexDiscoveryUsesTranscriptCwdForDesktopProcess() {
-        XCTAssertTrue(AppState.codexDiscoveryUsesTranscriptCwd(processCwd: nil))
-        XCTAssertTrue(AppState.codexDiscoveryUsesTranscriptCwd(processCwd: "/"))
-        XCTAssertFalse(AppState.codexDiscoveryUsesTranscriptCwd(
+        XCTAssertTrue(CodexDiscovery.codexDiscoveryUsesTranscriptCwd(processCwd: nil))
+        XCTAssertTrue(CodexDiscovery.codexDiscoveryUsesTranscriptCwd(processCwd: "/"))
+        XCTAssertFalse(CodexDiscovery.codexDiscoveryUsesTranscriptCwd(
             processCwd: "/Users/haoo/Documents/project"
         ))
     }
 
     func testCodexPlaceholderHookIsIgnoredButProjectHookIsKept() {
-        XCTAssertTrue(AppState.isCodexPlaceholderHook(
+        XCTAssertTrue(CodexDiscovery.isCodexPlaceholderHook(
             source: "codex",
             cwd: "/",
             hasTranscriptPath: false
         ))
-        XCTAssertTrue(AppState.isCodexPlaceholderHook(
+        XCTAssertTrue(CodexDiscovery.isCodexPlaceholderHook(
             source: "codex",
             cwd: nil,
             hasTranscriptPath: false
         ))
-        XCTAssertFalse(AppState.isCodexPlaceholderHook(
+        XCTAssertFalse(CodexDiscovery.isCodexPlaceholderHook(
             source: "codex",
             cwd: "/Users/haoo/Documents/project",
             hasTranscriptPath: false
         ))
-        XCTAssertFalse(AppState.isCodexPlaceholderHook(
+        XCTAssertFalse(CodexDiscovery.isCodexPlaceholderHook(
             source: "codex",
             cwd: "/",
             hasTranscriptPath: true
@@ -73,7 +88,7 @@ final class AppStateCodexAppServerTests: XCTestCase {
         XCTAssertEqual(Set(appState.sessions.keys), [sessionId])
         XCTAssertEqual(appState.sessions[sessionId]?.providerSessionId, rawId)
 
-        appState.integrateDiscovered([AppState.DiscoveredSession(
+        appState.integrateDiscovered([DiscoveredSession(
             sessionId: sessionId,
             cwd: "/desktop/repo",
             tty: nil,
@@ -150,7 +165,7 @@ final class AppStateCodexAppServerTests: XCTestCase {
         try data.write(to: url)
 
         XCTAssertEqual(
-            AppState.codexSessionCwd(path: url.path),
+            CodexDiscovery.codexSessionCwd(path: url.path),
             "/Users/haoo/Documents/project"
         )
     }
@@ -166,6 +181,26 @@ final class AppStateCodexAppServerTests: XCTestCase {
         let bundledExecutable = resourcesURL.appendingPathComponent("codex")
         try makeExecutable(at: bundledExecutable)
 
+        let fallbackExecutable = tempDir.appendingPathComponent("fallback-codex")
+        try makeExecutable(at: fallbackExecutable)
+
+        let resolved = AppState.codexAppServerExecutableURL(
+            runningBundleURLs: [bundleURL],
+            fallbackPaths: [fallbackExecutable.path],
+            fileManager: fm
+        )
+
+        XCTAssertEqual(resolved?.path, bundledExecutable.path)
+    }
+
+    func testCodexAppServerExecutableFindsBinaryNewerChatGPTBundles() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent("codeisland-codex-app-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let bundleURL = tempDir.appendingPathComponent("ChatGPT.app", isDirectory: true)
+        let bundledExecutable = bundleURL.appendingPathComponent(AppState.bundledCodexCLIRelativePath)
+        try makeExecutable(at: bundledExecutable)
         let fallbackExecutable = tempDir.appendingPathComponent("fallback-codex")
         try makeExecutable(at: fallbackExecutable)
 
@@ -261,7 +296,7 @@ final class AppStateCodexAppServerTests: XCTestCase {
 
         // A result already captured by the independent DB poll must not recreate
         // the just-closed card.
-        appState.integrateDiscovered([AppState.DiscoveredSession(
+        appState.integrateDiscovered([DiscoveredSession(
             sessionId: sessionId,
             cwd: "/repo",
             tty: nil,
@@ -279,7 +314,7 @@ final class AppStateCodexAppServerTests: XCTestCase {
 
         // A final terminal DB/file flush can be newer than the close callback;
         // idle is not evidence of a resumed generation.
-        appState.integrateDiscovered([AppState.DiscoveredSession(
+        appState.integrateDiscovered([DiscoveredSession(
             sessionId: sessionId,
             cwd: "/repo",
             tty: nil,

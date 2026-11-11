@@ -90,10 +90,7 @@ final class AppStateCodexRequestUserInputTests: XCTestCase {
         let hookEvent = try XCTUnwrap(
             HookEvent(from: try JSONSerialization.data(withJSONObject: hookPayload))
         )
-        _ = Task<Data, Never> {
-            await withCheckedContinuation { appState.handleQuestion(hookEvent, continuation: $0) }
-        }
-        await Task.yield()
+        _ = await startHookRequest { appState.handleQuestion(hookEvent, continuation: $0) }
 
         // Enqueued with a capturing reply closure rather than through the live
         // client: dequeuing is not the half that was at risk. A head-anchored

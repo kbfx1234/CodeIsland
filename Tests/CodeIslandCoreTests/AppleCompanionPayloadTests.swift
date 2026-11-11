@@ -130,4 +130,16 @@ final class AppleCompanionPayloadTests: XCTestCase {
         XCTAssertNil(decoded.source)
         XCTAssertNil(decoded.answer)
     }
+
+    /// Any nearby device running iPhone Buddy can reach the Mac, unauthenticated:
+    /// until Buddy pairs, nothing it sends may answer a request for the user.
+    func testOnlyCommandsThatDecideNothingAreTakenFromBuddy() {
+        let deciding: Set<AppleCompanionCommandType> = [
+            .approveCurrentPermission, .denyCurrentPermission, .skipCurrentQuestion, .answerQuestion,
+        ]
+        for type in [AppleCompanionCommandType.requestCurrentState, .approveCurrentPermission, .denyCurrentPermission,
+                     .skipCurrentQuestion, .answerQuestion, .focus] {
+            XCTAssertEqual(type.decidesForTheUser, deciding.contains(type), type.rawValue)
+        }
+    }
 }

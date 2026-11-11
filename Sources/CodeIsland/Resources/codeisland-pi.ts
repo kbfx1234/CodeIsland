@@ -1,5 +1,5 @@
 // CodeIsland pi extension
-// version: v4
+// version: v7
 
 /**
  * @fileoverview CodeIsland Integration Extension.
@@ -12,7 +12,17 @@
  *   pi (this extension)  ──→  /tmp/codeisland-{uid}.sock  ──→  CodeIsland.app
  *
  * The extension is a socket CLIENT — no server is started. If CodeIsland is not
- * running the socket does not exist and all send calls fail silently.
+ * running the socket does not exist and all send calls fail silently. Nothing
+ * is sent to a socket this user does not own (`socketIsOwnedByUser`).
+ * `CODEISLAND_SOCKET_PATH` overrides the socket path, as it does for the app.
+ *
+ * Subagent children (pi-subagents):
+ *   A background child runs as a pi session of its own inside a detached
+ *   runner that loads this same extension, with the spawning session's id in
+ *   PI_SUBAGENT_PARENT_SESSION. Its payloads carry `_parent_session_id` (the
+ *   parent's CodeIsland session id) and `agent_type`, so CodeIsland can fold
+ *   the child into the parent's card or hide it (Agent Sub-Sessions), and
+ *   never rings the completion sound for a child's turn — only the parent's.
  *
  * Event mapping:
  *   session_start          →  SessionStart
@@ -20,9 +30,17 @@
  *   before_agent_start     →  UserPromptSubmit
  *   tool_call              →  PreToolUse  (or PermissionRequest for dangerous bash)
  *   tool_result            →  PostToolUse
- *   agent_end              →  Stop
+ *   agent_settled          →  Stop  (agent_end on a pi before 0.80.4)
  *   session_before_compact →  PreCompact
  *   session_compact        →  PostCompact
+ *
+ * Turn end (#386):
+ *   `agent_end` ends one run, not the turn: a retry, error recovery,
+ *   compaction, a queued message or a subagent's result can start another
+ *   run after it. pi 0.80.4+ emits `agent_settled` once none is left, and the
+ *   turn's Stop goes out there, with its latest reply. A turn the user
+ *   aborted (Esc) is sent with `stop_reason: "interrupted"`, which CodeIsland
+ *   ends without the completion chime.
  *
  * Permission handling:
  *   Dangerous bash commands (`rm -rf`, `sudo`, `chmod 777`) are intercepted and
@@ -46,7 +64,7 @@
  */
 
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { getuid } from "node:process";
@@ -57,7 +75,31 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** Unix socket path CodeIsland listens on (user-scoped). */
 const userId = getuid?.() ?? 0;
-const SOCKET_PATH = `/tmp/codeisland-${userId}.sock`;
+const SOCKET_PATH =
+  process.env.CODEISLAND_SOCKET_PATH || `/tmp/codeisland-${userId}.sock`;
+
+/**
+ * Whether the socket at `path` is one this user owns. The default path is a
+ * predictable name in /tmp, where any user can create a socket first: theirs
+ * would be sent every event and could answer a permission request. `lstat`,
+ * not `stat`: a symlink, even to our own socket, stays its owner's to repoint,
+ * while a socket of ours in sticky /tmp is ours alone to remove.
+ *
+ * Exported for tests, which pass their own `lstat` and `uid`.
+ */
+export function socketIsOwnedByUser(
+  path: string,
+  lstat: (path: string) => { isSocket(): boolean; uid: number } = lstatSync,
+  uid: number | undefined = getuid?.(),
+): boolean {
+  if (uid === undefined) return false;
+  try {
+    const stat = lstat(path);
+    return stat.isSocket() && stat.uid === uid;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Bridge binary path. Used for blocking permission requests because Node's
@@ -121,6 +163,43 @@ function herdrMetadata(env: Record<string, string>): Record<string, string> {
   };
 }
 
+// ── Subagent children (pi-subagents) ─────────────────────────────────────────
+
+/**
+ * The spawning session's pi id when this session is a pi-subagents child.
+ *
+ * pi-subagents runs a background child as a pi session of its own inside a
+ * detached runner, which carries the parent's `getSessionId()` in
+ * PI_SUBAGENT_PARENT_SESSION (published for extensions such as
+ * pi-permission-system). Every child the runner hosts shares that value, so
+ * it is read once, when the extension starts for the child's session.
+ */
+export function subagentParentSessionId(
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  const parent = env.PI_SUBAGENT_PARENT_SESSION?.trim();
+  return parent ? parent : undefined;
+}
+
+/** Fallback `agent_type` for a child whose agent name is unknown. */
+const DEFAULT_SUBAGENT_TYPE = "subagent";
+
+/**
+ * The agent a pi-subagents child runs, from the `<active_agent name="…"/>`
+ * tag pi-subagents puts at the top of the child's system prompt.
+ */
+export function subagentAgentName(systemPrompt: unknown): string | undefined {
+  if (typeof systemPrompt !== "string") return undefined;
+  const match = /<active_agent name="([^"<>]{1,80})"\s*\/>/.exec(systemPrompt);
+  const name = match?.[1]
+    ?.replace(/&quot;/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .trim();
+  return name ? name : undefined;
+}
+
 /**
  * Walks the process tree upward to find the controlling TTY.
  * Cached at startup — pi's TTY does not change during a session.
@@ -157,6 +236,10 @@ function detectTty(): string | null {
  */
 function sendToSocket(payload: object): Promise<boolean> {
   return new Promise((resolve) => {
+    if (!socketIsOwnedByUser(SOCKET_PATH)) {
+      resolve(false);
+      return;
+    }
     try {
       const sock = connect({ path: SOCKET_PATH }, () => {
         sock.write(JSON.stringify(payload));
@@ -187,7 +270,7 @@ function sendAndWaitResponse(
   timeoutMs = 30_000,
 ): Promise<Record<string, unknown> | null> {
   return new Promise((resolve) => {
-    if (!existsSync(BRIDGE_PATH)) {
+    if (!existsSync(BRIDGE_PATH) || !socketIsOwnedByUser(SOCKET_PATH)) {
       resolve(null);
       return;
     }
@@ -251,19 +334,25 @@ function displayToolName(name: string): string {
   return name.charAt(0).toUpperCase() + name.slice(1);
 }
 
+/** The last assistant message in an event.messages array. */
+function lastAssistant(
+  messages: readonly unknown[],
+): AssistantMessage | undefined {
+  return messages
+    .filter(
+      (m): m is AssistantMessage =>
+        !!m &&
+        typeof m === "object" &&
+        (m as { role?: string }).role === "assistant",
+    )
+    .at(-1);
+}
+
 /** Extracts plain text from the last assistant message in an event.messages array. */
 function extractLastAssistantText(
   messages: readonly unknown[],
 ): string {
-  const assistants = messages.filter(
-    (m): m is AssistantMessage =>
-      !!m &&
-      typeof m === "object" &&
-      (m as { role?: string }).role === "assistant",
-  );
-  const last = assistants.at(-1);
-  if (!last) return "";
-  const content = last.content;
+  const content = lastAssistant(messages)?.content;
   if (!Array.isArray(content)) return "";
   return content
     .filter((c): c is { type: "text"; text: string } => c?.type === "text")
@@ -278,6 +367,11 @@ export default function codeislandExtension(pi: ExtensionAPI) {
   /** TTY path detected once at startup. */
   const tty = detectTty();
 
+  /** Set when this pi session is a pi-subagents child (#378). */
+  const parentSessionId = subagentParentSessionId();
+  /** The child's agent, learned from its first prompt's system prompt. */
+  let subagentType = DEFAULT_SUBAGENT_TYPE;
+
   /**
    * Session IDs for which a blocking PermissionRequest is currently in flight.
    * Non-lifecycle events for these sessions are suppressed to prevent CodeIsland's
@@ -287,18 +381,69 @@ export default function codeislandExtension(pi: ExtensionAPI) {
   /** Sessions for which CodeIsland has already received SessionStart. */
   const startedSessions = new Set<string>();
 
+  /**
+   * Whether this pi emits `agent_settled` (0.80.4+), where a turn's Stop goes
+   * out (#386). The extension API has no version to read; registerEntryRenderer
+   * arrived in the same release, so its presence marks a pi that settles. An
+   * older pi never settles and its turn ends at `agent_end`, as before. One
+   * that settles without it is caught at its first `agent_settled`.
+   */
+  let settles =
+    typeof (pi as { registerEntryRenderer?: unknown }).registerEntryRenderer === "function";
+  /**
+   * A turn `agent_settled` has yet to end, per session: its latest reply, and
+   * whether its last run was aborted.
+   */
+  const unsettledTurns = new Map<string, { reply: string; aborted: boolean }>();
+
+  /**
+   * An event payload for this pi session. A pi-subagents child also names its
+   * parent's CodeIsland session and its agent, so CodeIsland treats its turns
+   * as part of the parent's (#378).
+   */
+  function payload(
+    sessionId: string,
+    cwd: string,
+    extra: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return base(sessionId, cwd, {
+      ...(parentSessionId
+        ? { _parent_session_id: `pi-${parentSessionId}`, agent_type: subagentType }
+        : {}),
+      ...extra,
+    }, tty);
+  }
+
   async function ensureSessionStarted(sessionId: string, cwd: string): Promise<void> {
     const sid = `pi-${sessionId}`;
     if (startedSessions.has(sid)) return;
 
     const sessionName = pi.getSessionName();
     await sendToSocket(
-      base(sessionId, cwd, {
+      payload(sessionId, cwd, {
         hook_event_name: "SessionStart",
         ...(sessionName ? { session_title: sessionName } : {}),
-      }, tty),
+      }),
     );
     startedSessions.add(sid);
+  }
+
+  /** Ends the session's turn. One the user aborted ends without the completion chime. */
+  async function sendStop(
+    sessionId: string,
+    cwd: string,
+    reply: string,
+    aborted: boolean,
+  ): Promise<void> {
+    const sessionName = pi.getSessionName();
+    await sendToSocket(
+      payload(sessionId, cwd, {
+        hook_event_name: "Stop",
+        last_assistant_message: reply || undefined,
+        ...(aborted ? { stop_reason: "interrupted" } : {}),
+        ...(sessionName ? { session_title: sessionName } : {}),
+      }),
+    );
   }
 
 
@@ -315,7 +460,6 @@ export default function codeislandExtension(pi: ExtensionAPI) {
     ctx: { cwd: string },
     sessionId: string,
     sid: string,
-    tty: string | null,
   ): Promise<{ block: true; reason: string } | null> {
     const rawQuestions = Array.isArray(event.input.questions)
       ? (event.input.questions as Array<Record<string, unknown>>)
@@ -360,12 +504,12 @@ export default function codeislandExtension(pi: ExtensionAPI) {
     let response: Record<string, unknown> | null = null;
     try {
       response = await sendAndWaitResponse(
-        base(sessionId, ctx.cwd, {
+        payload(sessionId, ctx.cwd, {
           hook_event_name: "PermissionRequest",
           tool_name: "AskUserQuestion",
           tool_input: { questions },
           _pi_tool_call_id: event.toolCallId,
-        }, tty),
+        }),
         86_400_000, // waiting on a human — same 24h budget as PermissionRequest hooks
       );
     } finally {
@@ -406,6 +550,9 @@ export default function codeislandExtension(pi: ExtensionAPI) {
   // ── Session lifecycle ──────────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
+    // A child is announced with its first prompt (before_agent_start), once
+    // pi-subagents has named it and its agent is known.
+    if (parentSessionId) return;
     const sessionId = ctx.sessionManager.getSessionId();
     await ensureSessionStarted(sessionId, ctx.cwd);
   });
@@ -413,9 +560,10 @@ export default function codeislandExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     await sendToSocket(
-      base(sessionId, ctx.cwd, { hook_event_name: "SessionEnd" }, tty),
+      payload(sessionId, ctx.cwd, { hook_event_name: "SessionEnd" }),
     );
     startedSessions.delete(`pi-${sessionId}`);
+    unsettledTurns.delete(`pi-${sessionId}`);
   });
 
   // ── Agent lifecycle ────────────────────────────────────────────────────────
@@ -423,36 +571,63 @@ export default function codeislandExtension(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     const sid = `pi-${sessionId}`;
+    if (parentSessionId) {
+      subagentType = subagentAgentName(event.systemPrompt) ?? subagentType;
+    }
     await ensureSessionStarted(sessionId, ctx.cwd);
 
     if (pendingPermissionSessions.has(sid)) return;
 
     const prompt = event.prompt ?? "";
     await sendToSocket(
-      base(sessionId, ctx.cwd, {
+      payload(sessionId, ctx.cwd, {
         hook_event_name: "UserPromptSubmit",
         prompt,
-      }, tty),
+      }),
     );
   });
 
   pi.on("agent_end", async (event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     const sid = `pi-${sessionId}`;
+    const reply = extractLastAssistantText(event.messages);
+    const aborted = lastAssistant(event.messages)?.stopReason === "aborted";
+
+    if (settles) {
+      // One run of the turn; agent_settled ends it. A run without a reply (a
+      // retried error, a parent yielding to its subagent) keeps the last one.
+      unsettledTurns.set(sid, {
+        reply: reply || unsettledTurns.get(sid)?.reply || "",
+        aborted,
+      });
+      return;
+    }
+
     await ensureSessionStarted(sessionId, ctx.cwd);
 
     if (pendingPermissionSessions.has(sid)) return;
 
-    const lastAssistantMessage = extractLastAssistantText(event.messages);
-    const sessionName = pi.getSessionName();
+    await sendStop(sessionId, ctx.cwd, reply, aborted);
+  });
 
-    await sendToSocket(
-      base(sessionId, ctx.cwd, {
-        hook_event_name: "Stop",
-        last_assistant_message: lastAssistantMessage || undefined,
-        ...(sessionName ? { session_title: sessionName } : {}),
-      }, tty),
-    );
+  pi.on("agent_settled", async (event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const sid = `pi-${sessionId}`;
+    const turn = unsettledTurns.get(sid);
+    unsettledTurns.delete(sid);
+    if (!settles) {
+      // This turn's agent_end already ended it; from now on, this does.
+      settles = true;
+      return;
+    }
+
+    await ensureSessionStarted(sessionId, ctx.cwd);
+
+    if (pendingPermissionSessions.has(sid)) return;
+
+    // `aborted` arrived in pi 1.1.0; before it, the turn's last run tells.
+    const aborted = typeof event.aborted === "boolean" ? event.aborted : turn?.aborted === true;
+    await sendStop(sessionId, ctx.cwd, turn?.reply ?? "", aborted);
   });
 
   // ── Tool calls ─────────────────────────────────────────────────────────────
@@ -481,7 +656,7 @@ export default function codeislandExtension(pi: ExtensionAPI) {
     // message. Skip/deny or an unreachable CodeIsland falls through to OMP's
     // own TUI dialog — graceful degradation, never a lost question.
     if (event.toolName === "ask") {
-      const answered = await forwardAskToCodeIsland(event, ctx, sessionId, sid, tty);
+      const answered = await forwardAskToCodeIsland(event, ctx, sessionId, sid);
       if (answered) return answered;
       return undefined;
     }
@@ -494,16 +669,16 @@ export default function codeislandExtension(pi: ExtensionAPI) {
     ) {
       pendingPermissionSessions.add(sid);
 
-      const payload = base(sessionId, ctx.cwd, {
+      const request = payload(sessionId, ctx.cwd, {
         hook_event_name: "PermissionRequest",
         tool_name: toolName,
         tool_input: toolInput,
         _pi_tool_call_id: event.toolCallId,
-      }, tty);
+      });
 
       let response: Record<string, unknown> | null = null;
       try {
-        response = await sendAndWaitResponse(payload);
+        response = await sendAndWaitResponse(request);
       } finally {
         pendingPermissionSessions.delete(sid);
       }
@@ -534,11 +709,11 @@ export default function codeislandExtension(pi: ExtensionAPI) {
     // Non-blocking PreToolUse for all other tool calls.
     if (!pendingPermissionSessions.has(sid)) {
       await sendToSocket(
-        base(sessionId, ctx.cwd, {
+        payload(sessionId, ctx.cwd, {
           hook_event_name: "PreToolUse",
           tool_name: toolName,
           tool_input: toolInput,
-        }, tty),
+        }),
       );
     }
 
@@ -553,7 +728,7 @@ export default function codeislandExtension(pi: ExtensionAPI) {
     if (pendingPermissionSessions.has(sid)) return;
 
     await sendToSocket(
-      base(sessionId, ctx.cwd, { hook_event_name: "PostToolUse" }, tty),
+      payload(sessionId, ctx.cwd, { hook_event_name: "PostToolUse" }),
     );
   });
 
@@ -563,7 +738,7 @@ export default function codeislandExtension(pi: ExtensionAPI) {
     const sessionId = ctx.sessionManager.getSessionId();
     await ensureSessionStarted(sessionId, ctx.cwd);
     await sendToSocket(
-      base(sessionId, ctx.cwd, { hook_event_name: "PreCompact" }, tty),
+      payload(sessionId, ctx.cwd, { hook_event_name: "PreCompact" }),
     );
   });
 
@@ -571,7 +746,7 @@ export default function codeislandExtension(pi: ExtensionAPI) {
     const sessionId = ctx.sessionManager.getSessionId();
     await ensureSessionStarted(sessionId, ctx.cwd);
     await sendToSocket(
-      base(sessionId, ctx.cwd, { hook_event_name: "PostCompact" }, tty),
+      payload(sessionId, ctx.cwd, { hook_event_name: "PostCompact" }),
     );
   });
 }

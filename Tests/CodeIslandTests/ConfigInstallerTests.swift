@@ -142,6 +142,49 @@ final class ConfigInstallerTests: XCTestCase {
         XCTAssertTrue(command.contains("--event stop"))
     }
 
+    func testReinstallingUnchangedExternalHooksLeavesTheFileAlone() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let configPath = tempDir.appendingPathComponent("settings.json").path
+        let cli = CLIConfig(
+            name: "Qwen Code",
+            source: "qwen",
+            configPath: configPath,
+            configKey: "hooks",
+            format: .claude,
+            events: [("PreToolUse", 5, false), ("PostToolUse", 5, false), ("Stop", 5, false)]
+        )
+        XCTAssertTrue(ConfigInstaller.installExternalHooks(cli: cli, fm: fm))
+
+        // What another launch wrote: the same document with its keys in
+        // another order (each process orders our dictionaries differently).
+        let installed = try XCTUnwrap(fm.contents(atPath: configPath))
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: installed) as? [String: Any])
+        let reordered = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        try reordered.write(to: URL(fileURLWithPath: configPath))
+        let past = Date(timeIntervalSince1970: 1_000_000_000)
+        try fm.setAttributes([.modificationDate: past], ofItemAtPath: configPath)
+
+        XCTAssertTrue(ConfigInstaller.installExternalHooks(cli: cli, fm: fm))
+        XCTAssertEqual(fm.contents(atPath: configPath), reordered)
+        XCTAssertEqual(try fm.attributesOfItem(atPath: configPath)[.modificationDate] as? Date, past)
+
+        // A file that is missing something still gets it back.
+        var hooks = try XCTUnwrap(root["hooks"] as? [String: Any])
+        hooks["Stop"] = nil
+        root["hooks"] = hooks
+        try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted]).write(to: URL(fileURLWithPath: configPath))
+        try fm.setAttributes([.modificationDate: past], ofItemAtPath: configPath)
+
+        XCTAssertTrue(ConfigInstaller.installExternalHooks(cli: cli, fm: fm))
+        let repaired = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(fm.contents(atPath: configPath))) as? [String: Any])
+        XCTAssertNotNil((repaired["hooks"] as? [String: Any])?["Stop"])
+        XCTAssertNotEqual(try fm.attributesOfItem(atPath: configPath)[.modificationDate] as? Date, past)
+    }
+
     func testCodexSessionEndTimeoutRespectsTeardownCapAndRepairsStaleConfig() throws {
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -184,6 +227,18 @@ final class ConfigInstallerTests: XCTestCase {
         XCTAssertEqual(hookList.first?["timeout"] as? Int, 3)
     }
 
+    func testCodexRegistersEverySupportedLifecycleEvent() throws {
+        let codex = try XCTUnwrap(ConfigInstaller.allCLIs.first { $0.source == "codex" })
+        let configured = Set(codex.events.map { $0.0 })
+        let expected: Set<String> = [
+            "PreToolUse", "PermissionRequest", "PostToolUse", "PreCompact",
+            "PostCompact", "SessionStart", "SessionEnd", "SubagentStart",
+            "SubagentStop", "UserPromptSubmit", "Stop", "Interrupt",
+        ]
+
+        XCTAssertEqual(configured, expected)
+    }
+
     func testTraeIDEHooksUseOfficialNestedSchema() throws {
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -197,7 +252,7 @@ final class ConfigInstallerTests: XCTestCase {
             configPath: configPath,
             configKey: "hooks",
             format: .traeIDE,
-            events: [("beforeSubmitPrompt", 5, false)]
+            events: [("UserPromptSubmit", 5, false)]
         )
 
         XCTAssertTrue(ConfigInstaller.installExternalHooks(cli: cli, fm: fm))
@@ -206,7 +261,7 @@ final class ConfigInstallerTests: XCTestCase {
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(root["version"] as? Int, 1)
         let hooks = try XCTUnwrap(root["hooks"] as? [String: Any])
-        let entries = try XCTUnwrap(hooks["beforeSubmitPrompt"] as? [[String: Any]])
+        let entries = try XCTUnwrap(hooks["UserPromptSubmit"] as? [[String: Any]])
         let entry = try XCTUnwrap(entries.first)
         XCTAssertEqual(entry["matcher"] as? String, "*")
         XCTAssertEqual(entry["loop_limit"] as? Int, 5)
@@ -216,15 +271,109 @@ final class ConfigInstallerTests: XCTestCase {
         XCTAssertEqual(hook["timeout"] as? Int, 5)
         let command = try XCTUnwrap(hook["command"] as? String)
         XCTAssertTrue(command.contains("codeisland-bridge --source trae"))
-        XCTAssertTrue(command.contains("--event beforeSubmitPrompt"))
+        XCTAssertTrue(command.contains("--event UserPromptSubmit"))
     }
 
-    func testBuiltInTraeKeepsLegacyIDEHooksPath() throws {
-        let cli = try XCTUnwrap(ConfigInstaller.allCLIs.first { $0.source == "trae" })
+    /// Both TRAE editions document the same six Claude-style events
+    /// (docs.trae.ai/ide/hook-configuration-reference and
+    /// docs.trae.cn/ide_hook-configuration-reference), so the international
+    /// and CN built-ins share `.traeIDE` and differ only by config root.
+    func testBuiltInTraeEditionsInstallTheDocumentedTraeCodeEvents() throws {
+        let documented = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "Notification"]
+        XCTAssertEqual(ConfigInstaller.defaultEvents(for: .traeIDE).map { $0.0 }, documented)
 
-        XCTAssertEqual(cli.configPath, ".trae/hooks.json")
-        XCTAssertEqual(cli.format.storageValue, HookFormat.traeIDE.storageValue)
-        XCTAssertTrue(cli.events.contains { $0.0 == "beforeReadFile" })
+        for (source, path) in [("trae", ".trae/hooks.json"), ("traecn", ".trae-cn/hooks.json")] {
+            let cli = try XCTUnwrap(ConfigInstaller.allCLIs.first { $0.source == source }, source)
+            XCTAssertEqual(cli.configPath, path, source)
+            XCTAssertEqual(cli.format.storageValue, HookFormat.traeIDE.storageValue, source)
+            XCTAssertEqual(cli.events.map { $0.0 }, documented, source)
+            // Notification is async in TRAE and its stdout is ignored, so a
+            // long "blocking" timeout would only hold a bridge process open.
+            XCTAssertTrue(cli.events.allSatisfy { $0.1 == 5 }, source)
+        }
+    }
+
+    /// `.flat` is Cursor's own schema and must keep its camelCase events now
+    /// that `.traeIDE` no longer shares them.
+    func testFlatFormatKeepsCursorEventsSeparateFromTraeIDE() throws {
+        let flat = ConfigInstaller.defaultEvents(for: .flat).map { $0.0 }
+        XCTAssertEqual(flat, [
+            "beforeSubmitPrompt", "beforeShellExecution", "afterShellExecution",
+            "beforeReadFile", "afterFileEdit", "beforeMCPExecution",
+            "afterMCPExecution", "afterAgentThought", "afterAgentResponse", "stop",
+        ])
+        let trae = Set(ConfigInstaller.defaultEvents(for: .traeIDE).map { $0.0 })
+        XCTAssertTrue(trae.isDisjoint(with: flat))
+
+        let cursor = try XCTUnwrap(ConfigInstaller.allCLIs.first { $0.source == "cursor" })
+        XCTAssertEqual(cursor.events.map { $0.0 }, flat)
+    }
+
+    /// Upgrading from the Cursor-style list must not leave dead CodeIsland
+    /// entries under keys TraeCode never fires, while the user's own hooks
+    /// (under any key) survive.
+    func testTraeIDEInstallDropsLegacyCursorStyleEntries() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let bridge = "\(NSHomeDirectory())/.codeisland/codeisland-bridge --source traecn"
+        let configPath = tempDir.appendingPathComponent("hooks.json").path
+        let legacy = """
+        {
+          "hooks": {
+            "beforeReadFile": [
+              {"matcher": "*", "loop_limit": 5, "hooks": [{"type": "command", "command": "\(bridge) --event beforeReadFile", "timeout": 5}]}
+            ],
+            "stop": [
+              {"command": "\(bridge) --event stop"}
+            ],
+            "beforeSubmitPrompt": [
+              {"matcher": "*", "loop_limit": 5, "hooks": [{"type": "command", "command": "\(bridge) --event beforeSubmitPrompt", "timeout": 5}]},
+              {"hooks": [{"type": "command", "command": "/usr/local/bin/user-prompt-hook"}]}
+            ],
+            "Stop": [
+              {"loop_limit": 3, "hooks": [{"type": "command", "command": "/usr/local/bin/user-stop", "timeout": 60}]}
+            ]
+          }
+        }
+        """
+        try legacy.write(toFile: configPath, atomically: true, encoding: .utf8)
+
+        let cli = CLIConfig(
+            name: "Trae CN",
+            source: "traecn",
+            configPath: configPath,
+            configKey: "hooks",
+            format: .traeIDE,
+            events: ConfigInstaller.defaultEvents(for: .traeIDE)
+        )
+        XCTAssertTrue(ConfigInstaller.installExternalHooks(cli: cli, fm: fm))
+
+        let data = try XCTUnwrap(fm.contents(atPath: configPath))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(root["version"] as? Int, 1)
+        let hooks = try XCTUnwrap(root["hooks"] as? [String: Any])
+
+        func commands(_ key: String) -> [String] {
+            (hooks[key] as? [[String: Any]] ?? []).flatMap { entry -> [String] in
+                if let list = entry["hooks"] as? [[String: Any]] {
+                    return list.compactMap { $0["command"] as? String }
+                }
+                return [entry["command"] as? String].compactMap { $0 }
+            }
+        }
+
+        XCTAssertNil(hooks["beforeReadFile"])
+        XCTAssertNil(hooks["stop"])
+        XCTAssertEqual(commands("beforeSubmitPrompt"), ["/usr/local/bin/user-prompt-hook"])
+
+        for (event, _, _) in cli.events {
+            let ours = commands(event).filter { $0.contains("codeisland-bridge") }
+            XCTAssertEqual(ours, ["\(bridge) --event \(event)"], event)
+        }
+        XCTAssertTrue(commands("Stop").contains("/usr/local/bin/user-stop"))
     }
 
     func testTraeCLINextUsesTraeXHooksSchema() throws {
@@ -835,8 +984,11 @@ hooks:
         XCTAssertTrue(merged.contains("model: hermes-4"))
 
         let hooks = try hermesHooksMap(merged)
-        // All five status events registered under snake_case keys.
-        for event in ["pre_tool_call", "post_tool_call", "on_session_start", "on_session_end", "subagent_stop"] {
+        // Every status event registered under snake_case keys.
+        for event in [
+            "pre_tool_call", "post_tool_call", "pre_llm_call", "post_llm_call",
+            "on_session_start", "on_session_end", "on_session_finalize", "subagent_stop",
+        ] {
             let entries = try XCTUnwrap(hooks[event], "missing event \(event)")
             let cmd = entries.first?["command"] as? String
             XCTAssertTrue(cmd?.contains("codeisland-bridge --source hermes") ?? false,
@@ -926,6 +1078,10 @@ hooks:
         XCTAssertTrue(script.contains("HERMES_EVENTS"))
         XCTAssertTrue(script.contains(#""pre_tool_call""#))
         XCTAssertTrue(script.contains(#""on_session_start""#))
+        // Turn start / end carry the prompt and the reply (#364).
+        XCTAssertTrue(script.contains(#""pre_llm_call""#))
+        XCTAssertTrue(script.contains(#""post_llm_call""#))
+        XCTAssertTrue(script.contains(#""on_session_finalize""#))
         XCTAssertTrue(script.contains("_merge_hermes_hooks"))
         XCTAssertTrue(script.contains(#""Hermes ok""#))
         XCTAssertTrue(script.contains("install_hermes()"))
@@ -942,9 +1098,10 @@ hooks:
         XCTAssertTrue(script.contains("TRAECLI_EVENTS"))
         XCTAssertTrue(script.contains("\"session_start\""))
         XCTAssertTrue(script.contains("\"session_end\""))
-        // Codex renamed the feature flag from codex_hooks to hooks.
-        XCTAssertTrue(script.contains("\"hooks = true\""))
-        XCTAssertFalse(script.contains("\"codex_hooks = true\""))
+        // The generated source editor writes the current Codex feature name;
+        // RemoteCodexTomlHooksTests execute its scoped legacy migration.
+        XCTAssertTrue(script.contains("hooks = true"))
+        XCTAssertFalse(script.contains("codex_hooks = true"))
         // Ensure remote TraeCli YAML merge has indentation repair to avoid invalid YAML.
         XCTAssertTrue(script.contains("def _normalize_traecli_hooks_list_indentation"))
     }
@@ -970,7 +1127,9 @@ hooks:
 
         XCTAssertTrue(script.contains("def install_hermes():"))
         XCTAssertTrue(script.contains(#"home / ".hermes""#))
-        XCTAssertTrue(script.contains(#"command_for("hermes")"#))
+        // Hermes runs hooks without a shell, so not command_for()'s shell form.
+        XCTAssertTrue(script.contains("cmd = hermes_command()"))
+        XCTAssertFalse(script.contains(#"command_for("hermes")"#))
         XCTAssertTrue(script.contains(#""Hermes ok""#))
         XCTAssertTrue(script.contains("install_hermes()"))
     }
@@ -995,15 +1154,16 @@ hooks:
         // socket path so different OS users don't collide on /tmp/codeisland.sock.
         let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
 
-        let script = RemoteInstaller.configureRemoteHooksScript(host: host, remoteSocketPath: "/tmp/codeisland-1000.sock")
+        let script = RemoteInstaller.configureRemoteHooksScript(host: host, remoteSocketPath: "/tmp/codeisland-1000/island.sock")
 
-        XCTAssertTrue(script.contains(#"socket_path = "/tmp/codeisland-1000.sock""#))
-        XCTAssertTrue(script.contains("CODEISLAND_SOCKET_PATH={socket_path}"))
+        XCTAssertTrue(script.contains(#"socket_path = "/tmp/codeisland-1000/island.sock""#))
+        XCTAssertTrue(script.contains(#""CODEISLAND_SOCKET_PATH=" + shlex.quote(socket_path)"#))
         XCTAssertFalse(script.contains("CODEISLAND_SOCKET_PATH=/tmp/codeisland.sock"))
     }
 
     func testRemoteInstallerConfigureScriptFallsBackToLegacySocketPath() {
-        // When no per-user path is supplied (probe failed) the legacy shared path is used.
+        // A script made without a path names the shared one hooks used
+        // before #193; nothing is forwarded there any more.
         let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
 
         let script = RemoteInstaller.configureRemoteHooksScript(host: host)
@@ -1011,14 +1171,31 @@ hooks:
         XCTAssertTrue(script.contains(#"socket_path = "/tmp/codeisland.sock""#))
     }
 
+    func testRemoteOpencodePluginIsToldTheSocketOwnerWhereAgentsRunAsOtherUsers() throws {
+        let shipped = try XCTUnwrap(RemoteInstaller.remoteOpencodePluginSource())
+        let shared = RemoteHost(id: "host-1", name: "devbox", host: "example.com", agentsRunAsOtherUsers: true)
+        let socketPath = RemoteInstaller.remoteSocketPath(forUID: "1000")
+        let installed = RemoteInstaller.remoteOpencodePluginForInstall(source: shipped, host: shared, remoteSocketPath: socketPath)
+        XCTAssertTrue(installed.contains(#"const SOCKET_OWNER_UID = "1000";"#))
+        XCTAssertFalse(installed.contains("process.env.CODEISLAND_SOCKET_OWNER_UID"), "never the agent's environment's")
+
+        // Not where agents run as the SSH user, nor for a path that names no
+        // user: the plugin then uses only its own user's socket.
+        let own = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
+        XCTAssertTrue(RemoteInstaller.remoteOpencodePluginForInstall(source: shipped, host: own, remoteSocketPath: socketPath)
+            .contains(#"const SOCKET_OWNER_UID = "";"#))
+        XCTAssertTrue(RemoteInstaller.remoteOpencodePluginForInstall(source: shipped, host: shared, remoteSocketPath: "/tmp/codeisland.sock")
+            .contains(#"const SOCKET_OWNER_UID = "";"#))
+    }
+
     func testRemoteOpencodePluginInjectsPerUserSocketPath() {
         // #193
         let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
         let source = #"const SOCKET_PATH = process.env.CODEISLAND_SOCKET_PATH || "/tmp/codeisland.sock";"#
 
-        let plugin = RemoteInstaller.remoteOpencodePluginForInstall(source: source, host: host, remoteSocketPath: "/tmp/codeisland-1000.sock")
+        let plugin = RemoteInstaller.remoteOpencodePluginForInstall(source: source, host: host, remoteSocketPath: "/tmp/codeisland-1000/island.sock")
 
-        XCTAssertTrue(plugin.contains(#"const SOCKET_PATH = "/tmp/codeisland-1000.sock";"#))
+        XCTAssertTrue(plugin.contains(#"const SOCKET_PATH = "/tmp/codeisland-1000/island.sock";"#))
     }
 
     func testRemoteInstallerConfigureScriptInstallsCustomClaudeCLI() throws {
@@ -1043,7 +1220,8 @@ hooks:
 
     func testRemoteInstallerConfigureScriptSkipsUnsupportedCustomFormat() {
         // #192: flat (Cursor-style) hooks need a --event flag the remote hook can't
-        // supply, so they are skipped remotely — the list must come out empty.
+        // supply, so they are skipped remotely — the install list must come out
+        // empty. #342: the name is still passed along so the status line can say so.
         let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
         let flat = CLIConfig(
             name: "CursorLike", source: "cursorlike",
@@ -1056,6 +1234,7 @@ hooks:
 
         XCTAssertFalse(script.contains("cursorlike"))
         XCTAssertTrue(script.contains("custom_clis = []"))
+        XCTAssertTrue(script.contains(#"unsupported_custom_clis = ["CursorLike"]"#))
     }
 
     func testRemoteInstallerConfigureScriptWithNoCustomCLIsIsEmptyList() {
@@ -1369,10 +1548,61 @@ hooks:
 
         let contents = try String(contentsOf: piExtensionPath)
         XCTAssertTrue(contents.contains("CodeIsland pi extension"))
-        XCTAssertTrue(contents.contains("// version: v4"))
+        XCTAssertTrue(contents.contains("// version: v7"))
         XCTAssertTrue(contents.contains("__codeislandAllowedToolCalls"))
         XCTAssertTrue(contents.contains("@earendil-works/pi-coding-agent"))
+        // pi-subagents children name their parent's card (#378).
+        XCTAssertTrue(contents.contains("PI_SUBAGENT_PARENT_SESSION"))
+        XCTAssertTrue(contents.contains(DeclaredSubsession.parentKey))
+        // A turn ends once, when pi settles (#386).
+        XCTAssertTrue(contents.contains("agent_settled"))
         XCTAssertTrue(ConfigInstaller.isPiExtensionInstalled(piExtensionPath: piExtensionPath.path, fm: fm))
+    }
+
+    /// A v4 install rings for every pi-subagents child (#378); it must be
+    /// replaced, not left as a healthy install.
+    func testV4PiExtensionIsRewrittenToTheParentAwareVersion() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let piAgentDir = tempDir.appendingPathComponent(".pi/agent")
+        let piExtensionDir = piAgentDir.appendingPathComponent("extensions")
+        let piExtensionPath = piExtensionDir.appendingPathComponent("codeisland.ts")
+        try fm.createDirectory(at: piExtensionDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+        try "// CodeIsland pi extension\n// version: v4\n".write(to: piExtensionPath, atomically: true, encoding: .utf8)
+
+        XCTAssertFalse(ConfigInstaller.isPiExtensionInstalled(piExtensionPath: piExtensionPath.path, fm: fm))
+        XCTAssertTrue(ConfigInstaller.installPiExtension(
+            piAgentDir: piAgentDir.path,
+            piExtensionDir: piExtensionDir.path,
+            piExtensionPath: piExtensionPath.path,
+            fm: fm
+        ))
+        XCTAssertTrue(ConfigInstaller.isPiExtensionInstalled(piExtensionPath: piExtensionPath.path, fm: fm))
+        XCTAssertTrue(try String(contentsOf: piExtensionPath).contains("_parent_session_id"))
+    }
+
+    /// A v6 install rings at every run of a pi turn, a parent yielding to its
+    /// subagent included (#386); it must be replaced, not left as healthy.
+    func testV6PiExtensionIsRewrittenToTheSettleAwareVersion() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let piAgentDir = tempDir.appendingPathComponent(".pi/agent")
+        let piExtensionDir = piAgentDir.appendingPathComponent("extensions")
+        let piExtensionPath = piExtensionDir.appendingPathComponent("codeisland.ts")
+        try fm.createDirectory(at: piExtensionDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+        try "// CodeIsland pi extension\n// version: v6\n".write(to: piExtensionPath, atomically: true, encoding: .utf8)
+
+        XCTAssertFalse(ConfigInstaller.isPiExtensionInstalled(piExtensionPath: piExtensionPath.path, fm: fm))
+        XCTAssertTrue(ConfigInstaller.installPiExtension(
+            piAgentDir: piAgentDir.path,
+            piExtensionDir: piExtensionDir.path,
+            piExtensionPath: piExtensionPath.path,
+            fm: fm
+        ))
+        XCTAssertTrue(ConfigInstaller.isPiExtensionInstalled(piExtensionPath: piExtensionPath.path, fm: fm))
+        XCTAssertTrue(try String(contentsOf: piExtensionPath).contains("agent_settled"))
     }
 
     func testInstallPiExtensionSkipsWhenPiAgentDirIsMissing() throws {
@@ -1442,7 +1672,7 @@ hooks:
         try fm.createDirectory(at: ompExtensionDir, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: tempDir) }
 
-        for version in ["v2", "v3", "v4", "v5", "v6"] {
+        for version in ["v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"] {
             try """
             // CodeIsland pi extension
             // version: \(version)
@@ -1466,7 +1696,7 @@ hooks:
             )
 
             let rewritten = try String(contentsOf: ompExtensionPath)
-            XCTAssertTrue(rewritten.contains("// version: v7"))
+            XCTAssertTrue(rewritten.contains("// version: v11"))
             XCTAssertTrue(
                 ConfigInstaller.isOmpExtensionInstalled(
                     ompExtensionPath: ompExtensionPath.path,
@@ -1494,9 +1724,13 @@ hooks:
 
         let contents = try String(contentsOf: ompExtensionPath)
         XCTAssertTrue(contents.contains("CodeIsland pi extension"))
-        XCTAssertTrue(contents.contains("// version: v7"))
+        XCTAssertTrue(contents.contains("// version: v11"))
         XCTAssertTrue(contents.contains("@oh-my-pi/pi-coding-agent"))
         XCTAssertFalse(contents.contains("@earendil-works/pi-coding-agent"))
+        // OMP subagents name their parent's card (#378).
+        XCTAssertTrue(contents.contains(DeclaredSubsession.parentKey))
+        // A turn ends at the run OMP does not go on from (#386).
+        XCTAssertTrue(contents.contains("willContinue"))
         XCTAssertTrue(ConfigInstaller.isOmpExtensionInstalled(ompExtensionPath: ompExtensionPath.path, fm: fm))
     }
 

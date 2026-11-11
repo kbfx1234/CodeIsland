@@ -17,6 +17,9 @@ extension AppState {
     // handlers on background queues can read them without Swift 6
     // Sendable warnings.
     nonisolated static let codexAppBundleId = "com.openai.codex"
+    /// Where newer ChatGPT releases keep the Codex binary, relative to the
+    /// app bundle; older ones shipped it as `Contents/Resources/codex`.
+    nonisolated static let bundledCodexCLIRelativePath = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
 
     // MARK: - Public lifecycle
 
@@ -123,7 +126,7 @@ extension AppState {
             // Preserve state-backed cards, refresh immediately, and restore the
             // live JSON-RPC channel with capped exponential backoff.
             invalidateCodexAppServerQuestionsAfterDisconnect()
-            requestCodexDesktopDiscoveryScan()
+            discovery.requestCodexDesktopScan()
             scheduleCodexAppServerReconnect()
         case .stopAndRemoveSessions:
             codexAppServerReconnectTask?.cancel()
@@ -188,13 +191,16 @@ extension AppState {
         },
         fallbackPaths: [String] = [
             CodexAppServerClient.defaultExecutablePath,
-            NSHomeDirectory() + "/Applications/Codex.app/Contents/Resources/codex"
+            NSHomeDirectory() + "/Applications/Codex.app/Contents/Resources/codex",
+            "/Applications/ChatGPT.app/" + AppState.bundledCodexCLIRelativePath,
+            NSHomeDirectory() + "/Applications/ChatGPT.app/" + AppState.bundledCodexCLIRelativePath,
         ],
         fileManager: FileManager = .default
     ) -> URL? {
         var candidates: [URL] = []
         for bundleURL in runningBundleURLs {
             candidates.append(bundleURL.appendingPathComponent("Contents/Resources/codex"))
+            candidates.append(bundleURL.appendingPathComponent(bundledCodexCLIRelativePath))
         }
         candidates.append(contentsOf: fallbackPaths.map { URL(fileURLWithPath: $0) })
 
@@ -311,6 +317,7 @@ extension AppState {
         }
 
         guard !askItems.isEmpty else { return }
+        reviveRemovedSession(sessionId)
 
         // Make sure the session exists so the popup has context to render.
         if sessions[sessionId] == nil {
@@ -344,14 +351,23 @@ extension AppState {
             askUserQuestionState: askState
         )
         questionQueue.append(request)
+        // First of a burst, as in `handleQuestion`.
+        let firstOfBurst = nextVisibleQuestion?.id == request.id
+        let attention = decideAttention(
+            .questionQueued(firstOfBurst: firstOfBurst, smartSuppressible: false),
+            sessionId: sessionId
+        )
+        pushQuestionQueued(request, sessionId: sessionId, push: attention.push)
 
-        if questionQueue.count == 1 {
+        if firstOfBurst {
             activeSessionId = sessionId
-            withAnimation(NotchAnimation.open) {
-                surface = .questionCard(sessionId: sessionId)
+            if Self.autoExpandOnQuestion() {
+                withAnimation(NotchAnimation.open) {
+                    surface = .questionCard(sessionId: sessionId)
+                }
             }
-            SoundManager.shared.handleEvent("PermissionRequest")
         }
+        playAttentionSound(attention, sessionId: sessionId)
         refreshDerivedState()
     }
 
@@ -409,6 +425,7 @@ extension AppState {
         guard let thread = params["thread"]?.asObject else { return }
         guard let threadId = thread["id"]?.asString else { return }
         let sessionId = AppState.codexAppSessionPrefix + threadId
+        guard shouldAdmitRemovedSession(sessionId, evidence: .activeWork) else { return }
         closedCodexAppThreads.removeValue(forKey: threadId)
 
         var snapshot = sessions[sessionId] ?? SessionSnapshot(startTime: Date())
@@ -423,26 +440,35 @@ extension AppState {
         }
         if let name = thread["name"]?.asString, !name.isEmpty {
             snapshot.sessionTitle = name
+            invalidateProviderTitleReads(for: sessionId)
         }
         if let path = thread["path"]?.asString, !path.isEmpty {
             snapshot.transcriptPath = path
         }
 
+        let waitBefore = displayOnlyWaitKind(forSession: sessionId)
         applyCodexThreadStatus(&snapshot, status: thread["status"]?.asObject)
         snapshot.lastActivity = Date()
         sessions[sessionId] = snapshot
+        noteDisplayOnlyWait(sessionId: sessionId, was: waitBefore)
         attachTranscriptTailerIfNeeded(sessionId: sessionId)
         refreshDerivedState()
     }
 
+    /// A `waitingOnApproval` / `waitingOnUserInput` flag the island holds no
+    /// request for is a display-only wait. It only reminds: the matching hook
+    /// request or `requestUserInput` may be queued a moment later, and its
+    /// push is the one that carries the command or the questions.
     private func applyCodexThreadStatusNotification(params: [String: AnyCodableLike]) {
         guard let threadId = params["threadId"]?.asString else { return }
         let sessionId = AppState.codexAppSessionPrefix + threadId
         guard var snapshot = sessions[sessionId] else { return }
 
+        let waitBefore = displayOnlyWaitKind(forSession: sessionId)
         applyCodexThreadStatus(&snapshot, status: params["status"]?.asObject)
         snapshot.lastActivity = Date()
         sessions[sessionId] = snapshot
+        noteDisplayOnlyWait(sessionId: sessionId, was: waitBefore)
         refreshDerivedState()
     }
 

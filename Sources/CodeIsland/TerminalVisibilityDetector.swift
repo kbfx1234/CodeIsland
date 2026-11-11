@@ -22,11 +22,94 @@ import CodeIslandCore
 /// - Others: falls back to app-level only
 struct TerminalVisibilityDetector {
 
-    // MARK: - App-level check (main-thread safe, no blocking)
+    // MARK: - Probe (what callers consult)
+
+    /// The two checks as one swappable pair. Every caller — Smart Suppress,
+    /// follow-up reminders, jump validation, the question card — goes through
+    /// `probe`, so a test process never reads the real frontmost app or scripts
+    /// the terminal of whoever runs the suite: it gets `.unknown` unless a test
+    /// installs its own answer.
+    struct Probe: Sendable {
+        /// App level; cheap enough for the main thread.
+        let isTerminalFrontmost: @Sendable (SessionSnapshot) -> Bool
+        /// Tab level; may block on AppleScript or a terminal CLI.
+        let isSessionTabVisible: @Sendable (SessionSnapshot) -> Bool
+        /// Can a jump land on the session at all? False for a Codex session
+        /// whose tmux pane can't be told apart from another session's
+        /// (`CodexTmuxRouting.Resolution.ambiguous`): its jump only raises the
+        /// terminal, so the terminal being in front proves nothing. May block.
+        var isSessionLocatable: @Sendable (SessionSnapshot) -> Bool = { _ in true }
+
+        /// The real desktop: frontmost app, window list, AppleScript, CLIs.
+        static let live = Probe(
+            isTerminalFrontmost: { TerminalVisibilityDetector.liveIsTerminalFrontmost($0) },
+            isSessionTabVisible: { TerminalVisibilityDetector.liveIsSessionTabVisible($0) },
+            isSessionLocatable: { TerminalVisibilityDetector.liveIsSessionLocatable($0) }
+        )
+
+        /// "Can't tell" — what the detector already answers for a terminal it
+        /// cannot inspect: not visible, so nothing is suppressed.
+        static let unknown = Probe(
+            isTerminalFrontmost: { _ in false },
+            isSessionTabVisible: { _ in false }
+        )
+    }
+
+    /// Read from any thread; tests swap it.
+    static var probe: Probe {
+        get {
+            probeLock.lock()
+            defer { probeLock.unlock() }
+            return installedProbe
+        }
+        set {
+            probeLock.lock()
+            installedProbe = newValue
+            probeLock.unlock()
+        }
+    }
+
+    private static let probeLock = NSLock()
+    private static var installedProbe: Probe = RuntimeEnvironment.isRunningTests ? .unknown : .live
 
     /// Fast check: is the session's terminal app the frontmost application?
     /// Safe to call from the main thread — no AppleScript or subprocess calls.
+    ///
+    /// None of the checks look at a remote session: its terminal, tmux pane,
+    /// iTerm session, Kitty window or pid are its own host's, so asking this
+    /// Mac's terminals (and running their CLIs) about them answers nothing
+    /// about it. Can't tell — not visible, so nothing is suppressed.
     static func isTerminalFrontmostForSession(_ session: SessionSnapshot) -> Bool {
+        guard !session.isRemote else { return false }
+        return probe.isTerminalFrontmost(session)
+    }
+
+    /// Full check: is the session's specific tab/pane currently visible?
+    /// **Call from a background thread only** — AppleScript/CLI calls may block 50-200ms.
+    static func isSessionTabVisible(_ session: SessionSnapshot) -> Bool {
+        guard !session.isRemote else { return false }
+        return probe.isSessionTabVisible(session)
+    }
+
+    /// Jump validation: did a click on this session land on it? Its tab is
+    /// showing, or its terminal is in front — unless the session can't be
+    /// located, where the jump only raised the terminal.
+    /// **Call from a background thread only**, like `isSessionTabVisible`.
+    static func didJumpLand(_ session: SessionSnapshot) -> Bool {
+        guard !session.isRemote else { return false }
+        let probe = self.probe
+        if probe.isSessionTabVisible(session) { return true }
+        return probe.isTerminalFrontmost(session) && probe.isSessionLocatable(session)
+    }
+
+    // MARK: - App-level check (main-thread safe, no blocking)
+
+    private static func liveIsTerminalFrontmost(_ session: SessionSnapshot) -> Bool {
+        // Harness-hosted (T3 Code): the harness is where the session lives,
+        // not the terminal its inherited env names (#321).
+        if let harness = session.hostHarness {
+            return HostHarnessSupport.isFrontmost(harness)
+        }
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return false }
         let frontBundleId = frontApp.bundleIdentifier?.lowercased() ?? ""
 
@@ -61,11 +144,17 @@ struct TerminalVisibilityDetector {
 
     // MARK: - Tab-level check (background thread only)
 
-    /// Full check: is the session's specific tab/pane currently visible?
-    /// **Call from a background thread only** — AppleScript/CLI calls may block 50-200ms.
-    static func isSessionTabVisible(_ session: SessionSnapshot) -> Bool {
+    private static func liveIsSessionTabVisible(_ session: SessionSnapshot) -> Bool {
         // Fast path: terminal not even frontmost
-        guard isTerminalFrontmostForSession(session) else { return false }
+        guard liveIsTerminalFrontmost(session) else { return false }
+
+        // Harness desktop app in front: like a native agent app, the app IS
+        // the session surface. A browser in front says nothing about which
+        // tab is showing, so it never counts as the session being visible.
+        if let harness = session.hostHarness {
+            if case .desktopApp = harness.surface { return true }
+            return false
+        }
 
         // Native app bundles (Cursor APP, Codex APP): app IS the session, suppress when frontmost
         if session.isNativeAppMode {
@@ -90,9 +179,14 @@ struct TerminalVisibilityDetector {
         }
 
         // tmux takes priority: if session runs in a tmux pane, check that pane
-        // regardless of which terminal app wraps tmux (iTerm2, Ghostty, etc.)
+        // regardless of which terminal app wraps tmux (iTerm2, Ghostty, etc.).
+        // The pane is the one the jump targets, from the same resolution.
         if let pane = session.tmuxPane, !pane.isEmpty {
-            return isTmuxPaneActive(pane)
+            switch CodexTmuxRouting.resolution(for: session, tmuxPath: findBinary("tmux")) {
+            case .located(let located): return isTmuxPaneActive(located.id)
+            case .ambiguous: return false
+            case .unverified: return isTmuxPaneActive(pane)
+            }
         }
 
         // Herdr owns the pane below the outer terminal. Route on the same
@@ -142,6 +236,10 @@ struct TerminalVisibilityDetector {
 
         // Unknown terminal — can't determine tab, prefer showing notification
         return false
+    }
+
+    private static func liveIsSessionLocatable(_ session: SessionSnapshot) -> Bool {
+        CodexTmuxRouting.resolution(for: session, tmuxPath: findBinary("tmux")) != .ambiguous
     }
 
     private static func isWarpSession(_ session: SessionSnapshot) -> Bool {
@@ -445,12 +543,13 @@ struct TerminalVisibilityDetector {
          .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
-    /// Run AppleScript synchronously and return the string result.
+    /// Run AppleScript synchronously on the calling (background) thread and
+    /// return its result as text; nil when it fails. Out of process instead of
+    /// NSAppleScript, which is main-thread-only — see AppleScriptRunner. Capped
+    /// at 5 s like the CLI probes below: an unanswered check reads as "not
+    /// visible", which shows the notification rather than swallowing it.
     private static func runAppleScriptSync(_ source: String) -> String? {
-        guard let script = NSAppleScript(source: source) else { return nil }
-        var error: NSDictionary?
-        let result = script.executeAndReturnError(&error)
-        return result.stringValue
+        AppleScriptRunner.current.evaluate(source, 5)
     }
 
     private static func findBinary(_ name: String, extraPaths: [String] = []) -> String? {

@@ -12,6 +12,10 @@ final class AppStateDeinitTests: XCTestCase {
         let holder = Holder()
         await MainActor.run {
             let state = AppState()
+            // A test process watches no session store unless told to: give
+            // the watcher a root so there is an FSEventStream to tear down.
+            let root = NSTemporaryDirectory()
+            state.discovery.scanners.watchRoots = { [root] }
             state.startSessionDiscovery()
             holder.state = state
         }

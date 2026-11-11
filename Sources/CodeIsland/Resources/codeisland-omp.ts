@@ -1,5 +1,5 @@
 // CodeIsland pi extension
-// version: v7
+// version: v11
 // OMP-compatible install
 
 /**
@@ -7,11 +7,27 @@
  *
  * This is the same socket bridge as codeisland-pi.ts, but imports OMP's
  * package scope so `omp` can load it from ~/.omp/agent/extensions.
+ * `CODEISLAND_SOCKET_PATH` overrides the socket path, as it does for the app.
+ * Nothing is sent to a socket this user does not own (`socketIsOwnedByUser`).
+ *
+ * Subagent sessions (task tool, eval `agent()`, `/tan` clones):
+ *   OMP runs them in-process and rebinds this extension to each one. A
+ *   subagent's payloads carry `_parent_session_id` (the spawning session's
+ *   CodeIsland session id) and `agent_type`, so CodeIsland can fold it into
+ *   the parent's card or hide it (Agent Sub-Sessions), and never rings the
+ *   completion sound for a subagent's turn — only the parent's (#378).
+ *
+ * Turn end (#386):
+ *   `agent_end` ends one run, not the turn: OMP 17.0.2+ marks a run it goes
+ *   on from (a retry, recovery, compaction, a reminder, a wait on background
+ *   jobs) with `willContinue`, and the turn's Stop waits for the run that
+ *   ends it. A turn the user interrupted (Esc) is sent with `stop_reason:
+ *   "interrupted"`, which CodeIsland ends without the completion chime.
  */
 
 import { execFile, execFileSync } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { getuid } from "node:process";
@@ -34,7 +50,31 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 /** Unix socket path CodeIsland listens on (user-scoped). */
 const userId = getuid?.() ?? 0;
-const SOCKET_PATH = `/tmp/codeisland-${userId}.sock`;
+const SOCKET_PATH =
+  process.env.CODEISLAND_SOCKET_PATH || `/tmp/codeisland-${userId}.sock`;
+
+/**
+ * Whether the socket at `path` is one this user owns. The default path is a
+ * predictable name in /tmp, where any user can create a socket first: theirs
+ * would be sent every event and could answer a permission request. `lstat`,
+ * not `stat`: a symlink, even to our own socket, stays its owner's to repoint,
+ * while a socket of ours in sticky /tmp is ours alone to remove.
+ *
+ * Exported for tests, which pass their own `lstat` and `uid`.
+ */
+export function socketIsOwnedByUser(
+  path: string,
+  lstat: (path: string) => { isSocket(): boolean; uid: number } = lstatSync,
+  uid: number | undefined = getuid?.(),
+): boolean {
+  if (uid === undefined) return false;
+  try {
+    const stat = lstat(path);
+    return stat.isSocket() && stat.uid === uid;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Bridge binary path. Used for blocking permission requests because Node's
@@ -98,6 +138,49 @@ function herdrMetadata(env: Record<string, string>): Record<string, string> {
   };
 }
 
+// ── Subagent sessions ─────────────────────────────────────────────────────────
+
+/** The agent a session runs, as OMP reports it on `ctx.agent` (OMP 18.4+). */
+export interface OmpAgentIdentity {
+  kind: "main" | "sub";
+  /** Agent registry id, unique in the process: `"Main"`, `"0-Explore"`… */
+  id: string;
+  /** Agent definition name: `"task"`, `"explore"`, `"sub"` for `/tan`… */
+  name?: string;
+  /** Registry id of the spawning agent; absent for a top-level session. */
+  parentId?: string;
+}
+
+/** `ctx.agent`, or undefined on an OMP too old to report it (or a malformed one). */
+export function ompAgentIdentity(ctx: unknown): OmpAgentIdentity | undefined {
+  const agent = (ctx as { agent?: unknown } | null | undefined)?.agent;
+  if (!agent || typeof agent !== "object") return undefined;
+  const { kind, id, name, parentId } = agent as Record<string, unknown>;
+  if ((kind !== "main" && kind !== "sub") || typeof id !== "string" || !id) return undefined;
+  return {
+    kind,
+    id,
+    ...(typeof name === "string" && name ? { name } : {}),
+    ...(typeof parentId === "string" && parentId ? { parentId } : {}),
+  };
+}
+
+const AGENT_CARDS_KEY = "__codeislandOmpAgentCards";
+
+/**
+ * OMP agent registry id → the CodeIsland session id of the session that agent
+ * runs. Process-wide: OMP runs subagents in-process and rebinds this extension
+ * to each of them, and a subagent knows its parent only by registry id. Each
+ * copy of the extension registers its own session here.
+ */
+export function ompAgentCards(): Map<string, string> {
+  const g = globalThis as typeof globalThis & { [AGENT_CARDS_KEY]?: Map<string, string> };
+  return (g[AGENT_CARDS_KEY] ??= new Map());
+}
+
+/** Fallback `agent_type` for a subagent whose agent name is unknown. */
+const DEFAULT_SUBAGENT_TYPE = "subagent";
+
 /**
  * Walks the process tree upward to find the controlling TTY.
  * Cached at startup — pi's TTY does not change during a session.
@@ -134,6 +217,10 @@ function detectTty(): string | null {
  */
 function sendToSocket(payload: object): Promise<boolean> {
   return new Promise((resolve) => {
+    if (!socketIsOwnedByUser(SOCKET_PATH)) {
+      resolve(false);
+      return;
+    }
     try {
       const sock = connect({ path: SOCKET_PATH }, () => {
         sock.write(JSON.stringify(payload));
@@ -183,7 +270,7 @@ function sendAndWaitResponseCancellable(
 ): CancellableBridge {
   const { promise, resolve } = Promise.withResolvers<Record<string, unknown> | null>();
 
-  if (!existsSync(BRIDGE_PATH)) {
+  if (!existsSync(BRIDGE_PATH) || !socketIsOwnedByUser(SOCKET_PATH)) {
     resolve(null);
     return { promise, cancel: () => {} };
   }
@@ -257,25 +344,50 @@ function displayToolName(name: string): string {
   return name.charAt(0).toUpperCase() + name.slice(1);
 }
 
+/** An assistant message, as much of it as this extension reads. */
+interface AssistantMessageFields {
+  role: "assistant";
+  content: unknown;
+  stopReason?: unknown;
+  errorMessage?: unknown;
+}
+
+/** The last assistant message in an event.messages array. */
+function lastAssistant(
+  messages: readonly unknown[],
+): AssistantMessageFields | undefined {
+  return messages
+    .filter(
+      (m): m is AssistantMessageFields =>
+        !!m &&
+        typeof m === "object" &&
+        (m as { role?: string }).role === "assistant",
+    )
+    .at(-1);
+}
+
 /** Extracts plain text from the last assistant message in an event.messages array. */
 function extractLastAssistantText(
   messages: readonly unknown[],
 ): string {
-  const assistants = messages.filter(
-    (m): m is { role: "assistant"; content: unknown } =>
-      !!m &&
-      typeof m === "object" &&
-      (m as { role?: string }).role === "assistant",
-  );
-  const last = assistants.at(-1);
-  if (!last) return "";
-  const content = last.content;
+  const content = lastAssistant(messages)?.content;
   if (!Array.isArray(content)) return "";
   return content
     .filter((c): c is { type: "text"; text: string } => c?.type === "text")
     .map((c) => c.text)
     .join("")
     .trim();
+}
+
+/**
+ * Whether the last assistant message in an event.messages array is one the
+ * user cut off (Esc): OMP aborts it with the reason "Interrupted by user"
+ * (USER_INTERRUPT_LABEL), kept on its `errorMessage`. OMP's own aborts, such
+ * as a subagent's final `yield`, carry other reasons.
+ */
+export function interruptedByUser(messages: readonly unknown[]): boolean {
+  const last = lastAssistant(messages);
+  return last?.stopReason === "aborted" && last.errorMessage === "Interrupted by user";
 }
 
 export interface AskRaceSettlement<T> {
@@ -380,8 +492,6 @@ export function classifyCodeIslandAskResponse(
 // ── Extension ─────────────────────────────────────────────────────────────────
 
 export default function codeislandExtension(pi: ExtensionAPI) {
-  const askToolRenderer = pi.pi.askToolRenderer;
-
   class ToolAbortError extends Error {
     override name = "ToolAbortError";
   }
@@ -396,17 +506,68 @@ export default function codeislandExtension(pi: ExtensionAPI) {
   const pendingPermissionSessions = new Set<string>();
   /** Sessions for which CodeIsland has already received SessionStart. */
   const startedSessions = new Set<string>();
+  /** A subagent session's parent card, kept once found so it never flips back. */
+  const parentCards = new Map<string, string>();
+  /** A turn's latest reply, per session, while OMP goes on with it (#386). */
+  const continuedReplies = new Map<string, string>();
 
-  async function ensureSessionStarted(sessionId: string, cwd: string): Promise<void> {
+  /**
+   * Record which CodeIsland session this agent runs, for its subagents to
+   * find. Only from lifecycle events: there `ctx.agent` is this session's own
+   * agent, while tool events can name an advisor working on its behalf.
+   */
+  function registerAgentCard(ctx: ExtensionContext, sessionId: string): void {
+    const agent = ompAgentIdentity(ctx);
+    if (agent) ompAgentCards().set(agent.id, `pi-${sessionId}`);
+  }
+
+  function unregisterAgentCard(ctx: ExtensionContext, sessionId: string): void {
+    const agent = ompAgentIdentity(ctx);
+    const cards = ompAgentCards();
+    // A newer session may already own the id (`/new` keeps "Main").
+    if (agent && cards.get(agent.id) === `pi-${sessionId}`) cards.delete(agent.id);
+  }
+
+  /**
+   * For a subagent session, the parent's CodeIsland session and the agent it
+   * runs (#378). Untagged while the parent is unknown — its extension has not
+   * registered yet — rather than guessed.
+   */
+  function subagentTag(ctx: ExtensionContext, sessionId: string): Record<string, unknown> {
+    const agent = ompAgentIdentity(ctx);
+    if (agent?.kind !== "sub" || !agent.parentId) return {};
+    const card = `pi-${sessionId}`;
+    let parent = parentCards.get(card);
+    if (!parent) {
+      const registered = ompAgentCards().get(agent.parentId);
+      // An advisor reaches its own session's tool handlers as a subagent of
+      // that very session: the event is the session's own, not a child's.
+      if (!registered || registered === card) return {};
+      parent = registered;
+      parentCards.set(card, parent);
+    }
+    return { _parent_session_id: parent, agent_type: agent.name ?? DEFAULT_SUBAGENT_TYPE };
+  }
+
+  /** An event payload for the session `ctx` belongs to. */
+  function payload(
+    ctx: ExtensionContext,
+    sessionId: string,
+    extra: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return base(sessionId, ctx.cwd, { ...subagentTag(ctx, sessionId), ...extra }, tty);
+  }
+
+  async function ensureSessionStarted(ctx: ExtensionContext, sessionId: string): Promise<void> {
     const sid = `pi-${sessionId}`;
     if (startedSessions.has(sid)) return;
 
     const sessionName = pi.getSessionName();
     await sendToSocket(
-      base(sessionId, cwd, {
+      payload(ctx, sessionId, {
         hook_event_name: "SessionStart",
         ...(sessionName ? { session_title: sessionName } : {}),
-      }, tty),
+      }),
     );
     startedSessions.add(sid);
   }
@@ -646,12 +807,22 @@ export default function codeislandExtension(pi: ExtensionAPI) {
   // info first, only ask on major tradeoffs, never hand-write "Other", etc.).
   const nativeAskMetadata = createNativeAskTool();
 
+  // OMP 18.2.x moved the tool renderers into @oh-my-pi/pi-tui and no longer
+  // exports this one. It only affects how the shadow Ask tool is drawn in the
+  // terminal, so its absence must not stop the extension from loading.
+  const { askToolRenderer } = pi.pi as typeof pi.pi & {
+    askToolRenderer?: Pick<
+      ToolDefinition<typeof askParameters, CompatibleAskToolDetails>,
+      "renderCall" | "renderResult"
+    > & { mergeCallAndResult: boolean };
+  };
+
   const askToolDefinition: ToolDefinition<
     typeof askParameters,
     CompatibleAskToolDetails
   > & {
     concurrency: "exclusive";
-    mergeCallAndResult: boolean;
+    mergeCallAndResult?: boolean;
     strict: true;
     approval: "read";
   } = {
@@ -662,9 +833,13 @@ export default function codeislandExtension(pi: ExtensionAPI) {
     strict: true,
     approval: "read",
     concurrency: "exclusive",
-    mergeCallAndResult: askToolRenderer.mergeCallAndResult,
-    renderCall: askToolRenderer.renderCall,
-    renderResult: askToolRenderer.renderResult,
+    ...(askToolRenderer
+      ? {
+          mergeCallAndResult: askToolRenderer.mergeCallAndResult,
+          renderCall: askToolRenderer.renderCall,
+          renderResult: askToolRenderer.renderResult,
+        }
+      : {}),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const sessionId = ctx.sessionManager.getSessionId();
       const sid = `pi-${sessionId}`;
@@ -682,13 +857,13 @@ export default function codeislandExtension(pi: ExtensionAPI) {
       const race = createAskRaceSettlement<GateOutcome>();
 
       const islandBridge = sendAndWaitResponseCancellable(
-        base(sessionId, ctx.cwd, {
+        payload(ctx, sessionId, {
           hook_event_name: "PermissionRequest",
           tool_name: "AskUserQuestion",
           tool_input: { questions: islandQuestions },
           _pi_tool_call_id: toolCallId,
           _codeisland_native_ask_racing: true,
-        }, tty),
+        }),
         86_400_000,
       );
 
@@ -795,15 +970,19 @@ export default function codeislandExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
-    await ensureSessionStarted(sessionId, ctx.cwd);
+    registerAgentCard(ctx, sessionId);
+    await ensureSessionStarted(ctx, sessionId);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     await sendToSocket(
-      base(sessionId, ctx.cwd, { hook_event_name: "SessionEnd" }, tty),
+      payload(ctx, sessionId, { hook_event_name: "SessionEnd" }),
     );
     startedSessions.delete(`pi-${sessionId}`);
+    parentCards.delete(`pi-${sessionId}`);
+    continuedReplies.delete(`pi-${sessionId}`);
+    unregisterAgentCard(ctx, sessionId);
   });
 
   // ── Agent lifecycle ────────────────────────────────────────────────────────
@@ -811,35 +990,49 @@ export default function codeislandExtension(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     const sid = `pi-${sessionId}`;
-    await ensureSessionStarted(sessionId, ctx.cwd);
+    // Again here: an extension loaded mid-session missed session_start, and
+    // subagents are only spawned during a turn.
+    registerAgentCard(ctx, sessionId);
+    await ensureSessionStarted(ctx, sessionId);
 
     if (pendingPermissionSessions.has(sid)) return;
 
     const prompt = event.prompt ?? "";
     await sendToSocket(
-      base(sessionId, ctx.cwd, {
+      payload(ctx, sessionId, {
         hook_event_name: "UserPromptSubmit",
         prompt,
-      }, tty),
+      }),
     );
   });
 
   pi.on("agent_end", async (event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     const sid = `pi-${sessionId}`;
-    await ensureSessionStarted(sessionId, ctx.cwd);
+    const reply = extractLastAssistantText(event.messages) || continuedReplies.get(sid) || "";
+
+    // OMP goes on with this turn (OMP's own Warp bridge reads the flag the
+    // same way): its Stop, and the chime, wait for the run that ends it. An
+    // OMP before 17.0.2 sends no flag, and every run ends a turn as before.
+    if (event.willContinue === true) {
+      if (reply) continuedReplies.set(sid, reply);
+      return;
+    }
+    continuedReplies.delete(sid);
+
+    await ensureSessionStarted(ctx, sessionId);
 
     if (pendingPermissionSessions.has(sid)) return;
 
-    const lastAssistantMessage = extractLastAssistantText(event.messages);
     const sessionName = pi.getSessionName();
 
     await sendToSocket(
-      base(sessionId, ctx.cwd, {
+      payload(ctx, sessionId, {
         hook_event_name: "Stop",
-        last_assistant_message: lastAssistantMessage || undefined,
+        last_assistant_message: reply || undefined,
+        ...(interruptedByUser(event.messages) ? { stop_reason: "interrupted" } : {}),
         ...(sessionName ? { session_title: sessionName } : {}),
-      }, tty),
+      }),
     );
   });
 
@@ -848,7 +1041,7 @@ export default function codeislandExtension(pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     const sid = `pi-${sessionId}`;
-    await ensureSessionStarted(sessionId, ctx.cwd);
+    await ensureSessionStarted(ctx, sessionId);
     const toolName = displayToolName(event.toolName);
 
     // Build a tool_input object appropriate for the tool type.
@@ -870,16 +1063,16 @@ export default function codeislandExtension(pi: ExtensionAPI) {
     ) {
       pendingPermissionSessions.add(sid);
 
-      const payload = base(sessionId, ctx.cwd, {
+      const request = payload(ctx, sessionId, {
         hook_event_name: "PermissionRequest",
         tool_name: toolName,
         tool_input: toolInput,
         _pi_tool_call_id: event.toolCallId,
-      }, tty);
+      });
 
       let response: Record<string, unknown> | null = null;
       try {
-        response = await sendAndWaitResponse(payload);
+        response = await sendAndWaitResponse(request);
       } finally {
         pendingPermissionSessions.delete(sid);
       }
@@ -898,11 +1091,11 @@ export default function codeislandExtension(pi: ExtensionAPI) {
     // Non-blocking PreToolUse for all other tool calls.
     if (!pendingPermissionSessions.has(sid)) {
       await sendToSocket(
-        base(sessionId, ctx.cwd, {
+        payload(ctx, sessionId, {
           hook_event_name: "PreToolUse",
           tool_name: toolName,
           tool_input: toolInput,
-        }, tty),
+        }),
       );
     }
 
@@ -912,12 +1105,12 @@ export default function codeislandExtension(pi: ExtensionAPI) {
   pi.on("tool_result", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     const sid = `pi-${sessionId}`;
-    await ensureSessionStarted(sessionId, ctx.cwd);
+    await ensureSessionStarted(ctx, sessionId);
 
     if (pendingPermissionSessions.has(sid)) return;
 
     await sendToSocket(
-      base(sessionId, ctx.cwd, { hook_event_name: "PostToolUse" }, tty),
+      payload(ctx, sessionId, { hook_event_name: "PostToolUse" }),
     );
   });
 
@@ -925,17 +1118,17 @@ export default function codeislandExtension(pi: ExtensionAPI) {
 
   pi.on("session_before_compact", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
-    await ensureSessionStarted(sessionId, ctx.cwd);
+    await ensureSessionStarted(ctx, sessionId);
     await sendToSocket(
-      base(sessionId, ctx.cwd, { hook_event_name: "PreCompact" }, tty),
+      payload(ctx, sessionId, { hook_event_name: "PreCompact" }),
     );
   });
 
   pi.on("session_compact", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
-    await ensureSessionStarted(sessionId, ctx.cwd);
+    await ensureSessionStarted(ctx, sessionId);
     await sendToSocket(
-      base(sessionId, ctx.cwd, { hook_event_name: "PostCompact" }, tty),
+      payload(ctx, sessionId, { hook_event_name: "PostCompact" }),
     );
   });
 }

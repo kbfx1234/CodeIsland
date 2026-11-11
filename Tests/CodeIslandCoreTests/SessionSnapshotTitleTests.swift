@@ -13,6 +13,15 @@ final class SessionSnapshotTitleTests: XCTestCase {
         return "\(home)/.cursor/projects/\(homeEncoded)-\(encodedTail)/agent-transcripts"
     }
 
+    /// Tells the Cursor-path decoder that exactly `folders` exist, for this
+    /// test only — instead of creating (and then deleting) them in the real
+    /// home, where a same-named folder of the user's would be wiped.
+    private func describeFoldersUnderHome(_ folders: Set<String>) {
+        let saved = SessionSnapshot.cursorProjectFolderExists
+        SessionSnapshot.cursorProjectFolderExists = { folders.contains($0) }
+        addTeardownBlock { SessionSnapshot.cursorProjectFolderExists = saved }
+    }
+
     func testDisplayTitlePrefersProviderSessionTitle() {
         var snapshot = SessionSnapshot()
         snapshot.sessionTitle = "Investigate icon sizing"
@@ -73,13 +82,11 @@ final class SessionSnapshotTitleTests: XCTestCase {
         XCTAssertEqual(snapshot.projectDisplayName, fixtureLeaf)
     }
 
-    func testProjectDisplayNamePreservesHyphenatedCursorProjectLeaf() throws {
-        let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser.path
+    func testProjectDisplayNamePreservesHyphenatedCursorProjectLeaf() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
         let hyphenLeaf = "my-sample-app"
-        let projectDir = "\(home)/\(hyphenLeaf)"
-        try fm.createDirectory(atPath: projectDir, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(atPath: projectDir) }
+        // ~/my-sample-app exists; ~/my/sample/app and ~/my/sample-app do not.
+        describeFoldersUnderHome(["\(home)/\(hyphenLeaf)"])
 
         var snapshot = SessionSnapshot()
         snapshot.cwd = cursorProjectsCwd(encodedTail: hyphenLeaf)
@@ -87,12 +94,9 @@ final class SessionSnapshotTitleTests: XCTestCase {
         XCTAssertEqual(snapshot.projectDisplayName, hyphenLeaf)
     }
 
-    func testProjectDisplayNamePeelsMetadataDirFromCursorEncodedPath() throws {
-        let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser.path
-        let metadataDir = "\(home)/\(fixtureLeaf)/.claude"
-        try fm.createDirectory(atPath: metadataDir, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(atPath: "\(home)/\(fixtureLeaf)") }
+    func testProjectDisplayNamePeelsMetadataDirFromCursorEncodedPath() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        describeFoldersUnderHome(["\(home)/\(fixtureLeaf)", "\(home)/\(fixtureLeaf)/.claude"])
 
         var snapshot = SessionSnapshot()
         snapshot.cwd = cursorProjectsCwd(encodedTail: "\(fixtureLeaf)-.claude")

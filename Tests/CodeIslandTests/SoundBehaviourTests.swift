@@ -20,6 +20,7 @@ final class SoundBehaviourTests: XCTestCase {
         SettingsKey.quietHoursEnd,
         SettingsKey.smartSuppress,
         SettingsKey.autoExpandOnPermission,
+        SettingsKey.soundBoot,
     ]
 
     override func setUp() {
@@ -59,19 +60,14 @@ final class SoundBehaviourTests: XCTestCase {
         var tasks: [Task<Data, Never>] = []
         for index in 0..<3 {
             let event = try makePermissionEvent(sessionId: "burst-\(index)")
-            tasks.append(Task<Data, Never> {
-                await withCheckedContinuation { continuation in
-                    appState.handlePermissionRequest(event, continuation: continuation)
-                }
-            })
-            await Task.yield()
+            tasks.append(await startHookRequest { appState.handlePermissionRequest(event, continuation: $0) })
         }
 
         XCTAssertEqual(appState.permissionQueue.count, 3)
         XCTAssertEqual(played, ["8bit_approval"], "one burst, one chime")
 
         for index in 0..<3 { appState.handlePeerDisconnect(sessionId: "burst-\(index)") }
-        for task in tasks { _ = await task.value }
+        for task in tasks { _ = try await awaitValue(of: task) }
     }
 
     /// #309's regression, now expressible: a dismissed request stays queued, and
@@ -79,20 +75,14 @@ final class SoundBehaviourTests: XCTestCase {
     func testDismissedRequestDoesNotSwallowTheNextSessionsChime() async throws {
         let appState = AppState()
         let first = try makePermissionEvent(sessionId: "snd-dismissed")
-        let firstTask = Task<Data, Never> {
-            await withCheckedContinuation { appState.handlePermissionRequest(first, continuation: $0) }
-        }
-        await Task.yield()
+        let firstTask = await startHookRequest { appState.handlePermissionRequest(first, continuation: $0) }
         XCTAssertEqual(played, ["8bit_approval"])
 
         appState.dismissPermissionPrompt()
         played = []
 
         let second = try makePermissionEvent(sessionId: "snd-later")
-        let secondTask = Task<Data, Never> {
-            await withCheckedContinuation { appState.handlePermissionRequest(second, continuation: $0) }
-        }
-        await Task.yield()
+        let secondTask = await startHookRequest { appState.handlePermissionRequest(second, continuation: $0) }
 
         XCTAssertEqual(
             played,
@@ -102,8 +92,8 @@ final class SoundBehaviourTests: XCTestCase {
 
         appState.handlePeerDisconnect(sessionId: "snd-dismissed")
         appState.handlePeerDisconnect(sessionId: "snd-later")
-        _ = await firstTask.value
-        _ = await secondTask.value
+        _ = try await awaitValue(of: firstTask)
+        _ = try await awaitValue(of: secondTask)
     }
 
     /// A card that never opens still chimes: with auto-expand off the sound is
@@ -112,16 +102,13 @@ final class SoundBehaviourTests: XCTestCase {
         UserDefaults.standard.set(false, forKey: SettingsKey.autoExpandOnPermission)
         let appState = AppState()
         let event = try makePermissionEvent(sessionId: "snd-collapsed")
-        let task = Task<Data, Never> {
-            await withCheckedContinuation { appState.handlePermissionRequest(event, continuation: $0) }
-        }
-        await Task.yield()
+        let task = await startHookRequest { appState.handlePermissionRequest(event, continuation: $0) }
 
         XCTAssertEqual(appState.surface, .collapsed)
         XCTAssertEqual(played, ["8bit_approval"])
 
         appState.handlePeerDisconnect(sessionId: "snd-collapsed")
-        _ = await task.value
+        _ = try await awaitValue(of: task)
     }
 
     // MARK: - Gates
@@ -157,6 +144,24 @@ final class SoundBehaviourTests: XCTestCase {
     func testUnknownEventNameProducesNoSound() {
         SoundManager.shared.handleEvent("SomethingElse")
         XCTAssertEqual(played, [])
+    }
+
+    /// The launch chime answers to its own switch, and a hook event that
+    /// happens to carry the launch cue's name rings nothing.
+    func testOnlyTheLaunchRingsTheLaunchChime() throws {
+        UserDefaults.standard.set(true, forKey: SettingsKey.soundBoot)
+        let appState = AppState()
+        appState.handleEvent(try XCTUnwrap(HookEvent(from: JSONSerialization.data(withJSONObject: [
+            "hook_event_name": SoundCue.launch, "session_id": "snd-launch-named-hook",
+        ]))))
+        XCTAssertEqual(played, [])
+
+        SoundManager.shared.playBoot()
+        XCTAssertEqual(played, ["8bit_boot"])
+
+        UserDefaults.standard.set(false, forKey: SettingsKey.soundBoot)
+        SoundManager.shared.playBoot()
+        XCTAssertEqual(played, ["8bit_boot"])
     }
 
     // MARK: - Helpers

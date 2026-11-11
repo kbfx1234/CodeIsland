@@ -19,38 +19,23 @@ final class AppStatePermissionGateTests: XCTestCase {
 
         // Occupy the question queue first, so the question in step 3 does not
         // reassign the surface.
-        let cTask = Task<Data, Never> {
-            await withCheckedContinuation { appState.handleQuestion(try! self.question("s-c"), continuation: $0) }
-        }
-        await Task.yield()
+        let cTask = await startHookRequest { appState.handleQuestion(try! self.question("s-c"), continuation: $0) }
 
-        let aTask = Task<Data, Never> {
-            await withCheckedContinuation { appState.handlePermissionRequest(try! self.perm("s-a", "Bash"), continuation: $0) }
-        }
-        await Task.yield()
+        let aTask = await startHookRequest { appState.handlePermissionRequest(try! self.perm("s-a", "Bash"), continuation: $0) }
         XCTAssertEqual(appState.surface, .approvalCard(sessionId: "s-a"))
 
-        let bTask = Task<Data, Never> {
-            await withCheckedContinuation { appState.handlePermissionRequest(try! self.perm("s-b", "Read"), continuation: $0) }
-        }
-        await Task.yield()
+        let bTask = await startHookRequest { appState.handlePermissionRequest(try! self.perm("s-b", "Read"), continuation: $0) }
 
         // A question for s-a drains s-a's permission; s-b's is untouched.
-        let aQuestionTask = Task<Data, Never> {
-            await withCheckedContinuation { appState.handleQuestion(try! self.question("s-a"), continuation: $0) }
-        }
-        await Task.yield()
-        _ = await aTask.value
+        let aQuestionTask = await startHookRequest { appState.handleQuestion(try! self.question("s-a"), continuation: $0) }
+        _ = try await awaitValue(of: aTask)
         XCTAssertFalse(
             appState.permissionQueue.contains { $0.event.sessionId == "s-a" },
             "s-a has nothing queued"
         )
         XCTAssertFalse(appState.permissionQueue.isEmpty, "but the queue is not empty")
 
-        let dTask = Task<Data, Never> {
-            await withCheckedContinuation { appState.handlePermissionRequest(try! self.perm("s-d", "Edit"), continuation: $0) }
-        }
-        await Task.yield()
+        let dTask = await startHookRequest { appState.handlePermissionRequest(try! self.perm("s-d", "Edit"), continuation: $0) }
 
         XCTAssertEqual(
             appState.surface,
@@ -62,10 +47,10 @@ final class AppStatePermissionGateTests: XCTestCase {
         appState.handlePeerDisconnect(sessionId: "s-d")
         appState.handlePeerDisconnect(sessionId: "s-c")
         appState.handlePeerDisconnect(sessionId: "s-a")
-        _ = await bTask.value
-        _ = await dTask.value
-        _ = await cTask.value
-        _ = await aQuestionTask.value
+        _ = try await awaitValue(of: bTask)
+        _ = try await awaitValue(of: dTask)
+        _ = try await awaitValue(of: cTask)
+        _ = try await awaitValue(of: aQuestionTask)
     }
 
     /// A replay of the same `tool_use_id` is the same decision arriving twice.
@@ -74,29 +59,20 @@ final class AppStatePermissionGateTests: XCTestCase {
     func testReplayOfADismissedRequestDoesNotStealTheNextSessionsCard() async throws {
         let appState = AppState()
 
-        let originalTask = Task<Data, Never> {
-            await withCheckedContinuation {
-                appState.handlePermissionRequest(try! self.permWithToolUse("s-replay", "tool-1"), continuation: $0)
-            }
+        let originalTask = await startHookRequest {
+            appState.handlePermissionRequest(try! self.permWithToolUse("s-replay", "tool-1"), continuation: $0)
         }
-        await Task.yield()
         appState.dismissPermissionPrompt()
         XCTAssertEqual(appState.surface, .collapsed)
 
-        let replayTask = Task<Data, Never> {
-            await withCheckedContinuation {
-                appState.handlePermissionRequest(try! self.permWithToolUse("s-replay", "tool-1"), continuation: $0)
-            }
+        let replayTask = await startHookRequest {
+            appState.handlePermissionRequest(try! self.permWithToolUse("s-replay", "tool-1"), continuation: $0)
         }
-        await Task.yield()
-        _ = await originalTask.value  // the replay denies the previous waiter
+        _ = try await awaitValue(of: originalTask)  // the replay denies the previous waiter
         XCTAssertEqual(appState.permissionQueue.count, 1, "a replay swaps in place, it does not enqueue")
         XCTAssertEqual(appState.surface, .collapsed, "a replay must not resurrect the dismissed card")
 
-        let otherTask = Task<Data, Never> {
-            await withCheckedContinuation { appState.handlePermissionRequest(try! self.perm("s-other", "Read"), continuation: $0) }
-        }
-        await Task.yield()
+        let otherTask = await startHookRequest { appState.handlePermissionRequest(try! self.perm("s-other", "Read"), continuation: $0) }
 
         XCTAssertEqual(
             appState.surface,
@@ -105,21 +81,21 @@ final class AppStatePermissionGateTests: XCTestCase {
         )
         // Stop on failure. Under the bug the resurrected session leads the queue,
         // so the approve below resolves that one instead and the await never
-        // returns — the test would hang rather than report by name.
+        // completes — the test would fail on a timeout rather than by name.
         guard appState.permissionQueue.first?.event.sessionId == "s-other" else {
             appState.handlePeerDisconnect(sessionId: "s-replay")
             appState.handlePeerDisconnect(sessionId: "s-other")
-            _ = await replayTask.value
-            _ = await otherTask.value
+            _ = try await awaitValue(of: replayTask)
+            _ = try await awaitValue(of: otherTask)
             return
         }
 
         appState.approvePermission()
-        let otherResponse = await otherTask.value
+        let otherResponse = try await awaitValue(of: otherTask)
         XCTAssertEqual(try extractBehavior(from: otherResponse), "allow")
 
         appState.handlePeerDisconnect(sessionId: "s-replay")
-        _ = await replayTask.value
+        _ = try await awaitValue(of: replayTask)
     }
 
     /// The other side of that move: `mergeDuplicatePermissionRequest` returns
@@ -128,24 +104,18 @@ final class AppStatePermissionGateTests: XCTestCase {
     func testSameToolUseIdWithDifferentInputStillClearsTheDismissal() async throws {
         let appState = AppState()
 
-        let firstTask = Task<Data, Never> {
-            await withCheckedContinuation {
-                appState.handlePermissionRequest(try! self.permWithToolUse("s-parallel", "tool-9"), continuation: $0)
-            }
+        let firstTask = await startHookRequest {
+            appState.handlePermissionRequest(try! self.permWithToolUse("s-parallel", "tool-9"), continuation: $0)
         }
-        await Task.yield()
         appState.dismissPermissionPrompt()
         XCTAssertEqual(appState.surface, .collapsed)
 
-        let secondTask = Task<Data, Never> {
-            await withCheckedContinuation {
-                appState.handlePermissionRequest(
-                    try! self.permWithToolUse("s-parallel", "tool-9", command: "echo different"),
-                    continuation: $0
-                )
-            }
+        let secondTask = await startHookRequest {
+            appState.handlePermissionRequest(
+                try! self.permWithToolUse("s-parallel", "tool-9", command: "echo different"),
+                continuation: $0
+            )
         }
-        await Task.yield()
 
         XCTAssertEqual(appState.permissionQueue.count, 2, "differing inputs must enqueue, not merge")
         XCTAssertEqual(
@@ -155,8 +125,8 @@ final class AppStatePermissionGateTests: XCTestCase {
         )
 
         appState.handlePeerDisconnect(sessionId: "s-parallel")
-        _ = await firstTask.value
-        _ = await secondTask.value
+        _ = try await awaitValue(of: firstTask)
+        _ = try await awaitValue(of: secondTask)
     }
 
     func testStalePermissionIsDeniedAndRemovedInsteadOfWaitingForever() async throws {

@@ -71,7 +71,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
             XCTAssertEqual(routed.raw["session_id"] as? String, parentId)
             XCTAssertEqual(routed.raw["agent_id"] as? String, childId)
             XCTAssertEqual(routed.raw["agent_type"] as? String, "cursor-subagent")
-            XCTAssertEqual(routed.raw["_cursor_subagent"] as? Bool, true)
+            XCTAssertEqual(routed.raw[SubsessionRouter.foldedKey] as? String, "cursor")
         }
     }
 
@@ -106,7 +106,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
                 "hook_event_name": "PostToolUse",
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, parentId)
-            XCTAssertEqual(routed.raw["_cursor_subagent"] as? Bool, true)
+            XCTAssertEqual(routed.raw[SubsessionRouter.foldedKey] as? String, "cursor")
         }
     }
 
@@ -153,7 +153,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
             ])
             // Ambiguous IDE process — do not guess which chat owns the Task.
             XCTAssertEqual(routed.raw["session_id"] as? String, childId)
-            XCTAssertNil(routed.raw["_cursor_subagent"])
+            XCTAssertNil(routed.raw[SubsessionRouter.foldedKey])
         }
     }
 
@@ -174,7 +174,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
             // Unique same-pid card — idle main is still a valid fold target.
             XCTAssertEqual(routed.raw["session_id"] as? String, parentId)
             XCTAssertEqual(routed.raw["agent_id"] as? String, childId)
-            XCTAssertEqual(routed.raw["_cursor_subagent"] as? Bool, true)
+            XCTAssertEqual(routed.raw[SubsessionRouter.foldedKey] as? String, "cursor")
         }
     }
 
@@ -213,7 +213,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, parentId)
             XCTAssertEqual(routed.raw["agent_id"] as? String, newTaskId)
-            XCTAssertEqual(routed.raw["_cursor_subagent"] as? Bool, true)
+            XCTAssertEqual(routed.raw[SubsessionRouter.foldedKey] as? String, "cursor")
         }
     }
 
@@ -269,7 +269,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
                 "hook_event_name": "PostToolUse",
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, childId)
-            XCTAssertNil(routed.raw["_cursor_subagent"])
+            XCTAssertNil(routed.raw[SubsessionRouter.foldedKey])
         }
     }
 
@@ -287,7 +287,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
                 "hook_event_name": "PostToolUse",
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, parentId)
-            XCTAssertEqual(routed.raw["_cursor_subagent"] as? Bool, true)
+            XCTAssertEqual(routed.raw[SubsessionRouter.foldedKey] as? String, "cursor")
         }
     }
 
@@ -338,7 +338,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
                 "hook_event_name": "PostToolUse",
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, parentId)
-            XCTAssertNil(routed.raw["_cursor_subagent"])
+            XCTAssertNil(routed.raw[SubsessionRouter.foldedKey])
         }
     }
 
@@ -364,7 +364,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, parentId)
             XCTAssertNil(routed.raw["agent_id"])
-            XCTAssertNil(routed.raw["_cursor_subagent"])
+            XCTAssertNil(routed.raw[SubsessionRouter.foldedKey])
         }
     }
 
@@ -383,7 +383,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, parentId)
             XCTAssertEqual(routed.raw["agent_id"] as? String, childId)
-            XCTAssertEqual(routed.raw["_cursor_subagent"] as? Bool, true)
+            XCTAssertEqual(routed.raw[SubsessionRouter.foldedKey] as? String, "cursor")
         }
     }
 
@@ -400,7 +400,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
                 "hook_event_name": "PostToolUse",
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, childId)
-            XCTAssertNil(routed.raw["_cursor_subagent"])
+            XCTAssertNil(routed.raw[SubsessionRouter.foldedKey])
             XCTAssertNil(routed.responseData)
         }
     }
@@ -416,7 +416,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
                 "hook_event_name": "PostToolUse",
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, childId)
-            XCTAssertNil(routed.raw["_cursor_subagent"])
+            XCTAssertNil(routed.raw[SubsessionRouter.foldedKey])
         }
     }
 
@@ -446,7 +446,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, parentId)
             XCTAssertEqual(routed.raw["agent_id"] as? String, childId)
-            XCTAssertEqual(routed.raw["_cursor_subagent"] as? Bool, true)
+            XCTAssertEqual(routed.raw[SubsessionRouter.foldedKey] as? String, "cursor")
         }
     }
 
@@ -502,7 +502,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
                 "hook_event_name": "PostToolUse",
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, childId)
-            XCTAssertNil(routed.raw["_cursor_subagent"])
+            XCTAssertNil(routed.raw[SubsessionRouter.foldedKey])
         }
     }
 
@@ -545,7 +545,7 @@ final class HookServerCursorPpidFallbackTests: XCTestCase {
                 "hook_event_name": "PostToolUse",
             ])
             XCTAssertEqual(routed.raw["session_id"] as? String, childId)
-            XCTAssertNil(routed.raw["_cursor_subagent"])
+            XCTAssertNil(routed.raw[SubsessionRouter.foldedKey])
         }
     }
 

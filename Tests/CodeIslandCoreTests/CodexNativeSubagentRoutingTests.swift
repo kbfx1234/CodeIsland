@@ -32,6 +32,37 @@ final class CodexNativeSubagentRoutingTests: XCTestCase {
         XCTAssertTrue(effects.contains(.setActiveSession(sessionId: "parent")))
     }
 
+    func testCodexChildDoesNotLendItsRolloutToAParentWithoutOne() throws {
+        // The parent's own hooks haven't named its rollout yet; the child's
+        // transcript_path is the child's rollout, and tailing it as the
+        // parent's labels the parent with the child's model and effort.
+        var parent = SessionSnapshot()
+        parent.source = "codex"
+        var sessions = ["parent": parent]
+        _ = reduceEvent(sessions: &sessions, event: try decode([
+            "hook_event_name": "PreToolUse",
+            "session_id": "parent",
+            "_source": "codex",
+            "agent_id": "child",
+            "agent_type": "worker",
+            "tool_name": "exec_command",
+            "transcript_path": "/tmp/child-rollout.jsonl",
+        ]), maxHistory: 10)
+        XCTAssertNil(sessions["parent"]?.transcriptPath)
+
+        // Claude subagent hooks carry the parent's own transcript: still used.
+        var claudeSessions = ["main": SessionSnapshot()]
+        _ = reduceEvent(sessions: &claudeSessions, event: try decode([
+            "hook_event_name": "PreToolUse",
+            "session_id": "main",
+            "agent_id": "a1",
+            "agent_type": "Explore",
+            "tool_name": "Read",
+            "transcript_path": "/tmp/main-session.jsonl",
+        ]), maxHistory: 10)
+        XCTAssertEqual(claudeSessions["main"]?.transcriptPath, "/tmp/main-session.jsonl")
+    }
+
     func testCodexSubagentPromptAndStopAreConsumedByParentSubagentState() throws {
         var parent = SessionSnapshot()
         parent.source = "codex"

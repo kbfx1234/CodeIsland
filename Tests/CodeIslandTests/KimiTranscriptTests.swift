@@ -19,7 +19,7 @@ final class KimiTranscriptTests: XCTestCase {
         ]
         try lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
 
-        let messages = AppState.readRecentFromKimiTranscript(path: path).1
+        let messages = KimiDiscovery.readRecentFromKimiTranscript(path: path).1
         // Reader keeps only the last 3 chat rows.
         XCTAssertEqual(messages.map(\.isUser), [false, true, false])
         XCTAssertEqual(messages.map(\.text), [
@@ -43,7 +43,7 @@ final class KimiTranscriptTests: XCTestCase {
         ]
         try lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
 
-        let messages = AppState.readRecentFromKimiTranscript(path: path).1
+        let messages = KimiDiscovery.readRecentFromKimiTranscript(path: path).1
         XCTAssertEqual(messages.map(\.text), ["Legacy hi", "Legacy bye"])
         XCTAssertEqual(messages.map(\.isUser), [true, false])
     }
@@ -64,7 +64,7 @@ final class KimiTranscriptTests: XCTestCase {
         ]
         try lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
 
-        let messages = AppState.readRecentFromKimiTranscript(path: path).1
+        let messages = KimiDiscovery.readRecentFromKimiTranscript(path: path).1
         XCTAssertEqual(messages.map(\.text), ["From prompt", "Reply"])
         XCTAssertEqual(messages.map(\.isUser), [true, false])
     }
@@ -84,7 +84,7 @@ final class KimiTranscriptTests: XCTestCase {
         ]
         try lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
 
-        let messages = AppState.readRecentFromKimiTranscript(path: path).1
+        let messages = KimiDiscovery.readRecentFromKimiTranscript(path: path).1
         XCTAssertEqual(messages.map(\.text), ["From prompt", "Reply"])
         XCTAssertEqual(messages.map(\.isUser), [true, false])
     }
@@ -104,7 +104,7 @@ final class KimiTranscriptTests: XCTestCase {
         ]
         try lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
 
-        let messages = AppState.readRecentFromKimiTranscript(path: path).1
+        let messages = KimiDiscovery.readRecentFromKimiTranscript(path: path).1
         XCTAssertEqual(messages.map(\.text), ["First", "Second", "Answer"])
         XCTAssertEqual(messages.map(\.isUser), [true, true, false])
     }
@@ -124,7 +124,7 @@ final class KimiTranscriptTests: XCTestCase {
         ]
         try lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
 
-        let messages = AppState.readRecentFromKimiTranscript(path: path).1
+        let messages = KimiDiscovery.readRecentFromKimiTranscript(path: path).1
         XCTAssertEqual(messages.map(\.text), ["From append", "Reply"])
         XCTAssertEqual(messages.map(\.isUser), [true, false])
     }

@@ -27,6 +27,9 @@ public struct SessionSnapshot: Sendable {
         "codybuddycn",
         "stepfun",
         "opencode",
+        // MiMo Code (Xiaomi's OpenCode 1.x fork) and the Xiaomi MiMo desktop
+        // app, which runs MiMo Code as its engine — one plugin feeds both.
+        "mimo",
         "antigravity",
         "google-antigravity",
         "workbuddy",
@@ -40,6 +43,19 @@ public struct SessionSnapshot: Sendable {
         "cline",
         "dsh",
         "zcode",
+        "aiwork",
+        "aiwork-cli",
+        "minimax",
+    ]
+
+    /// Sources whose tool/description text arrives as a rapid delta stream
+    /// (AiWork/Agentix `stream.text_delta`). MorphText swaps text immediately for
+    /// these instead of restarting its blur morph on every update, which would
+    /// otherwise leave the label permanently unreadable. Scoped deliberately:
+    /// every other source keeps the original morph behaviour.
+    public static let rapidStreamingSources: Set<String> = [
+        "aiwork",
+        "aiwork-cli",
     ]
 
     public static let ideCompletionSources: Set<String> = [
@@ -83,7 +99,14 @@ public struct SessionSnapshot: Sendable {
     ]
 
     public var status: AgentStatus = .idle
-    public var currentTool: String?
+    public var currentTool: String? {
+        didSet { if currentTool != oldValue { currentToolUseId = nil } }
+    }
+    /// The tool use (its `tool_use_id`, or its source's spelling of it) that
+    /// put up ``currentTool``, when it named one; any other change of
+    /// ``currentTool`` forgets it. A tool step finishing another tool use
+    /// leaves the running tool up (``finishesAnotherToolUse(_:)``).
+    public var currentToolUseId: String?
     public var toolDescription: String?
     public var lastActivity: Date = Date()
     public var cwd: String?
@@ -107,6 +130,9 @@ public struct SessionSnapshot: Sendable {
     public var startTime: Date = Date()
     public var lastUserPrompt: String?
     public var lastAssistantMessage: String?
+    /// Public assistant text emitted during the active Codex turn. This is
+    /// transient UI state: a new turn clears it while chat history remains.
+    public var liveCodexOutput: String?
     /// Absolute path to the JSONL transcript currently backing this session. Populated
     /// by hooks (`transcript_path` field) and by filesystem discovery, consumed by the
     /// JSONLTailer for incremental streaming of the latest assistant reply.
@@ -147,10 +173,27 @@ public struct SessionSnapshot: Sendable {
     /// Claude Agent Teams sessions), which is what used to send click-to-jump
     /// to a blank Terminal.app window.
     public var orcaWorktreeId: String?
-    public var cliPid: pid_t?            // CLI process PID (from bridge _ppid)
+    /// Claude Desktop's own id for a Code-tab session (`local_…`, from
+    /// CLAUDE_CODE_HOST_SESSION_ID) — what its `claude://code/continue` link
+    /// takes to open that exact session instead of just raising the app.
+    public var claudeDesktopSessionId: String?
+    public var cliPid: pid_t?            // CLI process PID (from bridge _ppid); this Mac's sessions only
     public var cliStartTime: Date?       // Start time of the tracked CLI PID (guards PID reuse)
+    /// A remote session's agent process id on its own host (its hooks'
+    /// `_ppid`). It names no process on this Mac, so it is never `cliPid`:
+    /// only compared with other hooks from that host (`processId(onHost:)`).
+    public var remotePid: pid_t?
+    /// UI harness (T3 Code, …) that spawned the CLI, found by walking the
+    /// ancestry of `cliPid`. Resolved off the main actor and re-read rather
+    /// than persisted: the harness may have restarted between runs. (#321)
+    public var hostHarness: HostHarness?
     public var source: String = "claude" // "claude" or "codex"
     public var interrupted: Bool = false
+    /// The last turn ended on an error (Claude Code / Grok `StopFailure`, a
+    /// failed AiWork stream or Cowork turn); the card's status reads ERROR
+    /// until the next prompt. Set when AppState announces the turn's
+    /// completion (`AttentionDecision.completion`). Transient.
+    public var lastTurnFailed: Bool = false
     /// Cline-specific: true after TaskComplete/TaskCancel until the next TaskStart/TaskResume.
     /// Cline runs hooks asynchronously (background bridge), so events from prior tools can
     /// arrive after a TaskCancel and revive the session. This flag drops those stale events.
@@ -158,14 +201,65 @@ public struct SessionSnapshot: Sendable {
     public var sessionTitle: String?
     public var sessionTitleSource: SessionTitleSource?
     public var providerSessionId: String?
+    /// The card of the session this one works for: a child session on a card
+    /// of its own (``SubsessionLink`` — a Codex subagent thread, a Cursor
+    /// Task, a pi-subagents child, …), as Agent Sub-Sessions routed it or the
+    /// child declared it (`_parent_session_id`). Its turns are part of the
+    /// parent's, so none of them rings, pops a completion card or sends a
+    /// push; approvals and questions still do. Persisted.
+    public var parentSessionId: String?
+    /// AiWork/Agentix `client_type` from `sessions.get` (e.g. `DTCoderGUI`, `AiWorkGUI`).
+    /// Prefer this over the `acp:`/`cli:` session-id prefix — modern TUI also uses `acp:`.
+    public var aiworkClientType: String?
     public var remoteHostId: String?
     public var remoteHostName: String?
+    /// Tools the user chose "Always allow … this session" for on a card whose
+    /// agent keeps no rule for it — a remote Codex, whose rules live on its
+    /// own host; a running Codex, which reads the rules and config.toml it
+    /// is given only when a session starts. Its later requests for them are
+    /// allowed without a card. Goes with the card — a SessionStart rebuilds
+    /// it — and is never persisted.
+    public var alwaysAllowedTools: Set<String> = []
+    /// The same for the Codex prefix rules an "Always" of this session saved
+    /// (the words its link named): a later command each of whose commands
+    /// starts with one of them is allowed without a card.
+    public var alwaysAllowedCommandPrefixes: Set<[String]> = []
     /// nil = unchecked, false = not YOLO, true = YOLO
     public var isYoloMode: Bool?
     /// Checked-out git branch for cwd; refreshed on cwd changes and Stop
     /// (a turn may have switched branches). nil for non-repo and remote cwds.
     public var gitBranch: String?
     public var gitIsWorktree: Bool = false
+    /// The agent's own task checklist (TaskCreate/TaskUpdate, TodoWrite,
+    /// Codex update_plan), fed by hooks here and by the transcript tailer.
+    public var agentTasks = AgentTaskList()
+    /// Claude Code's `away_summary` recap of an idle session; cleared by the
+    /// next user prompt. See ``SessionRecap``.
+    public var recap: SessionRecap?
+    /// Reasoning effort of the latest turn ("xhigh", "max", …), read from the
+    /// transcript next to the turn's model. Hooks don't report it.
+    public var reasoningEffort: String?
+    /// When a hook last reported `model`. An attach-time transcript backfill
+    /// must not replace it with a model from an older line
+    /// (`claude --resume --model X` over a transcript that ran on Y).
+    public var modelReportedAt: Date?
+    /// What the latest `/model` switch said about the 1M context variant; nil
+    /// until one is seen. Transcript lines carry only the bare API id, so this
+    /// is the one place a switch *to or from* the `[1m]` variant shows up.
+    public var configuredLongContext: Bool?
+    /// Hermes hooks reported this card's prompts (`pre_llm_call`) / replies
+    /// (`post_llm_call`) themselves. Hooks are on time where Hermes's own store
+    /// lags behind, so once they do, the store only supplies the title; see
+    /// ``applyHermesStore(_:)``. Transient, never persisted.
+    public var hermesHooksReportPrompts = false
+    public var hermesHooksReportReplies = false
+    /// The latest Hermes turn hook came from a conversation held away from
+    /// this Mac (a gateway chat, the API server; see
+    /// ``HermesHookPayload/isQuiet(_:)``). The process behind such a card is
+    /// the gateway daemon, which outlives every chat it serves, so the idle
+    /// card is swept like a hook-only one. Persisted: a restored card is
+    /// bound to the daemon again.
+    public var hermesChatElsewhere = false
 
     public init(startTime: Date = Date()) {
         self.startTime = startTime
@@ -278,6 +372,12 @@ public struct SessionSnapshot: Sendable {
             "qoderclicn": "qoder-cli",
             "qodercli-cn": "qoder-cli",
             "qoder-cn": "qoder-cli",
+            // AiWork (formerly DTCoder) — the pre-rename spelling and the
+            // no-separator CLI variants normalise onto the `aiwork*` keys.
+            "dtcoder": "aiwork",
+            "dtcoder-cli": "aiwork-cli",
+            "dtcodercli": "aiwork-cli",
+            "aiworkcli": "aiwork-cli",
             "qodercn": "qoder-cli",
             // QoderWork — Qoder's standalone desktop assistant app (not the
             // IDE); own hooks file at ~/.qoderwork/settings.json (#249).
@@ -306,6 +406,30 @@ public struct SessionSnapshot: Sendable {
             "oh my pi": "pi",
             "z-code": "zcode",
             "z code": "zcode",
+            // MiniMax Code CLI — the executable is `mcode` (npm @minimax-ai/code)
+            // and the Node runtime renames the process title to `minimax-code`,
+            // so both spellings (and the product name) normalize onto `minimax`.
+            "mcode": "minimax",
+            "minimax-code": "minimax",
+            "minimaxcode": "minimax",
+            "minimax-cli": "minimax",
+            "minimaxcli": "minimax",
+            "minimax-code-cli": "minimax",
+            // MiMo Code (`mimo` CLI, npm @mimo-ai/cli) and the Xiaomi MiMo
+            // desktop app share one source: the app's engine is MiMo Code.
+            // No prefix rule — "mimo…" is too short a stem to claim.
+            "mimocode": "mimo",
+            "mimo-code": "mimo",
+            "mimo_code": "mimo",
+            "mimo code": "mimo",
+            "mimo-cli": "mimo",
+            "mimocli": "mimo",
+            "mimo-desktop": "mimo",
+            "mimodesktop": "mimo",
+            "xiaomi-mimo": "mimo",
+            "xiaomimimo": "mimo",
+            "xiaomi mimo": "mimo",
+            "xiaomi-mimo-ai": "mimo",
         ]
         let canonical = aliases[normalized] ?? normalized
         let dynamicSupportedSources = supportedSources.union(loadCustomSources())
@@ -323,6 +447,7 @@ public struct SessionSnapshot: Sendable {
         if canonical.hasPrefix("qwen") { return "qwen" }
         if canonical.hasPrefix("kiro") { return "kiro" }
         if canonical.hasPrefix("kimi") { return "kimi" }
+        if canonical.hasPrefix("minimax") { return "minimax" }
         if canonical.hasPrefix("codybuddycn") || canonical.hasPrefix("codebuddycn") { return "codybuddycn" }
         if canonical.hasPrefix("stepfun") { return "stepfun" }
         if canonical.hasPrefix("traecn") { return "traecn" }
@@ -402,6 +527,20 @@ public struct SessionSnapshot: Sendable {
         }
     }
 
+    /// Whether a PostToolUse / PostToolUseFailure finishes a tool use other
+    /// than the one running. Remote tool steps do not wait for the island,
+    /// so over SSH a large PostToolUse(A) can arrive after the PreToolUse(B)
+    /// that came next — with parallel tool calls in particular. Only when
+    /// both name their tool use: a source that names none goes as before.
+    public func finishesAnotherToolUse(_ event: HookEvent) -> Bool {
+        Self.isStep(event, ofAnotherToolUseThan: currentToolUseId, showing: currentTool)
+    }
+
+    static func isStep(_ event: HookEvent, ofAnotherToolUseThan running: String?, showing tool: String?) -> Bool {
+        guard tool != nil, let running, let finished = event.toolUseId else { return false }
+        return finished != running
+    }
+
     /// Display name: project folder, or short session ID
     public var displayName: String {
         guard let cwd = cwd else { return "Session" }
@@ -454,6 +593,13 @@ public struct SessionSnapshot: Sendable {
     /// NSCache is thread-safe and evicts under memory pressure.
     private static let cursorLeafCache = NSCache<NSString, NSString>()
 
+    /// The stat behind that walk. Tests describe the folders they need here
+    /// instead of creating them in the user's real home — the old tests made
+    /// and then recursively deleted `~/myproject` and `~/my-sample-app`.
+    static var cursorProjectFolderExists: (String) -> Bool = { path in
+        FileManager.default.fileExists(atPath: path)
+    }
+
     static func displayNameLeafFromCursorProjectsPath(_ cwd: String) -> String? {
         if let cached = cursorLeafCache.object(forKey: cwd as NSString) {
             return cached.length == 0 ? nil : (cached as String)
@@ -484,7 +630,6 @@ public struct SessionSnapshot: Sendable {
         guard !parts.isEmpty else { return nil }
 
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let fm = FileManager.default
         // Prefer the longest leaf whose prefix reconstructs to a real directory.
         for k in stride(from: parts.count - 1, through: 0, by: -1) {
             let leaf = parts[k...].joined(separator: "-")
@@ -493,7 +638,7 @@ public struct SessionSnapshot: Sendable {
                 return leaf
             }
             let relative = parts[..<k].joined(separator: "/") + "/" + leaf
-            if fm.fileExists(atPath: "\(home)/\(relative)") {
+            if cursorProjectFolderExists("\(home)/\(relative)") {
                 return leaf
             }
         }
@@ -592,6 +737,14 @@ public struct SessionSnapshot: Sendable {
         return !remoteHostId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// The agent's process id as hooks from `host` (nil: this Mac) report
+    /// it — nil when the session runs on another machine, where the same
+    /// number is a different process.
+    public func processId(onHost host: String?) -> pid_t? {
+        guard let host else { return isRemote ? nil : cliPid }
+        return isRemote && remoteHostId == host ? remotePid : nil
+    }
+
     public var remoteDisplayName: String? {
         guard let remoteHostName else { return nil }
         let trimmed = remoteHostName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -629,7 +782,7 @@ public struct SessionSnapshot: Sendable {
         case "trae": return "Trae"
         case "traecn": return "Trae CN"
         case "traecli": return "Traecli"
-        case "qoder": return "Qoder"
+        case "qoder": return termBundleId == "com.qoder.ide" ? "Qoder IDE" : "Qoder"
         case "qoder-cli": return "Qoder CLI"
         case "qoderwork": return "QoderWork"
         case "droid": return "Factory"
@@ -637,6 +790,7 @@ public struct SessionSnapshot: Sendable {
         case "codybuddycn": return "CodyBuddyCN"
         case "stepfun": return "StepFun"
         case "opencode": return "OpenCode"
+        case "mimo": return "MiMo"
         case "antigravity": return "AntiGravity"
         case "google-antigravity": return "Google Antigravity"
         case "workbuddy": return "WorkBuddy"
@@ -649,6 +803,9 @@ public struct SessionSnapshot: Sendable {
         case "kiro": return "Kiro"
         case "cline": return "Cline"
         case "zcode": return "ZCode"
+        case "aiwork": return "AiWork"
+        case "aiwork-cli": return "AiWork CLI"
+        case "minimax": return "MiniMax Code CLI"
         default:
             if let customName = Self.loadCustomSourceNames()[source] {
                 return customName
@@ -705,7 +862,9 @@ public struct SessionSnapshot: Sendable {
     private static let appBundleNames: [String: String] = [
         "com.todesktop.230313mzl4w4u92": "Cursor",
         "com.trae.app": "Trae",
-        "com.qoder.ide": "Qoder",
+        "cn.trae.app": "Trae CN",
+        "com.qoder.ide": "Qoder IDE",
+        "com.qoder.app": "Qoder",
         "com.factory.app": "Factory",
         "com.tencent.codebuddy": "CodeBuddy",
         "com.tencent.codebuddy.cn": "CodyBuddyCN",
@@ -716,6 +875,11 @@ public struct SessionSnapshot: Sendable {
         // Claude Code Desktop (#211): local Code-tab sessions run the same engine
         // and fire the same ~/.claude/settings.json hooks as the CLI.
         "com.anthropic.claudefordesktop": "Claude",
+        "com.alipay.dtcoder.ide": "AiWork",
+        // Xiaomi MiMo desktop — mainland and overseas ("AI") editions are
+        // separate installs with their own bundle ids.
+        "com.xiaomi.mimo.desktop": "Xiaomi MiMo",
+        "com.xiaomi.mimo.desktop-ai": "Xiaomi MiMo AI",
     ]
 
     /// Maps native app bundle IDs to their expected source identifier.
@@ -723,7 +887,11 @@ public struct SessionSnapshot: Sendable {
     private static let appBundleSources: [String: String] = [
         "com.todesktop.230313mzl4w4u92": "cursor",
         "com.trae.app": "trae",
+        // Trae CN ships as its own app (`Trae CN.app`), not inside Trae.app.
+        "cn.trae.app": "traecn",
         "com.qoder.ide": "qoder",
+        // Qoder App is separate from the IDE, but shares its ~/.qoder hooks.
+        "com.qoder.app": "qoder",
         "com.factory.app": "droid",
         "com.tencent.codebuddy": "codebuddy",
         "com.tencent.codebuddy.cn": "codybuddycn",
@@ -736,6 +904,11 @@ public struct SessionSnapshot: Sendable {
         // Claude Code Desktop (#211) — hook subprocesses inherit the app's
         // __CFBundleIdentifier, so desktop Code sessions arrive tagged with it.
         "com.anthropic.claudefordesktop": "claude",
+        "com.alipay.dtcoder.ide": "aiwork",
+        // Xiaomi MiMo desktop runs MiMo Code in its own main process, so the
+        // plugin's events carry the app's __CFBundleIdentifier.
+        "com.xiaomi.mimo.desktop": "mimo",
+        "com.xiaomi.mimo.desktop-ai": "mimo",
     ]
 
     /// Source id for the native app that owns `bundleId`, if any.
@@ -791,6 +964,10 @@ public struct SessionSnapshot: Sendable {
     /// innermost layer — the one the CLI actually sits in — wins, which is the
     /// same order `HerdrController.shouldRoute` uses to decide where a jump goes.
     public var multiplexerLabel: String? {
+        // Under a harness the multiplexer vars were inherited from wherever the
+        // harness server was started; the conversation is not in that pane, so
+        // naming it would point the user at the wrong place (#321).
+        if hostHarness != nil { return nil }
         if zellijPaneId != nil || zellijSessionName != nil { return "zellij" }
         if tmuxEnv != nil || tmuxPane != nil { return "tmux" }
         if hasHerdrRoute { return "herdr" }
@@ -813,6 +990,9 @@ public struct SessionSnapshot: Sendable {
         if isRemote {
             return remoteDisplayName ?? "Remote"
         }
+        // AiWork (formerly DTCoder): badge names match Hooks settings.
+        if source == "aiwork" { return "AiWork" }
+        if source == "aiwork-cli" { return "AiWork CLI" }
         // If termBundleId is a known app, show app name (APP mode)
         if let bid = termBundleId, let name = Self.appBundleNames[bid] {
             return name
@@ -830,6 +1010,7 @@ public struct SessionSnapshot: Sendable {
             // IDE integrated terminals
             if lower.contains("vscode") || lower.contains("vscodium") { return "VS Code" }
             if lower == "com.trae.app" { return "Trae" }
+            if lower == "cn.trae.app" { return "Trae CN" }
             if lower.contains("windsurf") { return "Windsurf" }
             if lower.contains("jetbrains") {
                 if lower.contains("intellij") { return "IDEA" }
@@ -968,16 +1149,126 @@ public enum SideEffect: Equatable {
 
 // MARK: - Pure Reducer
 
-/// Pure reducer: mutates sessions, returns side effects for the caller to execute.
+/// A hook event applied to the sessions: the lifecycle effects for the
+/// caller to execute (never `.playSound` or `.enqueueCompletion`), and what
+/// the event did, for `AttentionPolicy` to decide whether the user hears
+/// about it.
+public struct HookEventReduction {
+    public var effects: [SideEffect]
+    public var facts: HookEventFacts
+    /// Where the reducer used to put `.enqueueCompletion` and `.playSound`,
+    /// for `reduceEvent` to put the policy's intents back.
+    fileprivate var slots = AttentionEffectSlots()
+}
+
+/// Indexes into a reduction's effects: where the turn ended (the completion
+/// went in) and where the event finished moving its session (the sound
+/// went in, ahead of the closing switch of the active session).
+fileprivate struct AttentionEffectSlots {
+    var completion: Int?
+    var sound: Int?
+}
+
+/// Pure reducer: mutates sessions and reports what happened. Whether that
+/// rings, pops a card, pushes or gets a follow-up is `AttentionPolicy`'s call.
+public func reduceHookEvent(
+    sessions: inout [String: SessionSnapshot],
+    event: HookEvent,
+    maxHistory: Int,
+    replyCompletePlaceholder: String = "Reply complete"
+) -> HookEventReduction {
+    var facts = HookEventFacts(event: event)
+    var slots = AttentionEffectSlots()
+    let effects = applyHookEvent(
+        sessions: &sessions,
+        event: event,
+        maxHistory: maxHistory,
+        replyCompletePlaceholder: replyCompletePlaceholder,
+        facts: &facts,
+        slots: &slots
+    )
+    if facts.endedTurn {
+        let sessionId = event.sessionId ?? "default"
+        facts.subagentTurn = PushEventClassifier.isSubagentCompletion(
+            agentId: event.agentId,
+            raw: event.rawJSON,
+            sessionId: sessionId,
+            session: sessions[sessionId]
+        )
+    }
+    return HookEventReduction(effects: effects, facts: facts, slots: slots)
+}
+
+/// The reducer followed by `AttentionPolicy`'s own reading of the event:
+/// `.enqueueCompletion` and `.playSound` are the policy's intents, before the
+/// user's settings and the room have their say. The app runs the two halves
+/// itself — ``reduceHookEvent`` now, the policy with the context it gathers
+/// once the event has settled — and this keeps an event's whole story
+/// checkable in one call, in the order the reducer always returned it.
 public func reduceEvent(
     sessions: inout [String: SessionSnapshot],
     event: HookEvent,
     maxHistory: Int,
     replyCompletePlaceholder: String = "Reply complete"
 ) -> [SideEffect] {
+    let reduction = reduceHookEvent(
+        sessions: &sessions,
+        event: event,
+        maxHistory: maxHistory,
+        replyCompletePlaceholder: replyCompletePlaceholder
+    )
+    let sessionId = event.sessionId ?? "default"
+    let intents = AttentionPolicy.intents(
+        for: .hookEvent(reduction.facts),
+        subject: AttentionSubject(sessions[sessionId])
+    )
+    // Exactly where the reducer used to put them: the sound (later in the
+    // list) first, so the completion's slot still points where it should.
+    var effects = reduction.effects
+    if let sound = intents.sound {
+        effects.insert(.playSound(sound), at: reduction.slots.sound ?? effects.count)
+    }
+    if intents.completion != nil {
+        effects.insert(.enqueueCompletion(sessionId: sessionId), at: reduction.slots.completion ?? effects.count)
+    }
+    return effects
+}
+
+/// Whether `event` is Claude Code compacting a finished session in the
+/// background. While a session sits idle, Claude Code compacts it ahead of
+/// the prompt cache expiring (about 54 minutes after the turn ended; its
+/// `idleCompaction` setting). It reports PreCompact — trigger "auto", the
+/// same as a compaction mid-turn — and no turn follows, so no Stop. Read
+/// as work, the PreCompact left a finished card on "thinking" for good, or
+/// brought one the idle sweep had removed back as "thinking". The
+/// compaction's other hooks are ``BackgroundCompactionFilter``'s, which
+/// AppState asks first. A manual /compact is the user's doing and still
+/// shows.
+public func isIdleBackgroundCompaction(_ event: HookEvent, session: SessionSnapshot?) -> Bool {
+    let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String) ?? "claude"
+    guard source == "claude" else { return false }
+    let eventName = EventNormalizer.normalize(event.eventName)
+    guard eventName == "PreCompact" || eventName == "PostCompact",
+          event.agentId == nil,
+          (event.rawJSON["trigger"] as? String) != "manual" else { return false }
+    return session == nil || session?.status == .idle
+}
+
+private func applyHookEvent(
+    sessions: inout [String: SessionSnapshot],
+    event: HookEvent,
+    maxHistory: Int,
+    replyCompletePlaceholder: String,
+    facts: inout HookEventFacts,
+    slots: inout AttentionEffectSlots
+) -> [SideEffect] {
     let sessionId = event.sessionId ?? "default"
     let eventName = EventNormalizer.normalize(event.eventName)
     var effects: [SideEffect] = []
+
+    if isIdleBackgroundCompaction(event, session: sessions[sessionId]) {
+        return effects
+    }
 
     // Ensure session exists
     if sessions[sessionId] == nil {
@@ -1008,8 +1299,33 @@ public func reduceEvent(
         return effects
     }
 
+    // Codex may flush already queued tool hooks after an Interrupt. Keep the
+    // terminal state latched until a new prompt/session starts so stale work
+    // cannot revive the card as processing.
+    //
+    // SubagentStop still passes: interrupting the root turn does not stop
+    // spawned agents, and dropping their stop would leave them in `subagents`
+    // so the next root Stop sees "active subagents" and pins the card to
+    // running/Agent. Removing a subagent never revives an idle parent.
+    if sessions[sessionId]?.source == "codex",
+       sessions[sessionId]?.interrupted == true,
+       eventName != "SessionStart",
+       eventName != "UserPromptSubmit",
+       eventName != "SessionEnd",
+       eventName != "SubagentStop",
+       eventName != "Interrupt" {
+        return effects
+    }
+
     // Route subagent-specific events
     if let agentId = event.agentId {
+        // Subagents and teammates share the parent's task list: their
+        // TaskUpdate calls move the parent's rows too. Their own creates stay
+        // off the parent card (see applySharedUpdates).
+        let sharedTaskEvents = AgentTaskHookParser.events(from: event, normalizedEventName: eventName)
+        if !sharedTaskEvents.isEmpty {
+            sessions[sessionId]?.agentTasks.applySharedUpdates(sharedTaskEvents, now: Date())
+        }
         let handled = handleSubagentEvent(
             sessions: &sessions,
             sessionId: sessionId,
@@ -1019,18 +1335,48 @@ public func reduceEvent(
             maxHistory: maxHistory,
             effects: &effects
         )
+        recordSubagentModel(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event)
+        recordFoldedSubsession(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event)
         if handled { return effects }
+    }
+
+    // Remote Codex hooks can enrich ordinary lifecycle events with the latest
+    // public assistant text because their transcript path is not readable on
+    // this Mac. Apply it only after stale/interrupted and subagent events have
+    // been filtered, and keep it separate from persisted chat history.
+    if sessions[sessionId]?.source == "codex",
+       eventName != "UserPromptSubmit",
+       eventName != "SessionStart",
+       let output = event.rawJSON["last_assistant_message"] as? String {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            sessions[sessionId]?.liveCodexOutput = trimmed
+        }
     }
 
     // Preserve actionable states: don't let activity updates overwrite waiting states
     let isWaiting = sessions[sessionId]?.status == .waitingApproval
         || sessions[sessionId]?.status == .waitingQuestion
 
+    // Agent checklist progress. Subagent tool events were consumed by
+    // handleSubagentEvent above (after their shared-list updates), so a
+    // child's own list never lands here.
+    let agentTasksBeforeEvent = sessions[sessionId]?.agentTasks
+    let agentTaskEvents = AgentTaskHookParser.events(from: event, normalizedEventName: eventName)
+    if !agentTaskEvents.isEmpty {
+        sessions[sessionId]?.agentTasks.apply(agentTaskEvents, now: Date())
+    }
+
     // Update this session's state
     switch eventName {
     case "UserPromptSubmit":
         sessions[sessionId]?.interrupted = false
+        sessions[sessionId]?.lastTurnFailed = false
         sessions[sessionId]?.taskRoundEnded = false
+        sessions[sessionId]?.clearRecapIfSuperseded(byPromptAt: Date())
+        if sessions[sessionId]?.source == "codex" {
+            sessions[sessionId]?.liveCodexOutput = nil
+        }
         sessions[sessionId]?.status = .processing
         sessions[sessionId]?.currentTool = nil
         sessions[sessionId]?.toolDescription = nil
@@ -1039,18 +1385,21 @@ public func reduceEvent(
            source == "cursor" || source == "cursor-cli" {
             sessions[sessionId]?.clearClosedSubagentId(sessionId)
         }
-        // Probe a wider set of field names + nested containers. Qwen Code (#103),
-        // Hermes (#117), and most Claude forks put the prompt at "prompt" top-level,
-        // but some forks nest it inside `input` / `data` / `payload` / `params`,
-        // and Cursor's `beforeSubmitPrompt` uses a different shape. Empty strings
-        // are skipped so we don't insert blank chat rows when a hook fires with
-        // a placeholder.
+        // Probe a wider set of field names + nested containers. Qwen Code (#103)
+        // and most Claude forks put the prompt at "prompt" top-level, but some
+        // forks nest it inside `input` / `data` / `payload` / `params`, Hermes's
+        // pre_llm_call sends `extra.user_message`, and Cursor's
+        // `beforeSubmitPrompt` uses a different shape. Empty strings are skipped
+        // so we don't insert blank chat rows when a hook fires with a placeholder.
         let prompt = firstStringFromEvent(
             event,
-            keys: ["prompt", "user_prompt", "userPrompt", "message", "input", "content", "text"],
+            keys: ["prompt", "user_prompt", "userPrompt", "user_message", "message", "input", "content", "text"],
             includeNested: true
         )
         if let prompt {
+            if sessions[sessionId]?.source == "hermes" {
+                sessions[sessionId]?.hermesHooksReportPrompts = true
+            }
             sessions[sessionId]?.lastUserPrompt = prompt
             if sessions[sessionId]?.recentMessages.last?.isUser == true {
                 sessions[sessionId]?.recentMessages.removeLast()
@@ -1060,23 +1409,24 @@ public func reduceEvent(
     case "PreToolUse":
         if !isWaiting {
             sessions[sessionId]?.status = .running
-            sessions[sessionId]?.currentTool = event.toolName
+            sessions[sessionId]?.currentTool = event.activityLabel
+            sessions[sessionId]?.currentToolUseId = event.toolUseId
             sessions[sessionId]?.toolDescription = event.toolDescription
         }
-    case "PostToolUse":
+    case "PostToolUse", "PostToolUseFailure":
+        let success = eventName == "PostToolUse"
+        if sessions[sessionId]?.finishesAnotherToolUse(event) == true {
+            // An earlier tool's step, overtaken by the next tool's start:
+            // it is recorded from its own payload, and the running tool
+            // stays up.
+            if let tool = event.activityLabel {
+                sessions[sessionId]?.recordTool(tool, description: event.toolDescription, success: success, agentType: nil, maxHistory: maxHistory)
+            }
+            break
+        }
         if let tool = sessions[sessionId]?.currentTool {
             let desc = sessions[sessionId]?.toolDescription
-            sessions[sessionId]?.recordTool(tool, description: desc, success: true, agentType: nil, maxHistory: maxHistory)
-        }
-        if !isWaiting {
-            sessions[sessionId]?.status = .processing
-            sessions[sessionId]?.currentTool = nil
-            sessions[sessionId]?.toolDescription = nil
-        }
-    case "PostToolUseFailure":
-        if let tool = sessions[sessionId]?.currentTool {
-            let desc = sessions[sessionId]?.toolDescription
-            sessions[sessionId]?.recordTool(tool, description: desc, success: false, agentType: nil, maxHistory: maxHistory)
+            sessions[sessionId]?.recordTool(tool, description: desc, success: success, agentType: nil, maxHistory: maxHistory)
         }
         if !isWaiting {
             sessions[sessionId]?.status = .processing
@@ -1130,26 +1480,40 @@ public func reduceEvent(
                 sessions[sessionId]?.status = .idle
                 sessions[sessionId]?.currentTool = nil
                 sessions[sessionId]?.toolDescription = nil
-                effects.append(.enqueueCompletion(sessionId: sessionId))
+                facts.endedTurn = true
+                slots.completion = effects.count
             }
         } else {
             sessions[sessionId]?.status = .processing
         }
     case "AgentTurnSettled":
-        // A model response just completed. Drop the tool chrome and record the
-        // reply, but do NOT enqueue a completion — a mid-turn response is
-        // followed within a second or two by the next pre_tool_call, which puts
-        // the card straight back to running. What settles the card is the idle
-        // sweep's daemon-source timeout, which only fires when nothing follows.
+        // Hermes's post_llm_call: the turn's final reply, sent just before
+        // on_session_end (Stop) ends the turn. Drop the tool chrome and record
+        // the reply; the completion belongs to the Stop that follows.
         sessions[sessionId]?.currentTool = nil
         sessions[sessionId]?.toolDescription = nil
+        // It repeats the turn's prompt. Without an approved pre_llm_call hook
+        // this is the first the card hears of it, so it goes in ahead of the reply.
+        if let prompt = firstStringFromEvent(event, keys: ["user_message"], includeNested: true),
+           prompt != sessions[sessionId]?.lastUserPrompt {
+            sessions[sessionId]?.lastUserPrompt = prompt
+            if sessions[sessionId]?.recentMessages.last?.isUser == true {
+                sessions[sessionId]?.recentMessages.removeLast()
+            }
+            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: true, text: prompt))
+        }
         if let msg = firstStringFromEvent(
             event,
             keys: ["assistant_response", "last_assistant_message", "text", "message"],
             includeNested: true
         ), !msg.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty {
+            sessions[sessionId]?.hermesHooksReportReplies = true
             sessions[sessionId]?.lastAssistantMessage = msg
-            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            // A store read can land the same reply a moment before this hook.
+            let alreadyShown = sessions[sessionId]?.recentMessages.last.map { !$0.isUser && $0.text == msg } ?? false
+            if !alreadyShown {
+                sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            }
         }
         if !isWaiting {
             sessions[sessionId]?.status = .processing
@@ -1177,11 +1541,20 @@ public func reduceEvent(
             sessions[sessionId]?.status = .idle
             sessions[sessionId]?.taskRoundEnded = true
         }
-        effects.append(.enqueueCompletion(sessionId: sessionId))
+        facts.endedTurn = true
+        slots.completion = effects.count
     case "Stop":
+        // Hermes fires on_session_end at the end of every turn. A delegate_task
+        // child or a scheduled job runs just one, so its turn ending is its
+        // card ending.
+        if HermesHookPayload.endsOneShotRun(event) {
+            effects.append(.removeSession(sessionId: sessionId))
+            return effects
+        }
         // Detect ESC/Ctrl+C interruption
         let stopReason = event.rawJSON["stop_reason"] as? String ?? ""
         let wasInterrupted = (stopReason == "user" || stopReason == "interrupted")
+            || HermesHookPayload.endsInterruptedTurn(event)
         let hasActiveSubagents = sessions[sessionId]?.subagents.values.contains {
             $0.status != .idle
         } == true
@@ -1211,7 +1584,18 @@ public func reduceEvent(
         )
         if let msg = assistantMsg {
             sessions[sessionId]?.lastAssistantMessage = msg
-            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            // Stop's last_assistant_message (Claude Code, Codex, mcode, …) is
+            // often the reply the transcript tailer already appended, and with
+            // maxCount 3 a duplicate crowds a real row off the card. Skip it
+            // only when that reply is the newest row: after a new prompt, the
+            // same text is a new answer and still lands.
+            let normalizedIncoming = JSONLTailer.normalizedCursorChatText(from: msg) ?? msg
+            let alreadyShown = sessions[sessionId]?.recentMessages.last.map {
+                !$0.isUser && (JSONLTailer.normalizedCursorChatText(from: $0.text) ?? $0.text) == normalizedIncoming
+            } ?? false
+            if !alreadyShown {
+                sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            }
         } else if sessions[sessionId]?.lastAssistantMessage == nil,
                   sessions[sessionId]?.recentMessages.last?.isUser == true {
             // No reply content from hook (e.g. CodeBuddy) -- add placeholder
@@ -1241,21 +1625,23 @@ public func reduceEvent(
             sessions[sessionId]?.status = .idle
             sessions[sessionId]?.currentTool = nil
             sessions[sessionId]?.toolDescription = nil
-            effects.append(.enqueueCompletion(sessionId: sessionId))
+            facts.endedTurn = true
+            slots.completion = effects.count
         }
     case "SessionStart":
+        // A link an AppState pass made (the split on switching to Show
+        // separately, discovery) is on the card, not in the child's hooks:
+        // the rebuild keeps it unless the hook names a parent itself.
+        let linkedParentId = sessions[sessionId]?.parentSessionId
         effects.append(.stopMonitor(sessionId: sessionId))
         sessions[sessionId] = SessionSnapshot(startTime: Date())
         // Re-apply metadata from this event (common extraction above wrote to the old session)
         if let cwd = event.rawJSON["cwd"] as? String, !cwd.isEmpty { sessions[sessionId]?.cwd = cwd }
-        if let model = event.rawJSON["model"] as? String, !model.isEmpty { sessions[sessionId]?.model = model }
-        if let ppid = event.rawJSON["_ppid"] as? Int, ppid > 0 {
-            let newPid = pid_t(ppid)
-            if sessions[sessionId]?.cliPid != newPid {
-                sessions[sessionId]?.cliPid = newPid
-                sessions[sessionId]?.cliStartTime = nil
-            }
+        if let model = hookReportedModel(event) {
+            sessions[sessionId]?.model = model
+            sessions[sessionId]?.modelReportedAt = Date()
         }
+        applyHookProcessId(into: &sessions, sessionId: sessionId, event: event)
         if let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String) {
             sessions[sessionId]?.source = source
         }
@@ -1287,20 +1673,15 @@ public func reduceEvent(
         if let weztermPane = event.rawJSON["_wezterm_pane"] as? String, !weztermPane.isEmpty {
             sessions[sessionId]?.weztermPaneId = weztermPane
         }
-        if let herdrPane = event.rawJSON["_herdr_pane_id"] as? String, !herdrPane.isEmpty {
-            sessions[sessionId]?.herdrPaneId = herdrPane
-        }
-        if let herdrSocket = event.rawJSON["_herdr_socket_path"] as? String, !herdrSocket.isEmpty {
-            sessions[sessionId]?.herdrSocketPath = herdrSocket
-        }
-        if let herdrBinary = event.rawJSON["_herdr_bin_path"] as? String, !herdrBinary.isEmpty {
-            sessions[sessionId]?.herdrBinaryPath = herdrBinary
-        }
+        applyHerdrRoute(into: &sessions, sessionId: sessionId, event: event)
         if let supersetWs = event.rawJSON["_superset_workspace_id"] as? String, !supersetWs.isEmpty {
             sessions[sessionId]?.supersetWorkspaceId = supersetWs
         }
         if let supersetPane = event.rawJSON["_superset_pane_id"] as? String, !supersetPane.isEmpty {
             sessions[sessionId]?.supersetPaneId = supersetPane
+        }
+        if let hostId = claudeDesktopSessionId(in: event) {
+            sessions[sessionId]?.claudeDesktopSessionId = hostId
         }
         if let env = event.rawJSON["_env"] as? [String: String] {
             applyEnvMetadata(into: &sessions, sessionId: sessionId, env: env)
@@ -1326,11 +1707,12 @@ public func reduceEvent(
            !sessionTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             sessions[sessionId]?.sessionTitle = sessionTitle
         }
+        sessions[sessionId]?.parentSessionId = SubsessionRouter.parentCardId(in: event.rawJSON) ?? linkedParentId
         if !isRemote {
             effects.append(.tryMonitorSession(sessionId: sessionId))
         }
     case "SessionEnd":
-        // Side effect: AppState handles pending permission deny before removal
+        // Side effect: AppState drops the session's pending requests, undecided, before removal
         effects.append(.removeSession(sessionId: sessionId))
         return effects
     case "Notification":
@@ -1363,9 +1745,45 @@ public func reduceEvent(
         }
     case "PreCompact":
         sessions[sessionId]?.status = .processing
+        if sessions[sessionId]?.source == "codex" {
+            sessions[sessionId]?.currentTool = "Compacting"
+        }
         sessions[sessionId]?.toolDescription = "Compacting context\u{2026}"
+    case "PostCompact":
+        if !isWaiting {
+            sessions[sessionId]?.status = .processing
+            sessions[sessionId]?.currentTool = nil
+            sessions[sessionId]?.toolDescription = nil
+        }
+    case "Interrupt":
+        sessions[sessionId]?.interrupted = true
+        sessions[sessionId]?.status = .idle
+        sessions[sessionId]?.currentTool = nil
+        sessions[sessionId]?.toolDescription = nil
+        facts.endedTurn = true
+        slots.completion = effects.count
     default:
         break
+    }
+
+    // A remote Hermes hook reads the session's store on its own host (there
+    // is no file to read here) and attaches what it found. Applied after the
+    // event itself, so a prompt this very hook reported wins over the store.
+    if let store = HermesSessionStore.Snapshot(payload: event.rawJSON["_hermes_store"]) {
+        sessions[sessionId]?.applyHermesStore(store)
+    }
+    // After the switch: SessionStart rebuilt the snapshot.
+    if HermesHookPayload.platform(of: event) != nil {
+        sessions[sessionId]?.hermesChatElsewhere = HermesHookPayload.isQuiet(event)
+    }
+
+    // SessionStart rebuilt the snapshot, but a resumed or compacted
+    // conversation is still working through the same checklist. /clear
+    // starts the conversation over — even when it keeps the session id — so
+    // the old checklist goes with it.
+    if eventName == "SessionStart", let agentTasksBeforeEvent,
+       (event.rawJSON["source"] as? String)?.lowercased() != "clear" {
+        sessions[sessionId]?.agentTasks = agentTasksBeforeEvent
     }
 
     sessions[sessionId]?.lastActivity = Date()
@@ -1375,12 +1793,15 @@ public func reduceEvent(
         effects.append(.tryMonitorSession(sessionId: sessionId))
     }
 
-    // Trigger sound for this event
-    effects.append(.playSound(eventName))
+    // The event reached this session's own state. Whether it rings, pops a
+    // completion card or pushes — a declared child's never do (#378), nor a
+    // Hermes gateway chat's (#364) — is AttentionPolicy's call.
+    facts.appliedToSession = true
+    slots.sound = effects.count
 
     // Switch display to the session that just had activity
     if eventName == "Stop" {
-        // Stop event: keep activeSessionId on completed session (set by enqueueCompletion)
+        // Stop event: keep activeSessionId on completed session (set when its completion card shows)
     } else if sessions[sessionId]?.status != .idle {
         effects.append(.setActiveSession(sessionId: sessionId))
     }
@@ -1457,6 +1878,11 @@ private func applyEnvMetadata(into sessions: inout [String: SessionSnapshot], se
        let worktree = env["ORCA_WORKTREE_ID"], !worktree.isEmpty {
         sessions[sessionId]?.orcaWorktreeId = worktree
     }
+    if sessions[sessionId]?.claudeDesktopSessionId == nil,
+       let host = env[ClaudeDesktopCodeSession.hostSessionEnvKey],
+       ClaudeDesktopCodeSession.isValidHostSessionId(host) {
+        sessions[sessionId]?.claudeDesktopSessionId = host
+    }
 }
 
 /// Fill identity fields on a parent card from a merged Task/subagent hook.
@@ -1467,6 +1893,18 @@ public func fillMissingParentMetadataFromSubagentEvent(
     sessionId: String,
     event: HookEvent
 ) {
+    // The host is the card's as much as the child's: a remote host's hook
+    // only ever describes a session on that host. Left out, a card that a
+    // remote subagent's hook created looked local to every check that keeps
+    // a remote session's pids, paths and terminal handles off this Mac.
+    if sessions[sessionId]?.remoteHostId == nil,
+       let remoteHostId = SubsessionRouter.remoteHostId(in: event.rawJSON) {
+        sessions[sessionId]?.remoteHostId = remoteHostId
+    }
+    if sessions[sessionId]?.remoteHostName == nil,
+       let remoteHostName = event.rawJSON["_remote_host_name"] as? String, !remoteHostName.isEmpty {
+        sessions[sessionId]?.remoteHostName = remoteHostName
+    }
     // Default SessionSnapshot.source is "claude". Upgrade when the hook carries a
     // real source so merge-first Cursor Tasks are not branded as Claude forever.
     if sessions[sessionId]?.source == "claude",
@@ -1502,32 +1940,111 @@ public func fillMissingParentMetadataFromSubagentEvent(
         }
     }
 
+    // Claude and Cursor child hooks carry the parent's transcript; a Codex
+    // child's is its own rollout. Tailing that as the parent's would label
+    // the parent with the child's model and effort.
     if sessions[sessionId]?.transcriptPath == nil,
+       !isCodexSubagentEvent(event, session: sessions[sessionId]),
        let transcriptPath = event.rawJSON["transcript_path"] as? String, !transcriptPath.isEmpty {
         sessions[sessionId]?.transcriptPath = transcriptPath
     }
 
-    if sessions[sessionId]?.cliPid == nil,
-       let ppid = event.rawJSON["_ppid"] as? Int, ppid > 0 {
-        sessions[sessionId]?.cliPid = pid_t(ppid)
-    }
+    applyHookProcessId(into: &sessions, sessionId: sessionId, event: event, fillingOnly: true)
 
-    if sessions[sessionId]?.herdrPaneId == nil,
-       let pane = event.rawJSON["_herdr_pane_id"] as? String, !pane.isEmpty {
+    applyHerdrRoute(into: &sessions, sessionId: sessionId, event: event, fillingOnly: true)
+    // A subagent runs inside the parent's CLI, so it carries the same id.
+    if sessions[sessionId]?.claudeDesktopSessionId == nil,
+       let hostId = claudeDesktopSessionId(in: event) {
+        sessions[sessionId]?.claudeDesktopSessionId = hostId
+    }
+    // A child on a card of its own whose hooks also carry an `agent_id`
+    // (Codex has sent a thread's own id as one) is still linked to its
+    // parent. A hook folded into its parent's card carries no link.
+    if sessions[sessionId]?.parentSessionId == nil,
+       let parentSessionId = SubsessionRouter.parentCardId(in: event.rawJSON) {
+        sessions[sessionId]?.parentSessionId = parentSessionId
+    }
+}
+
+/// Records the Herdr pane the hook's agent runs in (`_herdr_*`, from the
+/// pane's env). `fillingOnly` keeps what the card already has — a subagent's
+/// hook only fills gaps on its parent's card.
+///
+/// A remote hook's are never recorded: its pane belongs to the Herdr on its
+/// own host, and the binary path it names would be run on this Mac
+/// (HerdrController).
+private func applyHerdrRoute(
+    into sessions: inout [String: SessionSnapshot],
+    sessionId: String,
+    event: HookEvent,
+    fillingOnly: Bool = false
+) {
+    guard SubsessionRouter.remoteHostId(in: event.rawJSON) == nil else { return }
+    if let pane = event.rawJSON["_herdr_pane_id"] as? String, !pane.isEmpty,
+       !fillingOnly || sessions[sessionId]?.herdrPaneId == nil {
         sessions[sessionId]?.herdrPaneId = pane
     }
-    if sessions[sessionId]?.herdrSocketPath == nil,
-       let socket = event.rawJSON["_herdr_socket_path"] as? String, !socket.isEmpty {
+    if let socket = event.rawJSON["_herdr_socket_path"] as? String, !socket.isEmpty,
+       !fillingOnly || sessions[sessionId]?.herdrSocketPath == nil {
         sessions[sessionId]?.herdrSocketPath = socket
     }
-    if sessions[sessionId]?.herdrBinaryPath == nil,
-       let binary = event.rawJSON["_herdr_bin_path"] as? String, !binary.isEmpty {
+    if let binary = event.rawJSON["_herdr_bin_path"] as? String, !binary.isEmpty,
+       !fillingOnly || sessions[sessionId]?.herdrBinaryPath == nil {
         sessions[sessionId]?.herdrBinaryPath = binary
     }
 }
 
-private func shouldReopenCursorSubagentOnPrompt(event: HookEvent, session: SessionSnapshot?) -> Bool {
-    if (event.rawJSON["_cursor_subagent"] as? Bool) == true {
+/// Records the process the hook's agent runs as (`_ppid`). `fillingOnly`
+/// keeps one the card already has — a subagent's hook only fills gaps.
+///
+/// On this Mac that is the CLI the island watches (`cliPid`). A remote
+/// host's is kept apart (`remotePid`), for telling that host's sessions
+/// apart only: as `cliPid` it would have the island watch, probe and, on
+/// orphan cleanup, SIGTERM whatever process has that number here.
+private func applyHookProcessId(
+    into sessions: inout [String: SessionSnapshot],
+    sessionId: String,
+    event: HookEvent,
+    fillingOnly: Bool = false
+) {
+    guard let pid = hookProcessId(event) else { return }
+    if SubsessionRouter.remoteHostId(in: event.rawJSON) != nil {
+        if !fillingOnly || sessions[sessionId]?.remotePid == nil {
+            sessions[sessionId]?.remotePid = pid
+        }
+    } else if fillingOnly {
+        if sessions[sessionId]?.cliPid == nil {
+            sessions[sessionId]?.cliPid = pid
+        }
+    } else if sessions[sessionId]?.cliPid != pid {
+        sessions[sessionId]?.cliPid = pid
+        sessions[sessionId]?.cliStartTime = nil
+    }
+}
+
+/// The CLI process the bridge found for the hook (`_ppid`). A number past
+/// pid_t's range comes only from a malformed payload; converting it would
+/// trap.
+private func hookProcessId(_ event: HookEvent) -> pid_t? {
+    guard let ppid = event.rawJSON["_ppid"] as? Int, ppid > 0 else { return nil }
+    return pid_t(exactly: ppid)
+}
+
+/// The Claude Desktop Code-tab id the bridge forwarded from
+/// CLAUDE_CODE_HOST_SESSION_ID. Only a well-formed id is kept: it ends up in
+/// a URL on click.
+private func claudeDesktopSessionId(in event: HookEvent) -> String? {
+    guard let hostId = event.rawJSON["_claude_desktop_session"] as? String,
+          ClaudeDesktopCodeSession.isValidHostSessionId(hostId) else { return nil }
+    return hostId
+}
+
+private func shouldReopenSubagentOnPrompt(event: HookEvent, session: SessionSnapshot?) -> Bool {
+    // A child session folded into its parent's card (a Cursor Task, a Codex
+    // thread, a pi-subagents child) starts every turn with a prompt, and none
+    // sends a SubagentStart: one sent after its last Stop is a new turn of
+    // the same child.
+    if SubsessionRouter.foldedKind(of: event) != nil {
         return true
     }
     let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String)
@@ -1536,9 +2053,16 @@ private func shouldReopenCursorSubagentOnPrompt(event: HookEvent, session: Sessi
     return source == "cursor" || source == "cursor-cli"
 }
 
+/// Whether a subagent-routed event comes from Codex (native child threads).
+private func isCodexSubagentEvent(_ event: HookEvent, session: SessionSnapshot?) -> Bool {
+    let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String)
+        ?? session?.source
+    return source == "codex"
+}
+
 /// Whether folded-child prompt/response text should appear on the parent card.
 private func shouldSurfaceCursorSubagentChat(event: HookEvent, session: SessionSnapshot?) -> Bool {
-    if (event.rawJSON["_cursor_subagent"] as? Bool) == true {
+    if SubsessionRouter.foldedKind(of: event) == .cursorTask {
         return true
     }
     return CursorSubsessionRouter.isCursorFamilySource(
@@ -1581,8 +2105,9 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     // Git branch resolution is NOT done here: this reducer runs on the main
     // actor and .git probing can block on network mounts. AppState refreshes
     // it asynchronously after reduce (maybeRefreshGitBranch).
-    if let model = event.rawJSON["model"] as? String, !model.isEmpty {
+    if let model = hookReportedModel(event) {
         sessions[sessionId]?.model = model
+        sessions[sessionId]?.modelReportedAt = Date()
     }
     if let mode = event.rawJSON["permission_mode"] as? String {
         sessions[sessionId]?.permissionMode = mode
@@ -1622,13 +2147,7 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     if let env = event.rawJSON["_env"] as? [String: String] {
         applyEnvMetadata(into: &sessions, sessionId: sessionId, env: env)
     }
-    if let ppid = event.rawJSON["_ppid"] as? Int, ppid > 0 {
-        let newPid = pid_t(ppid)
-        if sessions[sessionId]?.cliPid != newPid {
-            sessions[sessionId]?.cliPid = newPid
-            sessions[sessionId]?.cliStartTime = nil
-        }
-    }
+    applyHookProcessId(into: &sessions, sessionId: sessionId, event: event)
     if let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String) {
         sessions[sessionId]?.source = source
     } else if sessions[sessionId]?.source == "claude",
@@ -1657,15 +2176,7 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     if let weztermPane = event.rawJSON["_wezterm_pane"] as? String, !weztermPane.isEmpty {
         sessions[sessionId]?.weztermPaneId = weztermPane
     }
-    if let herdrPane = event.rawJSON["_herdr_pane_id"] as? String, !herdrPane.isEmpty {
-        sessions[sessionId]?.herdrPaneId = herdrPane
-    }
-    if let herdrSocket = event.rawJSON["_herdr_socket_path"] as? String, !herdrSocket.isEmpty {
-        sessions[sessionId]?.herdrSocketPath = herdrSocket
-    }
-    if let herdrBinary = event.rawJSON["_herdr_bin_path"] as? String, !herdrBinary.isEmpty {
-        sessions[sessionId]?.herdrBinaryPath = herdrBinary
-    }
+    applyHerdrRoute(into: &sessions, sessionId: sessionId, event: event)
     // Superset workspace / pane (injected by bridge from SUPERSET_* env vars). Presence routes
     // activation to com.superset.desktop instead of the spoofed kitty TERM_PROGRAM. (#213)
     if let supersetWs = event.rawJSON["_superset_workspace_id"] as? String, !supersetWs.isEmpty {
@@ -1683,6 +2194,11 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     }
     if let orcaWorktree = event.rawJSON["_orca_worktree_id"] as? String, !orcaWorktree.isEmpty {
         sessions[sessionId]?.orcaWorktreeId = orcaWorktree
+    }
+    // Claude Desktop Code-tab session id (injected by bridge from
+    // CLAUDE_CODE_HOST_SESSION_ID).
+    if let hostId = claudeDesktopSessionId(in: event) {
+        sessions[sessionId]?.claudeDesktopSessionId = hostId
     }
     if let remoteHostId = event.rawJSON["_remote_host_id"] as? String, !remoteHostId.isEmpty {
         sessions[sessionId]?.remoteHostId = remoteHostId
@@ -1704,6 +2220,9 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     if let sessionTitle = event.rawJSON["session_title"] as? String,
        !sessionTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         sessions[sessionId]?.sessionTitle = sessionTitle
+    }
+    if let parentSessionId = SubsessionRouter.parentCardId(in: event.rawJSON) {
+        sessions[sessionId]?.parentSessionId = parentSessionId
     }
 }
 
@@ -1745,6 +2264,12 @@ private func stringFromHookJSONValue(_ value: Any?) -> String? {
     }
     let joined = texts.joined()
     return joined.isEmpty ? nil : joined
+}
+
+/// The model a hook names: top-level `model`, or Hermes's `extra.model`.
+private func hookReportedModel(_ event: HookEvent) -> String? {
+    if let model = event.rawJSON["model"] as? String, !model.isEmpty { return model }
+    return HermesHookPayload.model(in: event.rawJSON)
 }
 
 private func firstStringFromDict(_ dict: [String: Any], keys: [String]) -> String? {
@@ -1811,6 +2336,37 @@ private func ensureSubagent(
     return true
 }
 
+/// Keep a child's own `model` (Codex child threads report it on their hooks)
+/// on its SubagentState. The parent's model is never used as a stand-in —
+/// `extractMetadata` is skipped for subagent events for the same reason.
+private func recordSubagentModel(
+    sessions: inout [String: SessionSnapshot],
+    sessionId: String,
+    agentId: String,
+    event: HookEvent
+) {
+    guard sessions[sessionId]?.subagents[agentId] != nil,
+          let model = (event.rawJSON["model"] as? String)?
+              .trimmingCharacters(in: .whitespacesAndNewlines),
+          !model.isEmpty else { return }
+    sessions[sessionId]?.subagents[agentId]?.model = model
+}
+
+/// Mark the row of a child session Agent Sub-Sessions folded into this card
+/// (``SubagentState/subsessionKind``), so the child's later hooks follow it
+/// here. A row the agent's own SubagentStart rebuilt is marked again by the
+/// child's next folded hook.
+private func recordFoldedSubsession(
+    sessions: inout [String: SessionSnapshot],
+    sessionId: String,
+    agentId: String,
+    event: HookEvent
+) {
+    guard let kind = SubsessionRouter.foldedKind(of: event),
+          sessions[sessionId]?.subagents[agentId] != nil else { return }
+    sessions[sessionId]?.subagents[agentId]?.subsessionKind = kind
+}
+
 /// Handle subagent events. Returns true if the event was consumed.
 private func handleSubagentEvent(
     sessions: inout [String: SessionSnapshot],
@@ -1841,7 +2397,7 @@ private func handleSubagentEvent(
 
     case "UserPromptSubmit":
         // Cursor has no SessionStart for Tasks; beforeSubmitPrompt is the relaunch signal.
-        if shouldReopenCursorSubagentOnPrompt(event: event, session: sessions[sessionId]) {
+        if shouldReopenSubagentOnPrompt(event: event, session: sessions[sessionId]) {
             sessions[sessionId]?.clearClosedSubagentId(agentId)
         }
         guard ensureSubagent(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event) else {
@@ -1876,7 +2432,17 @@ private func handleSubagentEvent(
 
     case "SubagentStop", "Stop", "SessionEnd":
         sessions[sessionId]?.subagents.removeValue(forKey: agentId)
-        sessions[sessionId]?.recordClosedSubagentId(agentId)
+        // Codex fires SubagentStop at the end of every child *turn*, and its
+        // agent_id is the child's thread id, reused for follow-up turns sent
+        // via send_message / followup_task without a new SubagentStart. A
+        // tombstone here would drop those turns' hooks (ensureSubagent) and
+        // auto-deny their PermissionRequests (shouldSuppressClosedSubagentUI).
+        // Removing the entry is enough: Codex awaits each hook in order, so no
+        // stale tool hook can trail the stop, and the next turn's hooks
+        // recreate the entry.
+        if !(eventName == "SubagentStop" && isCodexSubagentEvent(event, session: sessions[sessionId])) {
+            sessions[sessionId]?.recordClosedSubagentId(agentId)
+        }
         // If no more subagents, revert parent to processing (waiting for main thread to continue)
         if sessions[sessionId]?.subagents.isEmpty == true {
             if sessions[sessionId]?.status == .running && sessions[sessionId]?.currentTool == "Agent" {
@@ -1893,7 +2459,8 @@ private func handleSubagentEvent(
             return true
         }
         sessions[sessionId]?.subagents[agentId]?.status = .running
-        sessions[sessionId]?.subagents[agentId]?.currentTool = event.toolName
+        sessions[sessionId]?.subagents[agentId]?.currentTool = event.activityLabel
+        sessions[sessionId]?.subagents[agentId]?.currentToolUseId = event.toolUseId
         sessions[sessionId]?.subagents[agentId]?.toolDescription = event.toolDescription
         sessions[sessionId]?.subagents[agentId]?.lastActivity = Date()
         // Keep parent session showing as active while subagents work
@@ -1907,8 +2474,17 @@ private func handleSubagentEvent(
         guard ensureSubagent(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event) else {
             return true
         }
+        let agentType = sessions[sessionId]?.subagents[agentId]?.agentType
+        if sessions[sessionId]?.subagents[agentId]?.finishesAnotherToolUse(event) == true {
+            // An earlier tool's step, overtaken by the next tool's start.
+            if let tool = event.activityLabel {
+                sessions[sessionId]?.recordTool(tool, description: event.toolDescription, success: true, agentType: agentType, maxHistory: maxHistory)
+            }
+            sessions[sessionId]?.subagents[agentId]?.lastActivity = Date()
+            sessions[sessionId]?.lastActivity = Date()
+            return true
+        }
         if let tool = sessions[sessionId]?.subagents[agentId]?.currentTool {
-            let agentType = sessions[sessionId]?.subagents[agentId]?.agentType
             let desc = sessions[sessionId]?.subagents[agentId]?.toolDescription
             sessions[sessionId]?.recordTool(tool, description: desc, success: true, agentType: agentType, maxHistory: maxHistory)
         }
@@ -1923,8 +2499,16 @@ private func handleSubagentEvent(
         guard ensureSubagent(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event) else {
             return true
         }
+        let agentType = sessions[sessionId]?.subagents[agentId]?.agentType
+        if sessions[sessionId]?.subagents[agentId]?.finishesAnotherToolUse(event) == true {
+            // An earlier tool's step, overtaken by the next tool's start.
+            if let tool = event.activityLabel {
+                sessions[sessionId]?.recordTool(tool, description: event.toolDescription, success: false, agentType: agentType, maxHistory: maxHistory)
+            }
+            sessions[sessionId]?.lastActivity = Date()
+            return true
+        }
         if let tool = sessions[sessionId]?.subagents[agentId]?.currentTool {
-            let agentType = sessions[sessionId]?.subagents[agentId]?.agentType
             let desc = sessions[sessionId]?.subagents[agentId]?.toolDescription
             sessions[sessionId]?.recordTool(tool, description: desc, success: false, agentType: agentType, maxHistory: maxHistory)
         }
@@ -1987,6 +2571,15 @@ private func handleSubagentEvent(
             && sessions[sessionId]?.status != .running {
             sessions[sessionId]?.status = .processing
             sessions[sessionId]?.subagents[agentId]?.status = .processing
+        }
+        return true
+
+    case "PreCompact", "PostCompact":
+        // A subagent compacts its own context, not the parent's: the parent
+        // card must not read "Compacting" (or leave a waiting state) for it.
+        if sessions[sessionId]?.subagents[agentId] != nil {
+            sessions[sessionId]?.subagents[agentId]?.lastActivity = Date()
+            sessions[sessionId]?.lastActivity = Date()
         }
         return true
 

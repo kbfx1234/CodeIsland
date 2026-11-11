@@ -124,7 +124,12 @@ final class AppleCompanionPublisher: NSObject, ObservableObject {
         }
     }
 
-    private func handleCommand(_ command: AppleCompanionCommandPayload) {
+    /// Internal so tests can check which commands are taken.
+    func handleCommand(_ command: AppleCompanionCommandPayload) {
+        guard !command.type.decidesForTheUser else {
+            Self.log.notice("ignored \(command.type.rawValue, privacy: .public): iPhone Buddy can't answer requests until it pairs with this Mac")
+            return
+        }
         switch command.type {
         case .requestCurrentState:
             flush(reason: "requested")

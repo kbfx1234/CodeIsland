@@ -1,5 +1,5 @@
 // CodeIsland OpenClaw plugin
-// version: v1
+// version: v2
 
 /**
  * @fileoverview CodeIsland Integration Plugin for OpenClaw (openclaw.ai).
@@ -11,6 +11,8 @@
  *
  *   - fire-and-forget status events  -> /tmp/codeisland-<uid>.sock
  *   - blocking permission questions  -> ~/.codeisland/codeisland-bridge
+ *
+ * Nothing is sent to a socket this user does not own (`socketIsOwnedByUser`).
  *
  * Loaded via openclaw.json:
  *   plugins.load.paths   += ["~/.openclaw/codeisland-plugin"]
@@ -24,7 +26,7 @@
  */
 
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { getuid } from "node:process";
@@ -48,9 +50,37 @@ interface HookCtx {
 
 // ── Socket / bridge constants ─────────────────────────────────────────────────
 
-/** Unix socket path CodeIsland listens on (user-scoped). */
+/**
+ * Unix socket path CodeIsland listens on (user-scoped). `CODEISLAND_SOCKET_PATH`
+ * overrides it, as it does for the app and for the bridge this plugin runs.
+ */
 const userId = getuid?.() ?? 0;
-const SOCKET_PATH = `/tmp/codeisland-${userId}.sock`;
+const SOCKET_PATH =
+  process.env.CODEISLAND_SOCKET_PATH || `/tmp/codeisland-${userId}.sock`;
+
+/**
+ * Whether the socket at `path` is one this user owns. The default path is a
+ * predictable name in /tmp, where any user can create a socket first: theirs
+ * would be sent every event and could answer a permission request. `lstat`,
+ * not `stat`: a symlink, even to our own socket, stays its owner's to repoint,
+ * while a socket of ours in sticky /tmp is ours alone to remove.
+ *
+ * Exported for tests, which pass their own `lstat` and `uid`; OpenClaw loads
+ * the default export only.
+ */
+export function socketIsOwnedByUser(
+  path: string,
+  lstat: (path: string) => { isSocket(): boolean; uid: number } = lstatSync,
+  uid: number | undefined = getuid?.(),
+): boolean {
+  if (uid === undefined) return false;
+  try {
+    const stat = lstat(path);
+    return stat.isSocket() && stat.uid === uid;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Bridge binary path. Used for blocking permission requests because Node's
@@ -138,6 +168,10 @@ function detectTty(): string | null {
  */
 function sendToSocket(payload: object): Promise<boolean> {
   return new Promise((resolve) => {
+    if (!socketIsOwnedByUser(SOCKET_PATH)) {
+      resolve(false);
+      return;
+    }
     try {
       const sock = connect({ path: SOCKET_PATH }, () => {
         sock.write(JSON.stringify(payload));
@@ -168,7 +202,7 @@ function sendAndWaitResponse(
   timeoutMs = 30_000,
 ): Promise<Record<string, unknown> | null> {
   return new Promise((resolve) => {
-    if (!existsSync(BRIDGE_PATH)) {
+    if (!existsSync(BRIDGE_PATH) || !socketIsOwnedByUser(SOCKET_PATH)) {
       resolve(null);
       return;
     }

@@ -71,6 +71,8 @@ public enum ESP32Protocol {
     public static let maxWorkspaceFrameBytes = 2 + maxWorkspaceNameBytes
     public static let maxMessagePreviewBytes = 16
     public static let maxMessagePreviewFrameBytes = 4 + maxMessagePreviewBytes
+    /// A preview frame carries its index and the total in one byte each.
+    public static let maxMessagePreviewSegments = 255
     public static let brightnessFrameMarker: UInt8 = 0xFE
     public static let orientationFrameMarker: UInt8 = 0xFD
     public static let workspaceFrameMarker: UInt8 = 0xFC
@@ -251,7 +253,9 @@ public enum MascotID: UInt8, CaseIterable, Sendable {
         case "droid":                                self = .droid
         case "codebuddy", "codybuddycn":             self = .codebuddy
         case "stepfun":                              self = .stepfun
-        case "opencode":                             self = .opencode
+        // MiMo Code is an OpenCode fork (and the Xiaomi MiMo desktop's
+        // engine); every firmware slot is taken, so it shares OpenCode's.
+        case "opencode", "mimo":                     self = .opencode
         case "qwen":                                 self = .qwen
         case "antigravity":                          self = .antigravity
         case "workbuddy":                            self = .workbuddy

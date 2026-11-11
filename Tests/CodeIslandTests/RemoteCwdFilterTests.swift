@@ -104,6 +104,14 @@ final class RemoteCwdFilterTests: XCTestCase {
         let host = try JSONDecoder().decode(RemoteHost.self, from: Data(legacy.utf8))
         XCTAssertEqual(host.cwdFilter, "")
         XCTAssertEqual(host.authSocket, "")
+        XCTAssertFalse(host.agentsRunAsOtherUsers, "a host saved before the setting keeps an owner-only socket")
+    }
+
+    func testAgentsRunAsOtherUsersRoundTripsThroughCodable() throws {
+        let host = RemoteHost(name: "box", host: "example.com", agentsRunAsOtherUsers: true)
+        let decoded = try JSONDecoder().decode(RemoteHost.self, from: JSONEncoder().encode(host))
+        XCTAssertTrue(decoded.agentsRunAsOtherUsers)
+        XCTAssertEqual(decoded, host)
     }
 
     func testCwdFilterRoundTripsThroughCodable() throws {

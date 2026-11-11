@@ -47,6 +47,9 @@ struct ContentView: View {
         }
         .background(Color.ciBackground.ignoresSafeArea())
         .preferredColorScheme(appearance.colorScheme)
+        // 必须是容器：普通容器上的 identifier 会下发给所有顶层子元素并覆盖它们自己的
+        // identifier（横屏 StandBy 的看板 / 分组按钮 / 滚动区都变成了 companion.root）。
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("companion.root")
     }
 }
@@ -988,6 +991,7 @@ private struct StandBySessionBoard: View {
             .scrollIndicators(.automatic)
             .accessibilityIdentifier("companion.standby.scroll")
         }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("companion.standby.board")
     }
 
@@ -1136,6 +1140,7 @@ private struct StandBySessionRow: View {
         .padding(.vertical, 8)
         .background((highlightTint ?? Color.ciForeground).opacity(highlightTint == nil ? 0.055 : 0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(highlightTint?.opacity(0.55) ?? Color.ciForeground.opacity(0.07), lineWidth: highlightTint == nil ? 1 : 1.5))
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("companion.standby.sessionRow")
     }
 

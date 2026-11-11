@@ -37,19 +37,11 @@ esac
 echo "==> Building CodeIsland ${VERSION} (${BUILD_ARCH})"
 
 cd "$REPO_ROOT"
-case "$BUILD_ARCH" in
-    universal)
-        # Build for both architectures
-        swift build -c release --arch arm64
-        swift build -c release --arch x86_64
-        ;;
-    arm64)
-        swift build -c release --arch arm64
-        ;;
-esac
-
-ARM_DIR="$BUILD_DIR/arm64-apple-macosx/release"
-X86_DIR="$BUILD_DIR/x86_64-apple-macosx/release"
+source "$REPO_ROOT/scripts/swiftpm-release.sh"
+ARM_DIR=$(swiftpm_release_build arm64)
+if [ "$BUILD_ARCH" = universal ]; then
+    X86_DIR=$(swiftpm_release_build x86_64)
+fi
 
 echo "==> Assembling .app bundle"
 
@@ -109,15 +101,10 @@ if [ ! -s "$CONTENTS_DIR/Resources/AppIcon.icns" ]; then
     fi
 fi
 
-# Copy SPM resource bundles into Contents/Resources/ — putting them at the .app
+# Copy the SPM resource bundle into Contents/Resources/ — putting it at the .app
 # root breaks Developer ID signing with "unsealed contents present in the bundle
 # root". Bundle.module already checks resourceURL, so this layout loads fine.
-for bundle in "$BUILD_DIR"/*/release/*.bundle; do
-    if [ -e "$bundle" ]; then
-        cp -R "$bundle" "$CONTENTS_DIR/Resources/"
-        break
-    fi
-done
+cp -R "$ARM_DIR/CodeIsland_CodeIsland.bundle" "$CONTENTS_DIR/Resources/"
 
 # ---------------------------------------------------------------------------
 # Embed Sparkle.framework. The default release build keeps Sparkle universal;

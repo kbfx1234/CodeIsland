@@ -140,7 +140,7 @@ expect_present \
 
 expect_present \
   "Mac handles companion question answers" \
-  'func answerCompanionQuestion(_ answer: String)' \
+  'func answerCompanionQuestion(_ answer: String' \
   "Sources/CodeIsland/AppState.swift"
 
 expect_absent \

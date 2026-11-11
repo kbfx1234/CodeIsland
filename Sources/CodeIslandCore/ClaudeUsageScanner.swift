@@ -78,6 +78,19 @@ public enum ClaudeUsageScanner {
         now: Date = Date(),
         cache: inout FileCache
     ) -> Snapshot {
+        scan(claudeHomes: [claudeHome], now: now, cache: &cache)
+    }
+
+    /// Totals across several config dirs — one per Claude account the user
+    /// registered (`ClaudeConfigPaths.allConfigDirs()`). The cache is keyed by
+    /// transcript path, so one cache serves all of them. Homes whose
+    /// `projects/` resolve to the same directory are scanned once, or a
+    /// symlinked account would count every token twice.
+    public static func scan(
+        claudeHomes: [String],
+        now: Date = Date(),
+        cache: inout FileCache
+    ) -> Snapshot {
         let fiveHoursAgo = now.addingTimeInterval(-5 * 3600)
         let midnight = Calendar.current.startOfDay(for: now)
         let sparklineStart = now.addingTimeInterval(-Double(sparklineHours) * 3600)
@@ -89,37 +102,41 @@ public enum ClaudeUsageScanner {
         var activeFiles = Set<String>()
 
         let fm = FileManager.default
-        let projectsDir = claudeHome + "/projects"
-        for project in (try? fm.contentsOfDirectory(atPath: projectsDir)) ?? [] {
-            let projectPath = projectsDir + "/" + project
-            for file in (try? fm.contentsOfDirectory(atPath: projectPath)) ?? [] {
-                guard file.hasSuffix(".jsonl") else { continue }
-                let path = projectPath + "/" + file
-                // mtime gate: untouched-since-cutoff transcripts can't contain
-                // in-window lines, so the scan stays cheap on big histories.
-                guard let attrs = try? fm.attributesOfItem(atPath: path),
-                      let mtime = attrs[.modificationDate] as? Date,
-                      mtime >= cutoff else { continue }
-                activeFiles.insert(path)
-                let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        var scannedProjectDirs = Set<String>()
+        for claudeHome in claudeHomes {
+            let projectsDir = claudeHome + "/projects"
+            guard scannedProjectDirs.insert(ExtraConfigDirs.identity(of: projectsDir)).inserted else { continue }
+            for project in (try? fm.contentsOfDirectory(atPath: projectsDir)) ?? [] {
+                let projectPath = projectsDir + "/" + project
+                for file in (try? fm.contentsOfDirectory(atPath: projectPath)) ?? [] {
+                    guard file.hasSuffix(".jsonl") else { continue }
+                    let path = projectPath + "/" + file
+                    // mtime gate: untouched-since-cutoff transcripts can't contain
+                    // in-window lines, so the scan stays cheap on big histories.
+                    guard let attrs = try? fm.attributesOfItem(atPath: path),
+                          let mtime = attrs[.modificationDate] as? Date,
+                          mtime >= cutoff else { continue }
+                    activeFiles.insert(path)
+                    let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
 
-                var entry = cache.files[path] ?? FileCache.FileEntry()
-                if size < entry.consumedBytes {
-                    // Truncated or replaced — start over.
-                    entry = FileCache.FileEntry()
-                }
-                if size > entry.consumedBytes {
-                    consumeNewLines(path: path, into: &entry)
-                }
-                entry.entries.removeAll { $0.timestamp < cutoff }
-                cache.files[path] = entry
+                    var entry = cache.files[path] ?? FileCache.FileEntry()
+                    if size < entry.consumedBytes {
+                        // Truncated or replaced — start over.
+                        entry = FileCache.FileEntry()
+                    }
+                    if size > entry.consumedBytes {
+                        consumeNewLines(path: path, into: &entry)
+                    }
+                    entry.entries.removeAll { $0.timestamp < cutoff }
+                    cache.files[path] = entry
 
-                for message in entry.entries where message.timestamp <= now {
-                    if message.timestamp >= fiveHoursAgo { last5h.add(message.usage) }
-                    if message.timestamp >= midnight { today.add(message.usage) }
-                    let hoursAgo = Int(now.timeIntervalSince(message.timestamp) / 3600)
-                    if hoursAgo >= 0 && hoursAgo < sparklineHours {
-                        hourly[sparklineHours - 1 - hoursAgo] += message.usage.outputTokens
+                    for message in entry.entries where message.timestamp <= now {
+                        if message.timestamp >= fiveHoursAgo { last5h.add(message.usage) }
+                        if message.timestamp >= midnight { today.add(message.usage) }
+                        let hoursAgo = Int(now.timeIntervalSince(message.timestamp) / 3600)
+                        if hoursAgo >= 0 && hoursAgo < sparklineHours {
+                            hourly[sparklineHours - 1 - hoursAgo] += message.usage.outputTokens
+                        }
                     }
                 }
             }

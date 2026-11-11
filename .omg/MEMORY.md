@@ -37,8 +37,8 @@ See rules:
 
 To test bridge+server pipeline end-to-end, pipe a mock payload:
 ```bash
-CODEISLAND_DEBUG=1 echo '{"hook_event_name":"PreToolUse","session_id":"test","tool_name":"Bash","tool_input":{"command":"rm -rf bar"}}' \
-  | /Users/matthewgold/.codeisland/codeisland-bridge --source gemini --event BeforeTool
+echo '{"hook_event_name":"PreToolUse","session_id":"test","tool_name":"Bash","tool_input":{"command":"rm -rf bar"}}' \
+  | CODEISLAND_DEBUG=1 /Users/matthewgold/.codeisland/codeisland-bridge --source gemini --event BeforeTool
 ```
 
 Instruct the user to run `agy` from their own interactive terminal for real tests.
