@@ -3602,13 +3602,13 @@ private struct KiroUsageFooterLine: View {
                 .font(.system(size: 9, weight: .semibold))
             Text("Kiro").fontWeight(.semibold)
             if let account {
-                Text("账户 (format(account.currentUsage))/(format(account.usageLimit)) credits")
+                Text("账户 \(format(account.currentUsage))/\(format(account.usageLimit)) credits")
                 Text("·").foregroundStyle(.white.opacity(0.25))
                 Text(String(format: "%.1f%%", account.percentageUsed))
             } else {
-                Text("本地 5h (KiroUsageScanner.formatCredits(usage.last5h.credits))")
+                Text("本地 5h \(KiroUsageScanner.formatCredits(usage.last5h.credits))")
                 Text("·").foregroundStyle(.white.opacity(0.25))
-                Text("今日 (KiroUsageScanner.formatCredits(usage.today.credits))")
+                Text("今日 \(KiroUsageScanner.formatCredits(usage.today.credits))")
             }
             Spacer(minLength: 0)
         }
