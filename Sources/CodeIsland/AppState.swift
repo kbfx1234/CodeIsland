@@ -426,6 +426,8 @@ final class AppState {
     private(set) var cursorYoloReadsInFlight: Set<String> = []
     @ObservationIgnored
     private(set) var nativeAppTurnReadsInFlight: Set<String> = []
+    @ObservationIgnored
+    private(set) var kiroTurnReadsInFlight: Set<String> = []
     /// The reads of the agents' own stores made for a known card, run off
     /// the main actor (see `SessionStoreReaders`). Inert in a test process;
     /// tests install their own.
@@ -564,7 +566,7 @@ final class AppState {
         return daemonBackedSources.contains(normalized)
     }
 
-    private func cleanupIdleSessions() {
+    func cleanupIdleSessions() {
         // 1. Verify monitored PIDs are still alive (DispatchSource can silently miss exits)
         //    Also kill orphaned processes (ppid <= 1, terminal closed but process survived).
         let sweep = processMonitor.sweep()
@@ -609,9 +611,7 @@ final class AppState {
             default: threshold = session.currentTool != nil ? 180 : 300
             }
             if elapsed > threshold {
-                sessions[key]?.status = .idle
-                sessions[key]?.currentTool = nil
-                sessions[key]?.toolDescription = nil
+                settleQuietSession(key, session)
             }
         }
         settleCoworkCards()
@@ -651,7 +651,7 @@ final class AppState {
                 continue
             }
             if elapsed > monitoredThinkingTimeout {
-                sessions[key]?.status = .idle
+                settleQuietSession(key, session)
             }
         }
 
@@ -737,6 +737,37 @@ final class AppState {
         prunePendingToolUses()
 
         refreshDerivedState()
+    }
+
+    private func settleQuietSession(_ sessionId: String, _ session: SessionSnapshot) {
+        guard session.source == "kiro", !session.isRemote,
+              session.status == .processing || session.status == .running else {
+            sessions[sessionId]?.status = .idle
+            sessions[sessionId]?.currentTool = nil
+            sessions[sessionId]?.toolDescription = nil
+            return
+        }
+
+        // Kiro may update its session store throughout a long stretch without hooks.
+        guard kiroTurnReadsInFlight.insert(sessionId).inserted else { return }
+        let read = storeReaders.kiroTurnIsActive
+        let lastActivity = session.lastActivity
+        let status = session.status
+        let pid = session.cliPid
+        Task.detached(priority: .utility) { [weak self] in
+            let isActive = read(sessionId)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.kiroTurnReadsInFlight.remove(sessionId)
+                guard !isActive, let current = self.sessions[sessionId],
+                      current.lastActivity == lastActivity, current.status == status,
+                      current.cliPid == pid else { return }
+                self.sessions[sessionId]?.status = .idle
+                self.sessions[sessionId]?.currentTool = nil
+                self.sessions[sessionId]?.toolDescription = nil
+                self.refreshDerivedState()
+            }
+        }
     }
 
     /// Settle a native app's thinking card idle once its transcript shows
@@ -1142,7 +1173,9 @@ final class AppState {
         // Primary: use PID from bridge (works for any CLI)
         if let sessionProcess = resolvedSessionProcessIdentity(for: sessionId),
            ProcessTable.isLiveProcess(sessionProcess) {
-            if backfillClaudeTerminalMetadata(sessionId: sessionId, process: sessionProcess) {
+            let claudeMetadataChanged = backfillClaudeTerminalMetadata(sessionId: sessionId, process: sessionProcess)
+            let rexMetadataChanged = backfillRexTerminalMetadata(sessionId: sessionId, process: sessionProcess)
+            if claudeMetadataChanged || rexMetadataChanged {
                 scheduleSave()
             }
             if currentMonitor == sessionProcess { return }
@@ -1155,7 +1188,9 @@ final class AppState {
 
         if let currentMonitor, ProcessTable.isLiveProcess(currentMonitor) {
             setSessionProcessIdentity(currentMonitor, for: sessionId)
-            if backfillClaudeTerminalMetadata(sessionId: sessionId, process: currentMonitor) {
+            let claudeMetadataChanged = backfillClaudeTerminalMetadata(sessionId: sessionId, process: currentMonitor)
+            let rexMetadataChanged = backfillRexTerminalMetadata(sessionId: sessionId, process: currentMonitor)
+            if claudeMetadataChanged || rexMetadataChanged {
                 scheduleSave()
             }
             return
@@ -1180,7 +1215,13 @@ final class AppState {
                     self.setSessionProcessIdentity(discoveredProcess, for: sessionId)
                 }
 
-                if self.backfillClaudeTerminalMetadata(sessionId: sessionId, process: preferredProcess) {
+                let claudeMetadataChanged = self.backfillClaudeTerminalMetadata(
+                    sessionId: sessionId, process: preferredProcess
+                )
+                let rexMetadataChanged = self.backfillRexTerminalMetadata(
+                    sessionId: sessionId, process: preferredProcess
+                )
+                if claudeMetadataChanged || rexMetadataChanged {
                     self.scheduleSave()
                 }
                 if let monitorProcess = self.processMonitor.watchedProcess(for: sessionId),
@@ -3457,6 +3498,9 @@ final class AppState {
             snapshot.herdrPaneId = p.herdrPaneId
             snapshot.herdrSocketPath = p.herdrSocketPath
             snapshot.herdrBinaryPath = p.herdrBinaryPath
+            snapshot.rexSessionId = p.rexSessionId
+            snapshot.rexBlockId = p.rexBlockId
+            snapshot.rexTerm = p.rexTerm
             snapshot.claudeDesktopSessionId = p.claudeDesktopSessionId
             snapshot.hermesChatElsewhere = p.hermesChatElsewhere ?? false
             snapshot.parentSessionId = p.parentSessionId
@@ -3791,6 +3835,9 @@ final class AppState {
                 providerSessionId: info.providerSessionId ?? info.sessionId
             )
             tryMonitorSession(info.sessionId)
+            if info.source == "kiro" {
+                maybeResolveHostHarness(for: info.sessionId)
+            }
             attachTranscriptTailerIfNeeded(sessionId: info.sessionId)
             didMutate = true
         }
@@ -3849,6 +3896,7 @@ final class AppState {
            canApplyStatus,
            session.status != .waitingApproval,
            session.status != .waitingQuestion,
+           !(info.source == "kiro" && session.status == .running),
            session.status != discoveredStatus {
             session.status = discoveredStatus
             if discoveredStatus == .idle {

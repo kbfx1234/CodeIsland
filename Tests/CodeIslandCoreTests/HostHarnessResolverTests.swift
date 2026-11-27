@@ -72,6 +72,15 @@ final class HostHarnessResolverTests: XCTestCase {
         XCTAssertNil(HostHarnessResolver.detect(ancestry: [claude(), renamedLookalike], homeDirectory: home))
     }
 
+    func testCustomDesktopUsesItsOwnBundleIdentifier() {
+        let bundleId = "com.kbfx1234.t3code.custom"
+        let backend = ProcessAncestor(pid: 501, executablePath: nil, bundleIdentifier: bundleId)
+        let harness = HostHarnessResolver.detect(ancestry: [claude(), backend], homeDirectory: home)
+
+        XCTAssertEqual(harness?.surface, .desktopApp(bundleId: bundleId))
+        XCTAssertEqual(harness?.serverPid, 501)
+    }
+
     // MARK: - Browser servers
 
     /// install.sh: `~/.local/bin/t3` symlinks into `~/.t3/runtime/versions/<v>/t3`;

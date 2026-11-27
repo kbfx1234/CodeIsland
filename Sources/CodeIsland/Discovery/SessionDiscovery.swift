@@ -169,6 +169,9 @@ enum SessionDiscovery {
         if ConfigInstaller.isEnabled(source: "grok") {
             discovered.append(contentsOf: GrokDiscovery.findActiveGrokSessions(candidatePids: candidatePids))
         }
+        if ConfigInstaller.isEnabled(source: "kiro") {
+            discovered.append(contentsOf: KiroDiscovery.activeSessions())
+        }
         if ConfigInstaller.isEnabled(source: "cline") {
             discovered.append(contentsOf: ClineDiscovery.findActiveClineSessions(candidatePids: candidatePids))
         }

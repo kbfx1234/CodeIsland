@@ -144,6 +144,9 @@ public struct SessionSnapshot: Sendable {
     public var itermSessionId: String?  // iTerm2 session ID for direct activation
     public var ttyPath: String?         // /dev/ttys00X
     public var kittyWindowId: String?   // Kitty window ID for precise focus
+    public var rexSessionId: String?    // Rex session ID (shared by its windows)
+    public var rexBlockId: String?      // Rex block/pane ID for exact focus
+    public var rexTerm: String?         // Rex terminal marker, when TERM_PROGRAM is absent
     public var tmuxPane: String?        // tmux pane identifier (%0, %1, etc.)
     public var tmuxClientTty: String?   // tmux client TTY for real terminal detection
     public var tmuxEnv: String?         // raw TMUX env var (socket info for non-default tmux server)
@@ -515,7 +518,12 @@ public struct SessionSnapshot: Sendable {
     /// that came next — with parallel tool calls in particular. Only when
     /// both name their tool use: a source that names none goes as before.
     public func finishesAnotherToolUse(_ event: HookEvent) -> Bool {
-        Self.isStep(event, ofAnotherToolUseThan: currentToolUseId, showing: currentTool)
+        // Kiro's hooks omit tool-use IDs, even for parallel tools.
+        if source == "kiro", currentToolUseId == nil, event.toolUseId == nil,
+           let currentTool, let finished = event.activityLabel {
+            return currentTool != finished
+        }
+        return Self.isStep(event, ofAnotherToolUseThan: currentToolUseId, showing: currentTool)
     }
 
     static func isStep(_ event: HookEvent, ofAnotherToolUseThan running: String?, showing tool: String?) -> Bool {
@@ -977,6 +985,7 @@ public struct SessionSnapshot: Sendable {
             if lower == "com.mitchellh.ghostty" { return "Ghostty" }
             if lower.contains("iterm2") { return "iTerm2" }
             if lower.contains("kitty") { return "Kitty" }
+            if lower == "com.superlogical.rex" || lower.contains("superlogical.rex") { return "Rex" }
             if lower.contains("alacritty") { return "Alacritty" }
             if lower.contains("wezterm") { return "WezTerm" }
             // IDE integrated terminals
@@ -1009,6 +1018,9 @@ public struct SessionSnapshot: Sendable {
         // Orca strips TERM_PROGRAM for Claude Agent Teams sessions, so its own
         // ORCA_* vars are the only label that survives every launch path (#302).
         if orcaTerminalHandle != nil || orcaWorktreeId != nil { return "Orca" }
+        // Rex's own ids survive even when TERM_PROGRAM is filtered by a hook
+        // wrapper, and are more reliable than an inherited terminal name.
+        if rexBlockId != nil || rexSessionId != nil { return "Rex" }
         // Fallback to TERM_PROGRAM
         guard let app = termApp else { return nil }
         let lower = app.lowercased()
@@ -1018,6 +1030,7 @@ public struct SessionSnapshot: Sendable {
         if lower.contains("warp") { return "Warp" }
         if lower.contains("alacritty") { return "Alacritty" }
         if lower.contains("kitty") { return "Kitty" }
+        if lower == "rex" || (lower.contains("rex") && rexSessionId != nil) { return "Rex" }
         if lower.contains("terminal") { return "Terminal" }
         return app
     }
@@ -1622,6 +1635,15 @@ private func applyHookEvent(
         if let ses = event.rawJSON["_iterm_session"] as? String, !ses.isEmpty { sessions[sessionId]?.itermSessionId = ses }
         if let tty = event.rawJSON["_tty"] as? String, !tty.isEmpty { sessions[sessionId]?.ttyPath = tty }
         if let kitty = event.rawJSON["_kitty_window"] as? String, !kitty.isEmpty { sessions[sessionId]?.kittyWindowId = kitty }
+        if let rexSession = event.rawJSON["_rex_session"] as? String, !rexSession.isEmpty {
+            sessions[sessionId]?.rexSessionId = rexSession
+        }
+        if let rexBlock = event.rawJSON["_rex_block"] as? String, !rexBlock.isEmpty {
+            sessions[sessionId]?.rexBlockId = rexBlock
+        }
+        if let rexTerm = event.rawJSON["_rex_term"] as? String, !rexTerm.isEmpty {
+            sessions[sessionId]?.rexTerm = rexTerm
+        }
         if let pane = event.rawJSON["_tmux_pane"] as? String, !pane.isEmpty { sessions[sessionId]?.tmuxPane = pane }
         if let tmuxTty = event.rawJSON["_tmux_client_tty"] as? String, !tmuxTty.isEmpty { sessions[sessionId]?.tmuxClientTty = tmuxTty }
         if let tmux = event.rawJSON["_tmux"] as? String, !tmux.isEmpty { sessions[sessionId]?.tmuxEnv = tmux }
@@ -1805,6 +1827,18 @@ private func applyEnvMetadata(into sessions: inout [String: SessionSnapshot], se
     if sessions[sessionId]?.kittyWindowId == nil,
        let kitty = env["KITTY_WINDOW_ID"], !kitty.isEmpty {
         sessions[sessionId]?.kittyWindowId = kitty
+    }
+    if sessions[sessionId]?.rexSessionId == nil,
+       let rexSession = env["REX_SESSION"], !rexSession.isEmpty {
+        sessions[sessionId]?.rexSessionId = rexSession
+    }
+    if sessions[sessionId]?.rexBlockId == nil,
+       let rexBlock = env["REX_BLOCK"], !rexBlock.isEmpty {
+        sessions[sessionId]?.rexBlockId = rexBlock
+    }
+    if sessions[sessionId]?.rexTerm == nil,
+       let rexTerm = env["REX_TERM"], !rexTerm.isEmpty {
+        sessions[sessionId]?.rexTerm = rexTerm
     }
     if sessions[sessionId]?.tmuxEnv == nil,
        let tmux = env["TMUX"], !tmux.isEmpty {
@@ -2102,6 +2136,15 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     // Extended terminal info (from native bridge binary)
     if let kitty = event.rawJSON["_kitty_window"] as? String, !kitty.isEmpty {
         sessions[sessionId]?.kittyWindowId = kitty
+    }
+    if let rexSession = event.rawJSON["_rex_session"] as? String, !rexSession.isEmpty {
+        sessions[sessionId]?.rexSessionId = rexSession
+    }
+    if let rexBlock = event.rawJSON["_rex_block"] as? String, !rexBlock.isEmpty {
+        sessions[sessionId]?.rexBlockId = rexBlock
+    }
+    if let rexTerm = event.rawJSON["_rex_term"] as? String, !rexTerm.isEmpty {
+        sessions[sessionId]?.rexTerm = rexTerm
     }
     if let pane = event.rawJSON["_tmux_pane"] as? String, !pane.isEmpty {
         sessions[sessionId]?.tmuxPane = pane

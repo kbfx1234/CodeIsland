@@ -108,6 +108,44 @@ final class MultiplexerEnvCaptureTests: XCTestCase {
         XCTAssertEqual(sessions["sess-kaku"]?.termBundleId, "fun.tw93.kaku")
     }
 
+    // MARK: - Rex
+
+    func testSessionStartCapturesRexSessionAndBlock() {
+        let event = makeEvent([
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-rex",
+            "_term_app": "rex",
+            "_rex_session": "session:one",
+            "_rex_block": "block:two",
+        ])
+
+        var sessions: [String: SessionSnapshot] = [:]
+        _ = reduceEvent(sessions: &sessions, event: event, maxHistory: 100)
+
+        XCTAssertEqual(sessions["sess-rex"]?.rexSessionId, "session:one")
+        XCTAssertEqual(sessions["sess-rex"]?.rexBlockId, "block:two")
+        XCTAssertEqual(sessions["sess-rex"]?.terminalName, "Rex")
+    }
+
+    func testRexIdentifiersArriveFromEnvironmentObject() {
+        let event = makeEvent([
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-rex-env",
+            "_env": [
+                "REX_SESSION": "session:env",
+                "REX_BLOCK": "block:env",
+                "REX_TERM": "1",
+            ],
+        ])
+
+        var sessions: [String: SessionSnapshot] = ["sess-rex-env": SessionSnapshot()]
+        _ = reduceEvent(sessions: &sessions, event: event, maxHistory: 100)
+
+        XCTAssertEqual(sessions["sess-rex-env"]?.rexSessionId, "session:env")
+        XCTAssertEqual(sessions["sess-rex-env"]?.rexBlockId, "block:env")
+        XCTAssertEqual(sessions["sess-rex-env"]?.rexTerm, "1")
+    }
+
     // MARK: - Superset (#213)
 
     func testSessionStartCapturesSupersetWorkspaceAndPane() {

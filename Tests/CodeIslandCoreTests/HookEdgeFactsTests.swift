@@ -219,6 +219,26 @@ final class HookEdgeFactsTests: XCTestCase {
         XCTAssertNil(intake.payload["_remote_host_id"])
     }
 
+    func testRexEnvironmentIsForwardedForExactBlockRouting() throws {
+        var intake = try XCTUnwrap(HookIntake(
+            stdin: ["hook_event_name": "Stop", "session_id": "rex-event"],
+            facts: HookIntake.Facts(
+                environment: [
+                    "TERM_PROGRAM": "rex",
+                    "REX_SESSION": "session:one",
+                    "REX_BLOCK": "block:two",
+                    "REX_TERM": "1",
+                ],
+                parentPID: 4242
+            )
+        ))
+        intake.addTerminalContext()
+
+        XCTAssertEqual(intake.payload["_rex_session"] as? String, "session:one")
+        XCTAssertEqual(intake.payload["_rex_block"] as? String, "block:two")
+        XCTAssertEqual(intake.payload["_rex_term"] as? String, "1")
+    }
+
     func testRemoteHookWithoutSessionIsDropped() throws {
         let delivery = HookEdgeFacts.delivery(
             in: ["hook_event_name": "Stop", "_edge": remoteEdge(source: "codex")]

@@ -33,6 +33,45 @@ final class T3CodeHarnessSupportTests: XCTestCase {
         XCTAssertNil(result.harness)
     }
 
+    @MainActor
+    func testQuietKiroTurnStaysActiveUntilStop() async throws {
+        let appState = AppState()
+        let t3Id = "t3-kiro"
+        let rexId = "rex-kiro"
+        appState.storeReaders.kiroTurnIsActive = { $0 == t3Id || $0 == rexId }
+        func send(_ name: String, sessionId: String) throws {
+            appState.handleEvent(try XCTUnwrap(HookEvent(json: [
+                "hook_event_name": name,
+                "session_id": sessionId,
+                "_source": "kiro",
+                "_ppid": getpid(),
+                "cwd": "/tmp",
+                "prompt": "Run the build",
+            ])))
+        }
+
+        try send("UserPromptSubmit", sessionId: t3Id)
+        try send("UserPromptSubmit", sessionId: rexId)
+        try send("UserPromptSubmit", sessionId: "terminal-kiro")
+        appState.sessions[t3Id]?.hostHarness = harness()
+        let eightMinutesAgo = Date().addingTimeInterval(-480)
+        appState.sessions[t3Id]?.lastActivity = eightMinutesAgo
+        appState.sessions[rexId]?.lastActivity = eightMinutesAgo
+        appState.sessions["terminal-kiro"]?.lastActivity = eightMinutesAgo
+
+        appState.cleanupIdleSessions()
+        await waitUntil { appState.kiroTurnReadsInFlight.isEmpty }
+
+        XCTAssertEqual(appState.sessions[t3Id].map(SessionCardStatus.init), .thinking)
+        XCTAssertEqual(appState.sessions[rexId].map(SessionCardStatus.init), .thinking)
+        XCTAssertEqual(appState.sessions["terminal-kiro"].map(SessionCardStatus.init), .done)
+
+        try send("Stop", sessionId: t3Id)
+        try send("Stop", sessionId: rexId)
+        XCTAssertEqual(appState.sessions[t3Id].map(SessionCardStatus.init), .done)
+        XCTAssertEqual(appState.sessions[rexId].map(SessionCardStatus.init), .done)
+    }
+
     // MARK: - Thread lookup
 
     private func makeStateDatabase(rows: [(threadId: String, provider: String, cursor: String)]) throws {

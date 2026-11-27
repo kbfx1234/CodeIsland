@@ -122,6 +122,12 @@ struct TerminalVisibilityDetector {
             return isWarpSessionTabActive(session)
         }
 
+        if session.rexBlockId?.isEmpty == false || session.rexSessionId?.isEmpty == false
+            || session.termBundleId?.lowercased() == "com.superlogical.rex"
+            || session.termApp?.lowercased() == "rex" {
+            return frontBundleId == "com.superlogical.rex"
+        }
+
         if let termBundleId = session.termBundleId?.lowercased(),
            !termBundleId.isEmpty {
             // Bundle ID is known — match exclusively by bundle ID, don't fall through
@@ -170,6 +176,10 @@ struct TerminalVisibilityDetector {
         // for any app-level "do not disturb while focused" heuristic.
         if session.isIDETerminal {
             return true
+        }
+
+        if session.rexBlockId?.isEmpty == false {
+            return isRexBlockActive(session)
         }
 
         // Zellij multiplexer takes priority: it nests inside another terminal, so its pane
@@ -550,6 +560,26 @@ struct TerminalVisibilityDetector {
     /// visible", which shows the notification rather than swallowing it.
     private static func runAppleScriptSync(_ source: String) -> String? {
         AppleScriptRunner.current.evaluate(source, 5)
+    }
+
+    /// Rex's app client exposes the active window and focused block through
+    /// `session inspect`; this is the same identity that `block focus` uses.
+    private static func isRexBlockActive(_ session: SessionSnapshot) -> Bool {
+        guard let blockId = session.rexBlockId,
+              !blockId.isEmpty,
+              let sessionId = session.rexSessionId,
+              !sessionId.isEmpty,
+              let rex = TerminalActivator.rexBinaryPath(),
+              let data = runProcess(rex, args: ["session", "inspect", sessionId, "--json"]),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let activeWindowId = object["active_window_id"] as? String,
+              let windows = object["windows"] as? [[String: Any]] else {
+            return false
+        }
+        return windows.contains { window in
+            window["window_id"] as? String == activeWindowId
+                && window["focused_block_id"] as? String == blockId
+        }
     }
 
     private static func findBinary(_ name: String, extraPaths: [String] = []) -> String? {

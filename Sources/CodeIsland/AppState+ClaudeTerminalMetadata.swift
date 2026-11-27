@@ -3,6 +3,47 @@ import Darwin
 import CodeIslandCore
 
 extension AppState {
+    /// Recover Rex's stable session/block identifiers for a live process when
+    /// the card predates the bridge fields. A Rex session can contain several
+    /// blocks, so the block id is the part that makes click-to-jump precise.
+    @discardableResult
+    func backfillRexTerminalMetadata(
+        sessionId: String,
+        process: ProcessIdentity,
+        readEnvironment: (pid_t) -> [String: String]? = AppState.rexTerminalEnvironment
+    ) -> Bool {
+        guard var session = sessions[sessionId], !session.isRemote,
+              session.cliPid == process.pid, session.cliStartTime == process.startTime,
+              session.rexBlockId == nil,
+              ProcessTable.isLiveProcess(process) else { return false }
+        guard let environment = readEnvironment(process.pid),
+              ProcessTable.isLiveProcess(process) else { return false }
+
+        var changed = false
+        func fill(_ field: WritableKeyPath<SessionSnapshot, String?>, _ value: String?) {
+            guard session[keyPath: field] == nil, let value, !value.isEmpty else { return }
+            session[keyPath: field] = value
+            changed = true
+        }
+        fill(\.rexSessionId, environment["REX_SESSION"])
+        fill(\.rexBlockId, environment["REX_BLOCK"])
+        fill(\.rexTerm, environment["REX_TERM"])
+        if changed { sessions[sessionId] = session }
+        return changed
+    }
+
+    nonisolated static func rexTerminalEnvironment(for pid: pid_t) -> [String: String]? {
+        var mib = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 else { return nil }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 else { return nil }
+        return ProcArgsParser.completeEnvironment(
+            Array(buffer.prefix(size)),
+            keys: ["REX_SESSION", "REX_BLOCK", "REX_TERM"]
+        )
+    }
+
     /// Recover metadata for a locally discovered Claude process whose hooks have
     /// not supplied terminal information yet. Use its own environment, never the
     /// CodeIsland process environment or a different process with the same CWD.

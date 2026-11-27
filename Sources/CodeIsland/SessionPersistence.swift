@@ -59,6 +59,11 @@ struct PersistedSession: Codable {
     /// The session a child card works for (`SessionSnapshot.parentSessionId`),
     /// so a restored child still never rings for its own turns.
     var parentSessionId: String? = nil
+    /// Rex session/block identifiers, so a restored card can still focus the
+    /// exact pane when several conversations share one Rex session.
+    var rexSessionId: String? = nil
+    var rexBlockId: String? = nil
+    var rexTerm: String? = nil
 }
 
 enum SessionPersistence {
@@ -157,7 +162,10 @@ enum SessionPersistence {
                 reasoningEffort: s.reasoningEffort,
                 claudeDesktopSessionId: s.claudeDesktopSessionId,
                 hermesChatElsewhere: s.hermesChatElsewhere ? true : nil,
-                parentSessionId: s.parentSessionId
+                parentSessionId: s.parentSessionId,
+                rexSessionId: s.rexSessionId,
+                rexBlockId: s.rexBlockId,
+                rexTerm: s.rexTerm
             )
         }
         do {

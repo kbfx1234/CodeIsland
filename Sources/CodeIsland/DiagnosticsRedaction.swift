@@ -196,7 +196,7 @@ enum DiagnosticsRedaction {
         "sessionId", "cwd", "source", "model", "sessionTitleSource", "providerSessionId",
         "termApp", "itermSessionId", "ttyPath", "kittyWindowId", "tmuxPane", "tmuxClientTty", "tmuxEnv",
         "termBundleId", "cmuxSurfaceId", "cmuxWorkspaceId", "zellijPaneId", "zellijSessionName",
-        "weztermPaneId", "herdrPaneId", "herdrSocketPath", "herdrBinaryPath", "cliPid", "cliStartTime",
+        "weztermPaneId", "rexSessionId", "rexBlockId", "rexTerm", "herdrPaneId", "herdrSocketPath", "herdrBinaryPath", "cliPid", "cliStartTime",
         "startTime", "lastActivity", "transcriptPath", "closedSubagentIds", "reasoningEffort",
         "claudeDesktopSessionId", "hermesChatElsewhere", "parentSessionId",
     ]

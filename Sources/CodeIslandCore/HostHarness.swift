@@ -98,6 +98,7 @@ public enum HostHarnessResolver {
     /// change the product name, never the id — which is why the bundle id is
     /// matched instead of the `.app` name.
     public static let t3DesktopBundleId = "com.t3tools.t3code"
+    private static let t3CustomDesktopBundleId = "com.kbfx1234.t3code.custom"
 
     /// Deepest ancestry walk worth doing. T3 spawns agents directly (no shell),
     /// so the server is normally the parent; a handful of hops covers a shell
@@ -126,10 +127,12 @@ public enum HostHarnessResolver {
         // the app's bundle id. Helpers (`com.t3tools.t3code.helper`) never
         // spawn agents but are harmless to accept.
         if let bid = ancestor.bundleIdentifier?.lowercased(),
-           bid == t3DesktopBundleId || bid.hasPrefix(t3DesktopBundleId + ".") {
+           let desktopBundleId = [t3DesktopBundleId, t3CustomDesktopBundleId].first(where: {
+               bid == $0 || bid.hasPrefix($0 + ".")
+           }) {
             return HostHarness(
                 kind: .t3Code,
-                surface: .desktopApp(bundleId: t3DesktopBundleId),
+                surface: .desktopApp(bundleId: desktopBundleId),
                 serverPid: ancestor.pid
             )
         }

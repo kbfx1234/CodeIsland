@@ -149,6 +149,7 @@ public struct HookIntake {
         "GROK_SESSION_ID", "GROK_HOOK_EVENT", "GROK_WORKSPACE_ROOT", "GROK_HOME",
         "HERMES_HOME",
         "TERM_PROGRAM", "__CFBundleIdentifier", "ITERM_SESSION_ID", "KITTY_WINDOW_ID",
+        "REX_SESSION", "REX_BLOCK", "REX_TERM",
         "TMUX", "TMUX_PANE",
         "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID",
         "ZELLIJ", "ZELLIJ_PANE_ID", "ZELLIJ_SESSION_NAME",
@@ -557,6 +558,19 @@ public struct HookIntake {
         // Kitty window
         if let kitty = env["KITTY_WINDOW_ID"], !kitty.isEmpty {
             json["_kitty_window"] = kitty
+        }
+
+        // Rex exposes stable session and block identifiers for every terminal.
+        // The session is shared by several tabs, so the block is required for
+        // click-to-jump to reach the exact conversation pane.
+        if let rexSession = env["REX_SESSION"], !rexSession.isEmpty {
+            json["_rex_session"] = rexSession
+        }
+        if let rexBlock = env["REX_BLOCK"], !rexBlock.isEmpty {
+            json["_rex_block"] = rexBlock
+        }
+        if let rexTerm = env["REX_TERM"], !rexTerm.isEmpty {
+            json["_rex_term"] = rexTerm
         }
 
         // tmux detection — deep info collection

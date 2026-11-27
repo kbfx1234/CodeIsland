@@ -23,6 +23,8 @@ struct SessionStoreReaders: Sendable {
     var model: @Sendable (_ sessionId: String, _ session: SessionSnapshot) -> String?
     /// When a native app's card last finished a turn, by its transcript.
     var nativeAppFinishedTurn: @Sendable (_ sessionId: String, _ session: SessionSnapshot) -> Date?
+    /// Whether Kiro's live session record still has a turn in progress.
+    var kiroTurnIsActive: @Sendable (_ sessionId: String) -> Bool
     /// Whether Cursor's settings turn YOLO mode on.
     var cursorYoloMode: @Sendable () -> Bool
 
@@ -30,6 +32,7 @@ struct SessionStoreReaders: Sendable {
         title: { SessionTitleStore.title(for: $0.sessionId, provider: $0.provider, cwd: $0.cwd) },
         model: { SessionDiscovery.readModelForSession(sessionId: $0, session: $1) },
         nativeAppFinishedTurn: { SessionDiscovery.nativeAppFinishedTurnTimestamp(sessionId: $0, session: $1) },
+        kiroTurnIsActive: { !KiroDiscovery.activeSessions(sessionId: $0).isEmpty },
         cursorYoloMode: { CursorDiscovery.detectCursorYoloMode() }
     )
 
@@ -38,6 +41,7 @@ struct SessionStoreReaders: Sendable {
         title: { _ in nil },
         model: { _, _ in nil },
         nativeAppFinishedTurn: { _, _ in nil },
+        kiroTurnIsActive: { _ in false },
         cursorYoloMode: { false }
     )
 

@@ -10,6 +10,7 @@ struct TerminalActivator {
     // matching sourceToNativeAppBundleId's visibility. See TeraxSupportTests.
     static let knownTerminals: [(name: String, bundleId: String)] = [
         ("cmux", "com.cmuxterm.app"),
+        ("Rex", "com.superlogical.rex"),
         ("Ghostty", "com.mitchellh.ghostty"),
         ("iTerm2", "com.googlecode.iterm2"),
         ("WezTerm", "com.github.wez.wezterm"),
@@ -251,6 +252,19 @@ struct TerminalActivator {
                 NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == bid })
             })
             activateByBundleId(runningBundle ?? "com.superset.desktop")
+            return
+        }
+
+        // Rex owns multiple terminal blocks inside one session. The session id
+        // alone only selects the tab group; focus the recorded block so two
+        // conversations in the same Rex session remain distinguishable.
+        if let rexBlock = session.rexBlockId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rexBlock.isEmpty {
+            activateRex(session: session, blockId: rexBlock)
+            return
+        }
+        if session.termBundleId?.lowercased() == "com.superlogical.rex" || lower == "rex" {
+            activateByBundleId("com.superlogical.rex")
             return
         }
 
@@ -1565,6 +1579,48 @@ struct TerminalActivator {
             }
             _ = runProcess(cmuxBin, args: args)
         }
+    }
+
+    // MARK: - Rex (CLI: focus the exact block inside a session)
+
+    /// Rex sessions are workspaces containing several windows and blocks. Its
+    /// CLI's `block focus` command raises the Rex app and focuses the exact
+    /// block, while `-s` prevents an ID from another session being accepted.
+    private static func activateRex(session: SessionSnapshot, blockId: String) {
+        activateByBundleId("com.superlogical.rex")
+        guard let rex = rexBinaryPath() else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            var args = ["block", "focus", blockId]
+            if let sessionId = session.rexSessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !sessionId.isEmpty {
+                args += ["--session", sessionId]
+            }
+            _ = runProcess(rex, args: args)
+        }
+    }
+
+    /// Resolve the Rex server CLI shipped with the app. Rex does not always
+    /// put this helper on CodeIsland's PATH, especially when CodeIsland was
+    /// launched from Finder, so include the app's stable locations as well.
+    static func rexBinaryPath(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileExists: (String) -> Bool = FileManager.default.isExecutableFile(atPath:)
+    ) -> String? {
+        var candidates: [String] = []
+        if let binDir = environment["REX_BIN_DIR"], !binDir.isEmpty {
+            candidates.append((binDir as NSString).appendingPathComponent("rex"))
+        }
+        candidates += [
+            NSHomeDirectory() + "/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/Rex Server.app/Contents/MacOS/rex",
+            "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex",
+            "/Applications/Rex.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex",
+            "/opt/homebrew/bin/rex",
+            "/usr/local/bin/rex",
+            NSHomeDirectory() + "/.local/bin/rex",
+        ]
+        var seen = Set<String>()
+        return candidates.first { seen.insert($0).inserted && fileExists($0) }
     }
 
     // MARK: - Warp (SQLite pane lookup + optional tab keystroke)

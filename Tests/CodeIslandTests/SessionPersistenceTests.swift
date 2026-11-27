@@ -273,7 +273,10 @@ final class SessionPersistenceTests: XCTestCase {
             startTime: startTime,
             lastActivity: startTime,
             transcriptPath: nil,
-            closedSubagentIds: nil
+            closedSubagentIds: nil,
+            rexSessionId: "session:rex",
+            rexBlockId: "block:rex",
+            rexTerm: "1"
         )
 
         let data = try JSONEncoder().encode(session)
@@ -282,6 +285,9 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertEqual(decoded.herdrPaneId, "w1:p2")
         XCTAssertEqual(decoded.herdrSocketPath, "/tmp/herdr.sock")
         XCTAssertEqual(decoded.herdrBinaryPath, "/opt/homebrew/bin/herdr")
+        XCTAssertEqual(decoded.rexSessionId, "session:rex")
+        XCTAssertEqual(decoded.rexBlockId, "block:rex")
+        XCTAssertEqual(decoded.rexTerm, "1")
     }
 
     /// A file written by a newer version, read back after a downgrade: one

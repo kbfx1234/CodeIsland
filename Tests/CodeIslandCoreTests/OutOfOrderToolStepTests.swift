@@ -14,7 +14,8 @@ final class OutOfOrderToolStepTests: XCTestCase {
         tool: String,
         id: String?,
         command: String,
-        agent: String? = nil
+        agent: String? = nil,
+        source: String? = nil
     ) -> HookEvent {
         var json: [String: Any] = [
             "hook_event_name": name,
@@ -24,6 +25,7 @@ final class OutOfOrderToolStepTests: XCTestCase {
         ]
         if let id { json["tool_use_id"] = id }
         if let agent { json["agent_id"] = agent }
+        if let source { json["_source"] = source }
         return HookEvent(json: json)!
     }
 
@@ -78,6 +80,21 @@ final class OutOfOrderToolStepTests: XCTestCase {
         XCTAssertEqual(sessions["s1"]?.status, .processing)
         XCTAssertNil(sessions["s1"]?.currentTool)
         XCTAssertEqual(sessions["s1"]?.toolHistory.map(\.tool), ["Read"])
+    }
+
+    func testKiroPostWithoutIdPreservesADifferentRunningTool() {
+        reduce(
+            step("PreToolUse", tool: "fs_write", id: nil, command: "write", source: "kiro"),
+            step("PreToolUse", tool: "execute_bash", id: nil, command: "make test", source: "kiro"),
+            step("PostToolUse", tool: "fs_write", id: nil, command: "write", source: "kiro")
+        )
+        XCTAssertEqual(sessions["s1"]?.status, .running)
+        XCTAssertEqual(sessions["s1"]?.currentTool, "execute_bash")
+        XCTAssertEqual(sessions["s1"]?.toolHistory.map(\.tool), ["fs_write"])
+
+        reduce(step("PostToolUse", tool: "execute_bash", id: nil, command: "make test", source: "kiro"))
+        XCTAssertEqual(sessions["s1"]?.status, .processing)
+        XCTAssertNil(sessions["s1"]?.currentTool)
     }
 
     /// Only one side naming its tool use is not enough to tell them apart.
