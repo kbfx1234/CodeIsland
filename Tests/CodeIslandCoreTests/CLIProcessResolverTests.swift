@@ -123,6 +123,17 @@ final class CLIProcessResolverTests: XCTestCase {
         }
     }
 
+    func testAperitifStartsTheDesktopAppServer() {
+        let helper = ProcessAncestor(
+            pid: 850,
+            executablePath: "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/158.0.8127.89/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)",
+            bundleIdentifier: "com.openai.codex"
+        )
+        let ancestry = [bundledCodex(desktopArguments), helper]
+        XCTAssertEqual(CLIProcessResolver.codexDesktopTermBundle(ancestry: ancestry), "com.openai.codex")
+        XCTAssertEqual(CLIProcessResolver.codexBundledProcessRole(ancestry: ancestry), .desktopHost)
+    }
+
     func testAppServerLaunchedByBundledToolIsNotDesktopHost() {
         let broker = ProcessAncestor(
             pid: 850,

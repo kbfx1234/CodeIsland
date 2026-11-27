@@ -261,10 +261,9 @@ public enum CLIProcessResolver {
     /// `codex-cli/bin/codex` launcher) and the app-server Claude Code's Codex
     /// plugin starts (#368), and its own outermost `.app` is ChatGPT.app every
     /// time. So the nearest Codex process must run the `app-server` subcommand,
-    /// and its direct parent must be the app itself; `exec codex` in ChatGPT's
-    /// own terminal also leaves ChatGPT as the parent.
-    /// Bundled tool hosts share that outer bundle ID, so the parent must also
-    /// be an executable in the host app's own `Contents/MacOS` directory.
+    /// and its direct parent must be the app itself or its Aperitif helper.
+    /// Bundled tool hosts share that outer bundle ID, so check the parent's
+    /// executable path as well.
     public static func codexDesktopTermBundle(ancestry: [ProcessAncestor]) -> String? {
         guard let codexIndex = ancestry.firstIndex(where: {
             sourceMatchesExecutablePath($0.executablePath ?? "", source: "codex")
@@ -272,9 +271,21 @@ public enum CLIProcessResolver {
               codexIndex + 1 < ancestry.count,
               ancestry[codexIndex + 1].bundleIdentifier == "com.openai.codex",
               let parentPath = ancestry[codexIndex + 1].executablePath,
-              let appPath = HostHarnessResolver.outermostAppBundlePath(forExecutable: parentPath),
-              URL(fileURLWithPath: parentPath).standardizedFileURL.deletingLastPathComponent().path
-                == URL(fileURLWithPath: appPath).standardizedFileURL.appendingPathComponent("Contents/MacOS").path else {
+              let appPath = HostHarnessResolver.outermostAppBundlePath(forExecutable: parentPath) else {
+            return nil
+        }
+        let executable = URL(fileURLWithPath: parentPath).standardizedFileURL
+        let contents = URL(fileURLWithPath: appPath).standardizedFileURL.appendingPathComponent("Contents")
+        if executable.deletingLastPathComponent().path == contents.appendingPathComponent("MacOS").path {
+            return "com.openai.codex"
+        }
+
+        let versions = contents.appendingPathComponent("Frameworks/Codex Framework.framework/Versions").pathComponents
+        let components = executable.pathComponents
+        guard components.starts(with: versions),
+              components.dropFirst(versions.count + 1).elementsEqual([
+                  "Helpers", "Codex (Aperitif).app", "Contents", "MacOS", "Codex (Aperitif)",
+              ]) else {
             return nil
         }
         return "com.openai.codex"

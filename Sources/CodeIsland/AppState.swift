@@ -3388,17 +3388,41 @@ final class AppState {
     }
 
     func restoreSessions() {
-        let persisted = SessionPersistence.load()
         let cutoff = Date().addingTimeInterval(-30 * 60) // 30 minutes
-        for p in persisted where p.lastActivity > cutoff {
+        let persisted = SessionPersistence.load().filter { $0.lastActivity > cutoff }
+        let persistedById = Dictionary(persisted.map { ($0.sessionId, $0) }, uniquingKeysWith: { first, _ in first })
+        for p in persisted {
             guard let source = SessionSnapshot.normalizedSupportedSource(p.source) else { continue }
+            let liveProcess = p.cliPid.flatMap { pid -> ProcessIdentity? in
+                let identity = ProcessIdentity(pid: pid, startTime: p.cliStartTime)
+                return ProcessTable.isLiveProcess(identity) ? identity : nil
+            }
+            var termBundleId = p.termBundleId
+            // Older hooks saved Desktop threads under raw ids. A live Desktop
+            // host or an exact rollout match with a saved Desktop card can
+            // identify those entries even when the old bundle id is missing.
+            if source == "codex", termBundleId == nil, p.termApp == nil, p.ttyPath == nil,
+               !p.sessionId.hasPrefix(Self.codexAppSessionPrefix),
+               p.providerSessionId == nil || p.providerSessionId == p.sessionId {
+                let desktop = persistedById[Self.codexAppSessionPrefix + p.sessionId]
+                let sameRollout = desktop?.source == "codex" && desktop?.termBundleId == Self.codexAppBundleId
+                    && p.transcriptPath != nil && p.transcriptPath == desktop?.transcriptPath
+                let hasDesktopProcess = liveProcess.map {
+                    AgentProcessFinder.findCodexProcesses(candidatePids: [$0.pid]).first?.isDesktop == true
+                } ?? false
+                if hasDesktopProcess || (liveProcess == nil && sameRollout) {
+                    if sameRollout, desktop?.lastUserPrompt != nil { continue }
+                    termBundleId = Self.codexAppBundleId
+                }
+            }
             let restoredSessionId = CodexDiscovery.canonicalRestoredCodexSessionId(
                 sessionId: p.sessionId,
                 source: source,
                 providerSessionId: p.providerSessionId,
-                termBundleId: p.termBundleId
+                termBundleId: termBundleId
             )
             guard sessions[restoredSessionId] == nil else { continue }
+            let isCodexDesktop = source == "codex" && termBundleId == Self.codexAppBundleId
             var snapshot = SessionSnapshot(startTime: p.startTime)
             snapshot.cwd = p.cwd
             snapshot.source = source
@@ -3406,6 +3430,9 @@ final class AppState {
             snapshot.sessionTitle = p.sessionTitle
             snapshot.sessionTitleSource = p.sessionTitleSource
             snapshot.providerSessionId = p.providerSessionId
+            if isCodexDesktop, snapshot.providerSessionId == nil {
+                snapshot.providerSessionId = String(restoredSessionId.dropFirst(Self.codexAppSessionPrefix.count))
+            }
             snapshot.lastUserPrompt = p.lastUserPrompt
             snapshot.lastAssistantMessage = p.lastAssistantMessage
             if let prompt = p.lastUserPrompt {
@@ -3421,7 +3448,7 @@ final class AppState {
             snapshot.tmuxPane = p.tmuxPane
             snapshot.tmuxClientTty = p.tmuxClientTty
             snapshot.tmuxEnv = p.tmuxEnv
-            snapshot.termBundleId = p.termBundleId
+            snapshot.termBundleId = termBundleId
             snapshot.cmuxSurfaceId = p.cmuxSurfaceId
             snapshot.cmuxWorkspaceId = p.cmuxWorkspaceId
             snapshot.zellijPaneId = p.zellijPaneId
@@ -3450,14 +3477,10 @@ final class AppState {
             if let agentTasks = p.agentTasks {
                 snapshot.agentTasks = agentTasks
             }
-            // Restore persisted cliPid only if the process is still alive — avoids
-            // stale sessions reappearing briefly after the app or IDE restarts (#46).
-            if let pid = p.cliPid, pid > 0 {
-                let identity = ProcessIdentity(pid: pid, startTime: p.cliStartTime)
-                if ProcessTable.isLiveProcess(identity) {
-                    snapshot.cliPid = pid
-                    snapshot.cliStartTime = p.cliStartTime
-                }
+            // The Desktop app-server is shared by all its threads.
+            if let liveProcess, !isCodexDesktop {
+                snapshot.cliPid = liveProcess.pid
+                snapshot.cliStartTime = liveProcess.startTime
             }
             // Skip sessions whose process is dead and status was idle — nothing to show.
             // Keep Cursor Task tombstones / foldable orphans so applyCursor… can still

@@ -75,14 +75,24 @@ final class AppStateCodexAppServerTests: XCTestCase {
         let hookPayload: [String: Any] = [
             "hook_event_name": "SessionStart",
             "session_id": rawId,
-            "_source": "codex",
-            "_term_bundle": AppState.codexAppBundleId,
             "cwd": "/desktop/repo",
             "transcript_path": transcript.path,
         ]
-        let hook = try XCTUnwrap(HookEvent(
-            from: JSONSerialization.data(withJSONObject: hookPayload)
-        ))
+        let facts = HookIntake.Facts(sourceTag: "codex", ancestry: [
+            .init(
+                pid: 900,
+                executablePath: "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+                arguments: { ["codex", "-c", "features.code_mode_host=true", "app-server"] }
+            ),
+            .init(
+                pid: 800,
+                executablePath: "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/158.0.8127.89/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)",
+                bundleIdentifier: { AppState.codexAppBundleId }
+            ),
+        ])
+        var intake = try XCTUnwrap(HookIntake(stdin: hookPayload, facts: facts))
+        intake.addTerminalContext()
+        let hook = try XCTUnwrap(HookEvent(json: intake.payload))
         XCTAssertEqual(hook.sessionId, sessionId)
         appState.handleEvent(hook)
         XCTAssertEqual(Set(appState.sessions.keys), [sessionId])
@@ -113,6 +123,43 @@ final class AppStateCodexAppServerTests: XCTestCase {
         XCTAssertEqual(Set(appState.sessions.keys), [sessionId])
         XCTAssertNil(appState.sessions[rawId])
         XCTAssertEqual(appState.sessions[sessionId]?.providerSessionId, rawId)
+    }
+
+    func testRestoreUsesDesktopCardForSavedAliasAndKeepsLiveCLICard() {
+        defer { SessionPersistence.clear() }
+        let rawId = "desktop-saved-alias"
+        let liveId = "live-cli-thread"
+        let prefix = AppState.codexAppSessionPrefix
+
+        var alias = SessionSnapshot()
+        alias.source = "codex"
+        alias.providerSessionId = rawId
+        alias.transcriptPath = "/tmp/desktop-saved-alias.jsonl"
+        alias.lastUserPrompt = "saved by hook"
+
+        var desktop = alias
+        desktop.termBundleId = AppState.codexAppBundleId
+        desktop.lastUserPrompt = "saved by Desktop"
+        desktop.providerSessionId = nil
+
+        var cli = alias
+        cli.providerSessionId = liveId
+        cli.transcriptPath = "/tmp/live-cli-thread.jsonl"
+        cli.cliPid = getpid()
+        var sameRolloutDesktop = cli
+        sameRolloutDesktop.cliPid = nil
+        sameRolloutDesktop.termBundleId = AppState.codexAppBundleId
+
+        SessionPersistence.save([
+            rawId: alias, prefix + rawId: desktop,
+            liveId: cli, prefix + liveId: sameRolloutDesktop,
+        ])
+        let appState = AppState()
+        appState.restoreSessions()
+
+        XCTAssertEqual(Set(appState.sessions.keys), [prefix + rawId, liveId, prefix + liveId])
+        XCTAssertEqual(appState.sessions[prefix + rawId]?.lastUserPrompt, "saved by Desktop")
+        XCTAssertEqual(appState.sessions[prefix + rawId]?.providerSessionId, rawId)
     }
 
     func testCodexCLIHookKeepsRawSessionId() throws {
