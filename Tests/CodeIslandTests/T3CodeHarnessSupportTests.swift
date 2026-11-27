@@ -74,9 +74,11 @@ final class T3CodeHarnessSupportTests: XCTestCase {
 
     // MARK: - Thread lookup
 
-    private func makeStateDatabase(rows: [(threadId: String, provider: String, cursor: String)]) throws {
+    private func makeStateDatabase(
+        rows: [(threadId: String, provider: String, cursor: String)], file: String = "state.sqlite"
+    ) throws {
         var db: OpaquePointer?
-        XCTAssertEqual(sqlite3_open((stateDir as NSString).appendingPathComponent("state.sqlite"), &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_open((stateDir as NSString).appendingPathComponent(file), &db), SQLITE_OK)
         defer { sqlite3_close(db) }
         let schema = """
             CREATE TABLE provider_session_runtime (
@@ -102,13 +104,47 @@ final class T3CodeHarnessSupportTests: XCTestCase {
         }
     }
 
-    private func harness() -> HostHarness {
+    private func makeProjection(rows: [(threadId: String, provider: String, nativeId: String)]) throws {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open((stateDir as NSString).appendingPathComponent("statev2.sqlite"), &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        let schema = """
+            CREATE TABLE orchestration_v2_projection_provider_threads (
+              provider_thread_id TEXT PRIMARY KEY,
+              thread_id TEXT,
+              provider TEXT NOT NULL,
+              provider_session_id TEXT,
+              payload_json TEXT NOT NULL
+            );
+            CREATE TABLE orchestration_v2_projection_threads (
+              thread_id TEXT PRIMARY KEY,
+              deleted_at TEXT
+            );
+            """
+        XCTAssertEqual(sqlite3_exec(db, schema, nil, nil, nil), SQLITE_OK)
+        for (index, row) in rows.enumerated() {
+            let insert = """
+                INSERT OR IGNORE INTO orchestration_v2_projection_threads VALUES ('\(row.threadId)', NULL);
+                INSERT INTO orchestration_v2_projection_provider_threads
+                VALUES ('provider-thread-\(index)', '\(row.threadId)', '\(row.provider)', 'provider-session-\(index)',
+                    json_object('nativeThreadRef', json_object('nativeId', '\(row.nativeId)')));
+                """
+            XCTAssertEqual(sqlite3_exec(db, insert, nil, nil, nil), SQLITE_OK)
+        }
+    }
+
+    private func makeRuntime(pid: Int = 400) throws {
+        try "env-1\n".write(toFile: stateDir + "/environment-id", atomically: true, encoding: .utf8)
+        try #"{"pid":\#(pid),"port":3773}"#.write(toFile: stateDir + "/server-runtime.json", atomically: true, encoding: .utf8)
+    }
+
+    private func harness(bundleId: String? = nil) -> HostHarness {
         HostHarness(
             kind: .t3Code,
-            surface: .browser,
+            surface: bundleId.map { .desktopApp(bundleId: $0) } ?? .browser,
             serverPid: 400,
             stateDirectories: [stateDir],
-            browserOrigin: "http://localhost:3773"
+            browserOrigin: bundleId == nil ? "http://localhost:3773" : nil
         )
     }
 
@@ -138,6 +174,97 @@ final class T3CodeHarnessSupportTests: XCTestCase {
             HostHarnessSupport.t3BrowserURL(harness: harness(), sessionId: "opencode-ses_abc", session: session(source: "opencode"))?.absoluteString,
             "http://localhost:3773/env-1/thread-c"
         )
+    }
+
+    func testV2OpensProviderThreadInEitherDesktopInstanceAndBrowser() throws {
+        try makeRuntime()
+        try makeProjection(rows: [
+            ("kiro-thread", "kiro", "sess_abc"),
+            ("kiro-thread", "kiro", "sess_abc"),
+            ("codex-thread", "codex", "native-codex"),
+            ("claude-thread", "claudeAgent", "native-claude"),
+            ("other-thread", "codex", "sess_abc"),
+        ])
+        var kiro = session(source: "kiro")
+        kiro.providerSessionId = "sess_abc"
+        let custom = harness(bundleId: "com.kbfx1234.t3code.custom")
+        let standard = harness(bundleId: "com.t3tools.t3code")
+        XCTAssertEqual(
+            HostHarnessSupport.t3DesktopURL(harness: custom, sessionId: "local-card-id", session: kiro)?.absoluteString,
+            "t3code-custom://threads/env-1/kiro-thread"
+        )
+        XCTAssertEqual(
+            HostHarnessSupport.t3DesktopURL(harness: standard, sessionId: "native-codex", session: session(source: "codex"))?.absoluteString,
+            "t3code://threads/env-1/codex-thread"
+        )
+        XCTAssertEqual(
+            HostHarnessSupport.t3DesktopURL(harness: custom, sessionId: "native-claude", session: session(source: "claude"))?.absoluteString,
+            "t3code-custom://threads/env-1/claude-thread"
+        )
+        XCTAssertEqual(
+            HostHarnessSupport.t3BrowserURL(harness: harness(), sessionId: "sess_abc", session: kiro)?.absoluteString,
+            "http://localhost:3773/env-1/kiro-thread"
+        )
+    }
+
+    func testDesktopSkipsStateOwnedByAnotherProcess() throws {
+        try makeRuntime(pid: 401)
+        try makeProjection(rows: [("kiro-thread", "kiro", "sess_abc")])
+        let custom = harness(bundleId: "com.kbfx1234.t3code.custom")
+        XCTAssertNil(HostHarnessSupport.t3DesktopURL(harness: custom, sessionId: "sess_abc", session: session(source: "kiro")))
+    }
+
+    func testV2RefusesMissingAndConflictingIdentities() throws {
+        try makeRuntime()
+        try makeProjection(rows: [
+            ("first-thread", "kiro", "sess_dup"),
+            ("second-thread", "kiro", "sess_dup"),
+            ("first-thread", "kiro", "sess_first"),
+            ("second-thread", "kiro", "sess_second"),
+        ])
+        try makeStateDatabase(rows: [
+            ("first-thread", "kiro", #"{"sessionId":"sess_dup"}"#),
+        ], file: "statev2.sqlite")
+        let custom = harness(bundleId: "com.kbfx1234.t3code.custom")
+        let kiro = session(source: "kiro")
+        XCTAssertNil(HostHarnessSupport.t3DesktopURL(harness: custom, sessionId: "sess_dup", session: kiro))
+        XCTAssertNil(HostHarnessSupport.t3DesktopURL(harness: custom, sessionId: "sess_missing", session: kiro))
+        var conflicting = kiro
+        conflicting.providerSessionId = "sess_second"
+        XCTAssertNil(HostHarnessSupport.t3DesktopURL(harness: custom, sessionId: "sess_first", session: conflicting))
+    }
+
+    func testDesktopCanReadLegacyT3State() throws {
+        try makeRuntime()
+        try makeStateDatabase(rows: [
+            ("codex-thread", "codex", #"{"threadId":"shared-id"}"#),
+            ("claude-thread", "claudeAgent", #"{"resume":"shared-id"}"#),
+        ])
+        let standard = harness(bundleId: "com.t3tools.t3code")
+        XCTAssertEqual(
+            HostHarnessSupport.t3DesktopURL(harness: standard, sessionId: "shared-id", session: session(source: "claude"))?.absoluteString,
+            "t3code://threads/env-1/claude-thread"
+        )
+    }
+
+    func testV2OpensAnImportedThreadThroughItsLegacyResumeCursor() throws {
+        try makeRuntime()
+        try makeProjection(rows: [("import:claude:thread", "claudeAgent", "placeholder")])
+        try makeStateDatabase(rows: [
+            ("import:claude:thread", "claudeAgent", #"{"resume":"legacy-claude"}"#),
+            ("missing-thread", "claudeAgent", #"{"resume":"legacy-missing"}"#),
+        ], file: "statev2.sqlite")
+        let custom = harness(bundleId: "com.kbfx1234.t3code.custom")
+        let claude = session(source: "claude")
+        XCTAssertEqual(
+            HostHarnessSupport.t3DesktopURL(harness: custom, sessionId: "legacy-claude", session: claude)?.absoluteString,
+            "t3code-custom://threads/env-1/import%3Aclaude%3Athread"
+        )
+        XCTAssertEqual(
+            HostHarnessSupport.t3BrowserURL(harness: harness(), sessionId: "legacy-claude", session: claude)?.absoluteString,
+            "http://localhost:3773/env-1/import%3Aclaude%3Athread"
+        )
+        XCTAssertNil(HostHarnessSupport.t3DesktopURL(harness: custom, sessionId: "legacy-missing", session: claude))
     }
 
     func testUnknownOrAmbiguousSessionFallsBackToT3Root() throws {

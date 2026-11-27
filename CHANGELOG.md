@@ -1,5 +1,19 @@
 # Changelog
 
+## [v1.1.3] - 2026-11-27
+
+### English
+
+- Open the matching Kiro, Codex, or Claude thread from a T3 Code Desktop session card, including in T3 Code Custom.
+- Jump through the active tmux client in Rex to focus the correct block and pane, including across Rex sessions.
+- Update local Kiro credits as usage is recorded and refresh billing-cycle credits when the usage view is expanded.
+
+### 中文
+
+- 点击 T3 Code Desktop 会话卡片可跳回对应的 Kiro、Codex 或 Claude 线程，支持 T3 Code Custom。
+- Rex 跳转会按活跃 tmux 客户端定位正确的终端块和窗格，支持跨 Rex 会话。
+- Kiro 本地 credits 随用量记录更新，展开用量面板时按需刷新账期额度。
+
 ## [v1.1.2] - 2026-11-27
 
 ### English

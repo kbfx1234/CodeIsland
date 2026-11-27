@@ -50,6 +50,8 @@ final class HostHarnessResolverTests: XCTestCase {
         XCTAssertEqual(harness?.kind, .t3Code)
         XCTAssertEqual(harness?.surface, .desktopApp(bundleId: "com.t3tools.t3code"))
         XCTAssertEqual(harness?.serverPid, 501, "the nearest T3 process owns the agent")
+        XCTAssertEqual(harness?.desktopApplicationPath, "/Applications/T3 Code (Alpha).app")
+        XCTAssertEqual(harness?.stateDirectories, ["\(home)/.t3/userdata", "\(home)/.t3/dev"])
         XCTAssertEqual(harness?.label, "T3 Code")
         XCTAssertEqual(harness?.canJump, true, "desktop jump = bring the app forward, always possible")
     }
@@ -79,6 +81,7 @@ final class HostHarnessResolverTests: XCTestCase {
 
         XCTAssertEqual(harness?.surface, .desktopApp(bundleId: bundleId))
         XCTAssertEqual(harness?.serverPid, 501)
+        XCTAssertEqual(harness?.stateDirectories, ["\(home)/.t3-custom/userdata", "\(home)/.t3-custom/dev"])
     }
 
     // MARK: - Browser servers
@@ -259,6 +262,23 @@ final class HostHarnessResolverTests: XCTestCase {
             url?.absoluteString,
             "http://localhost:3773/0f5f7c1e-8c1a-4f7b-9b1e-2b3c4d5e6f70/7d2c9a4e-1b3f-4c5d-8e9f-0a1b2c3d4e5f"
         )
+    }
+
+    func testDesktopThreadURLUsesTheOwningAppScheme() {
+        XCTAssertEqual(
+            HostHarnessResolver.t3DesktopURL(bundleId: "com.t3tools.t3code", environmentId: "env", threadId: "thread")?.absoluteString,
+            "t3code://threads/env/thread"
+        )
+        XCTAssertEqual(
+            HostHarnessResolver.t3DesktopURL(bundleId: "com.kbfx1234.t3code.custom", environmentId: "env", threadId: "thread")?.absoluteString,
+            "t3code-custom://threads/env/thread"
+        )
+        XCTAssertEqual(
+            HostHarnessResolver.t3DesktopURL(bundleId: "com.t3tools.t3code", environmentId: "env", threadId: "mcp:1")?.absoluteString,
+            "t3code://threads/env/mcp%3A1"
+        )
+        XCTAssertNil(HostHarnessResolver.t3DesktopURL(bundleId: "com.t3tools.t3code", environmentId: "env", threadId: "../settings"))
+        XCTAssertNil(HostHarnessResolver.t3DesktopURL(bundleId: "com.t3tools.t3code", environmentId: "env", threadId: ".."))
     }
 
     func testThreadURLFallsBackToRootWhenThreadIsUnknown() {

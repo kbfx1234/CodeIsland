@@ -43,8 +43,7 @@ public struct HostHarness: Sendable, Equatable {
     }
 
     public enum Surface: Sendable, Equatable {
-        /// The Electron desktop app. It registers no deep link that opens an
-        /// existing thread, so the best jump is bringing the app forward.
+        /// The Electron desktop app that owns the backend.
         case desktopApp(bundleId: String)
         /// A `t3` server (CLI, npx, or the launchd service) used from a browser.
         case browser
@@ -54,8 +53,10 @@ public struct HostHarness: Sendable, Equatable {
     public let surface: Surface
     /// The harness server process the agent descends from.
     public let serverPid: Int32
-    /// Candidate T3 state directories for `.browser`, most likely first.
+    /// Candidate T3 state directories, most likely first.
     public var stateDirectories: [String]
+    /// The desktop bundle that launched the backend, when visible in ancestry.
+    public let desktopApplicationPath: String?
     /// Verified browser origin (e.g. `http://localhost:3773`) for `.browser`;
     /// nil when the server's runtime file could not be matched to `serverPid`.
     public var browserOrigin: String?
@@ -65,13 +66,15 @@ public struct HostHarness: Sendable, Equatable {
         surface: Surface,
         serverPid: Int32,
         stateDirectories: [String] = [],
-        browserOrigin: String? = nil
+        browserOrigin: String? = nil,
+        desktopApplicationPath: String? = nil
     ) {
         self.kind = kind
         self.surface = surface
         self.serverPid = serverPid
         self.stateDirectories = stateDirectories
         self.browserOrigin = browserOrigin
+        self.desktopApplicationPath = desktopApplicationPath
     }
 
     /// Product name for the card chip. Not localized — it is a brand.
@@ -133,7 +136,14 @@ public enum HostHarnessResolver {
             return HostHarness(
                 kind: .t3Code,
                 surface: .desktopApp(bundleId: desktopBundleId),
-                serverPid: ancestor.pid
+                serverPid: ancestor.pid,
+                stateDirectories: t3StateDirectories(
+                    arguments: ancestor.arguments,
+                    environment: ancestor.environment,
+                    homeDirectory: homeDirectory,
+                    defaultBaseDirectory: desktopBundleId == t3CustomDesktopBundleId ? ".t3-custom" : ".t3"
+                ),
+                desktopApplicationPath: ancestor.executablePath.flatMap(outermostAppBundlePath(forExecutable:))
             )
         }
         guard isT3ServerProcess(ancestor) else { return nil }
@@ -185,11 +195,12 @@ public enum HostHarnessResolver {
     static func t3StateDirectories(
         arguments: [String],
         environment: [String: String],
-        homeDirectory: String
+        homeDirectory: String,
+        defaultBaseDirectory: String = ".t3"
     ) -> [String] {
         let base = baseDirArgument(arguments)
             ?? environment["T3CODE_HOME"].flatMap { $0.isEmpty ? nil : $0 }
-            ?? (homeDirectory as NSString).appendingPathComponent(".t3")
+            ?? (homeDirectory as NSString).appendingPathComponent(defaultBaseDirectory)
         let expanded = expandHome(base, homeDirectory: homeDirectory)
         return [
             (expanded as NSString).appendingPathComponent("userdata"),
@@ -257,22 +268,39 @@ public enum HostHarnessResolver {
     public static func t3BrowserURL(origin: String, environmentId: String?, threadId: String?) -> URL? {
         guard var components = URLComponents(string: origin) else { return nil }
         if let environmentId = pathSegment(environmentId), let threadId = pathSegment(threadId) {
-            components.path = "/\(environmentId)/\(threadId)"
+            components.percentEncodedPath = "/\(environmentId)/\(threadId)"
         } else {
             components.path = "/"
         }
         return components.url
     }
 
-    /// Ids T3 generates are UUIDs; anything that is not a plain token is
-    /// rejected rather than escaped into a path.
+    /// External thread link consumed by T3's Electron open-url handler.
+    public static func t3DesktopURL(bundleId: String, environmentId: String, threadId: String) -> URL? {
+        let scheme: String
+        switch bundleId {
+        case t3DesktopBundleId: scheme = "t3code"
+        case t3CustomDesktopBundleId: scheme = "t3code-custom"
+        default: return nil
+        }
+        guard let environmentId = pathSegment(environmentId), let threadId = pathSegment(threadId) else { return nil }
+        var components = URLComponents()
+        components.scheme = scheme
+        components.host = "threads"
+        components.percentEncodedPath = "/\(environmentId)/\(threadId)"
+        return components.url
+    }
+
+    /// T3 uses UUIDs and namespaced IDs such as `import:claude:<id>`.
     private static func pathSegment(_ value: String?) -> String? {
-        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty, trimmed != ".", trimmed != ".." else {
             return nil
         }
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        let allowed = unreserved.union(.alphanumerics).union(CharacterSet(charactersIn: ":"))
         guard trimmed.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
-        return trimmed
+        return trimmed.addingPercentEncoding(withAllowedCharacters: unreserved)
     }
 
     /// The ids a harness may have recorded for this agent session, for the
