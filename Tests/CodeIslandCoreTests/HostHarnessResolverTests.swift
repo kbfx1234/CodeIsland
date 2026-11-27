@@ -281,6 +281,20 @@ final class HostHarnessResolverTests: XCTestCase {
         XCTAssertNil(HostHarnessResolver.t3DesktopURL(bundleId: "com.t3tools.t3code", environmentId: "env", threadId: ".."))
     }
 
+    func testThreadURLsPreserveLiteralPercentEscapesInStoredID() {
+        let thread = "thread:kiro:workspace%3Achat"
+        let desktop = HostHarnessResolver.t3DesktopURL(
+            bundleId: "com.kbfx1234.t3code.custom", environmentId: "env", threadId: thread
+        )
+        let browser = HostHarnessResolver.t3BrowserURL(
+            origin: "http://localhost:3773", environmentId: "env", threadId: thread
+        )
+        XCTAssertEqual(desktop?.absoluteString, "t3code-custom://threads/env/thread%3Akiro%3Aworkspace%253Achat")
+        XCTAssertEqual(browser?.absoluteString, "http://localhost:3773/env/thread%3Akiro%3Aworkspace%253Achat")
+        XCTAssertEqual(desktop?.pathComponents.last, thread)
+        XCTAssertEqual(browser?.pathComponents.last, thread)
+    }
+
     func testThreadURLFallsBackToRootWhenThreadIsUnknown() {
         XCTAssertEqual(
             HostHarnessResolver.t3BrowserURL(origin: "http://localhost:3773", environmentId: "env", threadId: nil)?.absoluteString,

@@ -291,14 +291,15 @@ public enum HostHarnessResolver {
         return components.url
     }
 
-    /// T3 uses UUIDs and namespaced IDs such as `import:claude:<id>`.
+    /// T3 can store percent escapes as part of a thread ID. Encode the literal
+    /// percent sign so the router's decode preserves the stored ID.
     private static func pathSegment(_ value: String?) -> String? {
         guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmed.isEmpty, trimmed != ".", trimmed != ".." else {
             return nil
         }
         let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-        let allowed = unreserved.union(.alphanumerics).union(CharacterSet(charactersIn: ":"))
+        let allowed = unreserved.union(.alphanumerics).union(CharacterSet(charactersIn: ":%"))
         guard trimmed.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
         return trimmed.addingPercentEncoding(withAllowedCharacters: unreserved)
     }
