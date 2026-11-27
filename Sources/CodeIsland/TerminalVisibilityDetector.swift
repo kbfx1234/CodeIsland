@@ -99,6 +99,7 @@ struct TerminalVisibilityDetector {
         guard !session.isRemote else { return false }
         let probe = self.probe
         if probe.isSessionTabVisible(session) { return true }
+        if session.hostHarness == nil, RexRouting.matches(session), session.tmuxPane?.isEmpty == false { return false }
         return probe.isTerminalFrontmost(session) && probe.isSessionLocatable(session)
     }
 
@@ -122,10 +123,8 @@ struct TerminalVisibilityDetector {
             return isWarpSessionTabActive(session)
         }
 
-        if session.rexBlockId?.isEmpty == false || session.rexSessionId?.isEmpty == false
-            || session.termBundleId?.lowercased() == "com.superlogical.rex"
-            || session.termApp?.lowercased() == "rex" {
-            return frontBundleId == "com.superlogical.rex"
+        if RexRouting.matches(session) {
+            return frontBundleId == RexRouting.bundleID
         }
 
         if let termBundleId = session.termBundleId?.lowercased(),
@@ -178,7 +177,7 @@ struct TerminalVisibilityDetector {
             return true
         }
 
-        if session.rexBlockId?.isEmpty == false {
+        if RexRouting.matches(session) {
             return isRexBlockActive(session)
         }
 
@@ -562,24 +561,17 @@ struct TerminalVisibilityDetector {
         AppleScriptRunner.current.evaluate(source, 5)
     }
 
-    /// Rex's app client exposes the active window and focused block through
-    /// `session inspect`; this is the same identity that `block focus` uses.
     private static func isRexBlockActive(_ session: SessionSnapshot) -> Bool {
-        guard let blockId = session.rexBlockId,
-              !blockId.isEmpty,
-              let sessionId = session.rexSessionId,
-              !sessionId.isEmpty,
-              let rex = TerminalActivator.rexBinaryPath(),
-              let data = runProcess(rex, args: ["session", "inspect", sessionId, "--json"]),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let activeWindowId = object["active_window_id"] as? String,
-              let windows = object["windows"] as? [[String: Any]] else {
-            return false
+        guard let rex = TerminalActivator.rexBinaryPath() else { return false }
+        let command: ([String]) -> Data? = { RexRouting.run(rex, $0) }
+        if session.tmuxPane?.isEmpty == false {
+            guard let tmux = findBinary("tmux"),
+                  let target = RexRouting.tmuxTarget(for: session, tmuxPath: tmux, rex: command),
+                  target.client.activePane == target.paneID else { return false }
+            return RexRouting.isBlockFocused(target.blockID, command: command)
         }
-        return windows.contains { window in
-            window["window_id"] as? String == activeWindowId
-                && window["focused_block_id"] as? String == blockId
-        }
+        guard let blockID = session.rexBlockId, !blockID.isEmpty else { return false }
+        return RexRouting.isBlockFocused(blockID, command: command)
     }
 
     private static func findBinary(_ name: String, extraPaths: [String] = []) -> String? {

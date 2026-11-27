@@ -19,6 +19,8 @@ enum CodexTmuxRouting {
         let tty: String
         /// `#{session_id}` the client is showing.
         let session: String
+        var pid: pid_t?
+        var activePane: String?
     }
 
     enum Resolution: Equatable {
@@ -43,7 +45,7 @@ enum CodexTmuxRouting {
     /// fields before it.
     static let paneFormat =
         "#{pane_id}\t#{pane_pid}\t#{session_id}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}"
-    static let clientFormat = "#{client_tty}\t#{session_id}"
+    static let clientFormat = "#{client_tty}\t#{session_id}\t#{client_pid}\t#{pane_id}"
 
     /// The one place a session's tmux target is decided: for the jump
     /// (TerminalActivator) and for checking whether it landed or is in view
@@ -81,9 +83,12 @@ enum CodexTmuxRouting {
 
     static func parseClients(_ output: String) -> [Client] {
         output.split(separator: "\n").compactMap { line -> Client? in
-            let fields = line.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
-            guard fields.count == 2, !fields[0].isEmpty else { return nil }
-            return Client(tty: String(fields[0]), session: String(fields[1]))
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard fields.count == 4, !fields[0].isEmpty else { return nil }
+            return Client(
+                tty: String(fields[0]), session: String(fields[1]),
+                pid: pid_t(fields[2]), activePane: String(fields[3])
+            )
         }
     }
 

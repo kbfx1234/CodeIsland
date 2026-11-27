@@ -255,16 +255,8 @@ struct TerminalActivator {
             return
         }
 
-        // Rex owns multiple terminal blocks inside one session. The session id
-        // alone only selects the tab group; focus the recorded block so two
-        // conversations in the same Rex session remain distinguishable.
-        if let rexBlock = session.rexBlockId?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !rexBlock.isEmpty {
-            activateRex(session: session, blockId: rexBlock)
-            return
-        }
-        if session.termBundleId?.lowercased() == "com.superlogical.rex" || lower == "rex" {
-            activateByBundleId("com.superlogical.rex")
+        if RexRouting.matches(session) || lower == "rex" {
+            activateRex(session: session)
             return
         }
 
@@ -1583,20 +1575,25 @@ struct TerminalActivator {
 
     // MARK: - Rex (CLI: focus the exact block inside a session)
 
-    /// Rex sessions are workspaces containing several windows and blocks. Its
-    /// CLI's `block focus` command raises the Rex app and focuses the exact
-    /// block, while `-s` prevents an ID from another session being accepted.
-    private static func activateRex(session: SessionSnapshot, blockId: String) {
-        activateByBundleId("com.superlogical.rex")
+    private static func activateRex(session: SessionSnapshot) {
+        let bundleID = RexRouting.bundleID
+        if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first {
+            activateByBundleId(bundleID)
+            focusRexSession(session, appPID: app.processIdentifier)
+        } else if let url = appURL(forBundleId: bundleID) {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { app, _ in
+                focusRexSession(session, appPID: app?.processIdentifier)
+            }
+        }
+    }
+
+    private static func focusRexSession(_ session: SessionSnapshot, appPID: pid_t?) {
         guard let rex = rexBinaryPath() else { return }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            var args = ["block", "focus", blockId]
-            if let sessionId = session.rexSessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !sessionId.isEmpty {
-                args += ["--session", sessionId]
+            RexRouting.jump(session, tmuxPath: findBinary("tmux"), appPID: appPID) { args in
+                RexRouting.run(rex, args)
             }
-            _ = runProcess(rex, args: args)
         }
     }
 

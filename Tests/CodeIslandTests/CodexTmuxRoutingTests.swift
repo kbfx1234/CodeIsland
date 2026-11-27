@@ -105,8 +105,11 @@ final class CodexTmuxRoutingTests: XCTestCase {
     }
 
     func testParseClients() {
-        XCTAssertEqual(CodexTmuxRouting.parseClients("/dev/ttys001\t$0\n/dev/ttys004\t$2\n\n"),
-                       [.init(tty: "/dev/ttys001", session: "$0"), .init(tty: "/dev/ttys004", session: "$2")])
+        let listing = "/dev/ttys001\t$0\t123\t%5\n/dev/ttys004\t$2\t124\t%9\n\n"
+        XCTAssertEqual(CodexTmuxRouting.parseClients(listing), [
+            .init(tty: "/dev/ttys001", session: "$0", pid: 123, activePane: "%5"),
+            .init(tty: "/dev/ttys004", session: "$2", pid: 124, activePane: "%9"),
+        ])
         XCTAssertEqual(CodexTmuxRouting.parseClients(""), [])
     }
 
