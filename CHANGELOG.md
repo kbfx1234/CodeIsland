@@ -1,5 +1,19 @@
 # Changelog
 
+## [v1.1.2] - 2026-11-27
+
+### English
+
+- Show one card per Codex Desktop conversation when the Aperitif helper launches the app server. Merge duplicate cards saved by earlier builds.
+- Keep quiet Kiro V3 turns active while their local session record and lease indicate work in progress. Recover active turns on launch and preserve a running command when a parallel tool finishes first.
+- Focus the recorded Rex terminal block from its session card and recognize the custom T3 Desktop bundle.
+
+### 中文
+
+- 识别由 Aperitif helper 启动的 Codex Desktop 会话，每段对话显示一张卡片，并在启动时合并旧版保存的重复卡片。
+- 通过 Kiro V3 的本机会话记录和进程租约确认任务状态。启动时恢复进行中的任务，并修正并行工具先结束时清掉运行中命令的问题。
+- 点击卡片可跳回 Rex 中对应的终端块，支持识别自定义 T3 Desktop 应用。
+
 ## [v1.0.41] - 2026-10-28
 
 ### English

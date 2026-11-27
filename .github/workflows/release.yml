@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   update-homebrew:
+    if: github.repository == 'wxtsky/CodeIsland'
     runs-on: ubuntu-latest
     steps:
       - name: Extract version from tag
