@@ -260,7 +260,6 @@ final class AppState {
             }
             if surface.isExpanded {
                 refreshClaudeUsageIfStale()
-                refreshKiroUsageIfStale()
                 claudeQuota.noteExpanded()
             } else {
                 claudeQuota.noteCollapsed()
@@ -324,6 +323,7 @@ final class AppState {
     private var usageFileCache = ClaudeUsageScanner.FileCache()
     private var kiroUsageFileCache = KiroUsageScanner.FileCache()
     private var kiroUsageScanInFlight = false
+    private var kiroUsageRescanPending = false
 
     /// Glance completion mode: an agent finished while the pill was collapsed —
     /// light the dot instead of expanding. Cleared when the user expands the
@@ -382,6 +382,10 @@ final class AppState {
     private(set) lazy var discovery: SessionDiscoveryCoordinator = {
         let discovery = SessionDiscoveryCoordinator()
         discovery.onDiscovered = { [weak self] in self?.integrateDiscovered($0) }
+        discovery.onKiroUsageChanged = { [weak self] in
+            guard let self, self.surface == .sessionList else { return }
+            self.refreshKiroUsage()
+        }
         return discovery
     }()
     /// Cursor Agent Task transcripts on disk, for rebranding default-Claude
@@ -1304,32 +1308,41 @@ final class AppState {
             await MainActor.run { [weak self] in
                 self?.claudeUsage = snapshot
                 self?.usageFileCache = scannedCache
-                self?.refreshKiroUsageIfStale()
                 AppState.usageScanInFlight = false
             }
         }
     }
 
-    /// Refresh the local Kiro activity footer on the same lazy cadence as the
-    /// Claude activity scan. The account cache is handled by its own store.
-    func refreshKiroUsageIfStale() {
+    /// Called when the list appears or its Kiro session files change.
+    func refreshKiroUsage() {
         guard UserDefaults.standard.bool(forKey: SettingsKey.showUsageStats),
-              !kiroUsageScanInFlight else { return }
-        if let scannedAt = kiroUsage?.scannedAt,
-           Date().timeIntervalSince(scannedAt) < 120 { return }
-        let now = Date()
+              !RuntimeEnvironment.isIsolated else { return }
+        if kiroUsageScanInFlight {
+            kiroUsageRescanPending = true
+            return
+        }
+        guard let home = discovery.kiroUsageHome() else {
+            kiroUsage = nil
+            return
+        }
         let cacheCopy = kiroUsageFileCache
         kiroUsageScanInFlight = true
         Task { [weak self] in
             let result = await Task.detached(priority: .utility) {
                 var cache = cacheCopy
-                let snapshot = KiroUsageScanner.scan(now: now, cache: &cache)
+                let snapshot = KiroUsageScanner.scan(kiroHome: home, cache: &cache)
                 return (snapshot, cache)
             }.value
             guard !Task.isCancelled, let self else { return }
-            self.kiroUsage = result.0
+            if self.kiroUsage?.last5h != result.0.last5h || self.kiroUsage?.today != result.0.today {
+                self.kiroUsage = result.0
+            }
             self.kiroUsageFileCache = result.1
             self.kiroUsageScanInFlight = false
+            if self.kiroUsageRescanPending {
+                self.kiroUsageRescanPending = false
+                self.refreshKiroUsage()
+            }
         }
     }
 

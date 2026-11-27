@@ -20,12 +20,33 @@ private final class ProjectsWatcherBox: @unchecked Sendable {
         lock.unlock()
     }
 
-    func handleChange() {
+    let kiroRoot: String?
+
+    init(kiroRoot: String?) {
+        self.kiroRoot = kiroRoot
+    }
+
+    func handleChange(paths: [String], mustRescan: Bool) {
         lock.lock()
         let isCancelled = cancelled
         lock.unlock()
         guard !isCancelled else { return }
-        coordinator?.handleProjectsDirChange()
+        let kiroPrefix = kiroRoot.map { $0 + "/" }
+        let kiroPaths = paths.filter { path in
+            path == kiroRoot || kiroPrefix.map(path.hasPrefix) == true
+        }
+        let kiroUsageChanged = kiroRoot.map { root in
+            let sessions = root + "/sessions"
+            return mustRescan || kiroPaths.contains { path in
+                path == root || path == sessions
+                    || (path.hasPrefix(sessions + "/") && path.hasSuffix("/messages.jsonl"))
+                    || (path.hasPrefix(sessions + "/cli/") && path.hasSuffix(".json"))
+            }
+        } ?? false
+        coordinator?.handleProjectsDirChange(
+            scanSessions: mustRescan || paths.count > kiroPaths.count,
+            kiroUsageChanged: kiroUsageChanged
+        )
     }
 }
 
@@ -50,6 +71,7 @@ final class SessionDiscoveryCoordinator {
         var cursorSubagentIndex: @Sendable () -> CursorSubagentTranscriptIndex
         /// The session stores the watcher follows (none: no watcher).
         var watchRoots: @Sendable () -> [String]
+        var kiroUsageWatchRoot: @Sendable () -> String? = { nil }
 
         static let live = Scanners(
             sessions: { SessionDiscovery.findDiscoveredSessions() },
@@ -61,7 +83,8 @@ final class SessionDiscoveryCoordinator {
             cursorSubagentIndex: {
                 CursorSubagentTranscriptIndex.scan(home: FileManager.default.homeDirectoryForCurrentUser.path)
             },
-            watchRoots: { SessionDiscovery.discoveryWatchRoots() }
+            watchRoots: { SessionDiscovery.discoveryWatchRoots() },
+            kiroUsageWatchRoot: { SessionDiscovery.kiroUsageWatchRoot() }
         )
 
         static let inert = Scanners(
@@ -78,6 +101,7 @@ final class SessionDiscoveryCoordinator {
     var scanners: Scanners
     /// Receives each scan's sessions, on the main actor.
     var onDiscovered: ([DiscoveredSession]) -> Void = { _ in }
+    var onKiroUsageChanged: () -> Void = {}
 
     // Torn down from `deinit`, which may run off the main actor (AppState is
     // released there by async XCTest ARC). Only mutated on the main actor.
@@ -204,10 +228,11 @@ final class SessionDiscoveryCoordinator {
     /// FSEventStream on known session-store roots — fires when transcript/event files change.
     func startProjectsWatcher() {
         guard !isStopped, fsEventStream == nil else { return }
-        let watchRoots = scanners.watchRoots()
+        let kiroRoot = scanners.kiroUsageWatchRoot().map(ConfigPathIdentity.resolved)
+        let watchRoots = scanners.watchRoots() + (kiroRoot.map { [$0] } ?? [])
         guard !watchRoots.isEmpty else { return }
 
-        let box = ProjectsWatcherBox()
+        let box = ProjectsWatcherBox(kiroRoot: kiroRoot)
         box.coordinator = self
 
         var context = FSEventStreamContext()
@@ -218,10 +243,13 @@ final class SessionDiscoveryCoordinator {
 
         let stream = FSEventStreamCreate(
             nil,
-            { (_, info, _, _, _, _) in
+            { (_, info, count, eventPaths, eventFlags, _) in
                 guard let info = info else { return }
                 let box = Unmanaged<ProjectsWatcherBox>.fromOpaque(info).takeUnretainedValue()
-                box.handleChange()
+                let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
+                let rescanFlags = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+                let mustRescan = (0..<count).contains { eventFlags[$0] & rescanFlags != 0 }
+                box.handleChange(paths: paths, mustRescan: mustRescan)
             },
             &context,
             watchRoots as CFArray,
@@ -240,6 +268,16 @@ final class SessionDiscoveryCoordinator {
         self.projectsWatcherBox = box
         self.fsEventStream = stream
         log.info("Discovery watcher started on \(watchRoots.joined(separator: ", "))")
+    }
+
+    /// The Kiro store may first appear after the application starts.
+    func kiroUsageHome() -> String? {
+        guard let root = scanners.kiroUsageWatchRoot().map(ConfigPathIdentity.resolved) else { return nil }
+        if projectsWatcherBox?.kiroRoot != root {
+            tearDownProjectsWatcher()
+            startProjectsWatcher()
+        }
+        return root
     }
 
     /// Re-arm the watcher after the watched roots changed, and rescan at once
@@ -267,14 +305,15 @@ final class SessionDiscoveryCoordinator {
     }
 
     /// Called by FSEventStream when a known session-store directory changes.
-    nonisolated fileprivate func handleProjectsDirChange() {
+    nonisolated fileprivate func handleProjectsDirChange(scanSessions: Bool, kiroUsageChanged: Bool) {
         Task { @MainActor [weak self] in
-            guard let self = self else { return }
+            guard let self, !self.isStopped else { return }
             // FSEvents already coalesces writes with a two-second latency, and
             // requestScan() coalesces events that arrive during a scan.
             // Dropping events in an additional time window can miss the final
             // lifecycle write and leave the island showing stale state.
-            self.requestScan()
+            if scanSessions { self.requestScan() }
+            if kiroUsageChanged { self.onKiroUsageChanged() }
         }
     }
 

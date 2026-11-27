@@ -44,7 +44,26 @@ final class KiroAccountUsageStoreTests: XCTestCase {
         XCTAssertNotNil(store.snapshot)
         XCTAssertEqual(store.snapshot?.currentUsage ?? 0, 5316.10, accuracy: 0.0001)
         XCTAssertEqual(store.snapshot?.usageLimit ?? 0, 5000, accuracy: 0.0001)
+        XCTAssertTrue(store.isUsingCache)
         XCTAssertNil(store.error)
+    }
+
+    func testExpansionUsesACPBeforeCacheAndSkipsImmediateReopening() async throws {
+        let live = KiroAccountUsageSnapshot(
+            currentUsage: 1, usageLimit: 100, percentageUsed: 1, currentOverages: 0,
+            resetAt: nil, fetchedAt: Date()
+        )
+        let store = KiroAccountUsageStore(dataReader: {
+            XCTFail("A successful ACP reply should bypass the cache")
+            return nil
+        }, liveReader: { live })
+        store.refreshOnExpansion()
+        await waitUntil("ACP snapshot") { store.snapshot == live }
+        XCTAssertFalse(store.isUsingCache)
+        let started = try XCTUnwrap(store.lastAttempt)
+        store.refreshOnExpansion(now: started.addingTimeInterval(1))
+        XCTAssertEqual(store.lastAttempt, started)
+        XCTAssertFalse(store.isLoading)
     }
 
     func testRefreshDoesNotKeepStaleSnapshotWhenCacheIsUnavailable() async throws {

@@ -7,6 +7,43 @@ import XCTest
 /// landing after `stop()`, and the cleanup tick's Codex Desktop poll.
 @MainActor
 final class SessionDiscoveryCoordinatorTests: XCTestCase {
+    func testOpenSessionListRefreshesWhenKiroUsageIsAppended() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).resolvingSymlinksInPath()
+        let directory = root.appendingPathComponent("sessions/project/session")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = directory.appendingPathComponent("messages.jsonl")
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        func row(_ id: String, credits: Double) -> Data {
+            Data("""
+            {"id":"\(id)","timestamp":"\(timestamp)","payload":{"type":"usage_summary","promptTurnSummaries":[{"unit":"credit","usage":\(credits)}]}}
+
+            """.utf8)
+        }
+        try row("first", credits: 2).write(to: file)
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: SettingsKey.showUsageStats)
+        defer { defaults.set(previous, forKey: SettingsKey.showUsageStats) }
+        defaults.set(false, forKey: SettingsKey.showUsageStats)
+        let appState = AppState()
+        appState.surface = .sessionList
+        appState.discovery.scanners.kiroUsageWatchRoot = { root.path }
+        defer { appState.discovery.stop() }
+        defaults.set(true, forKey: SettingsKey.showUsageStats)
+        appState.refreshKiroUsage()
+        await waitUntil("initial Kiro scan") { appState.kiroUsage?.last5h.credits == 2 }
+
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: row("second", credits: 0.25) + row("second", credits: 0.25))
+        try handle.close()
+        await waitUntil("Kiro totals should update while the list stays open") {
+            appState.kiroUsage?.last5h.credits == 2.25
+        }
+        XCTAssertEqual(appState.kiroUsage?.last5h.turnCount, 2)
+    }
+
     /// A scanner that blocks until its gate opens, counting the scans that
     /// ran and the most that ran at once.
     private func gatedScanners(_ scans: ScanCounter, gates: [ScanGate]) -> SessionDiscoveryCoordinator.Scanners {

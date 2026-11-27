@@ -3579,36 +3579,47 @@ private struct SessionListFooter: View {
         if content.quotaMessage, let error {
             QuotaFooterMessage(error: error)
         }
-        if showUsageStats,
-           let usage = appState.kiroUsage,
-           !(usage.last5h.isEmpty && usage.today.isEmpty) {
-            KiroUsageFooterLine(usage: usage, account: kiroAccount.snapshot)
-        }
         if showUsageStats {
+            let local = appState.kiroUsage.flatMap {
+                $0.last5h.isEmpty && $0.today.isEmpty ? nil : $0
+            }
+            if local != nil || kiroAccount.snapshot != nil {
+                KiroUsageFooterLine(usage: local, account: kiroAccount.snapshot, isUsingCache: kiroAccount.isUsingCache)
+            }
             Color.clear
                 .frame(height: 0)
-                .onAppear { kiroAccount.startAutoRefresh() }
+                .onAppear {
+                    guard !RuntimeEnvironment.isRunningTests, !RuntimeEnvironment.isIsolated else { return }
+                    appState.refreshKiroUsage()
+                    kiroAccount.refreshOnExpansion()
+                }
         }
     }
 }
 
 private struct KiroUsageFooterLine: View {
-    let usage: KiroUsageScanner.Snapshot
+    let usage: KiroUsageScanner.Snapshot?
     let account: KiroAccountUsageSnapshot?
+    let isUsingCache: Bool
+    @ObservedObject private var l10n = L10n.shared
 
     var body: some View {
-        HStack(spacing: 5) {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
             Image(systemName: "gauge.with.needle")
                 .font(.system(size: 9, weight: .semibold))
             Text("Kiro").fontWeight(.semibold)
-            if let account {
-                Text("账户 \(format(account.currentUsage))/\(format(account.usageLimit)) credits")
-                Text("·").foregroundStyle(.white.opacity(0.25))
-                Text(String(format: "%.1f%%", account.percentageUsed))
-            } else {
-                Text("本地 5h \(KiroUsageScanner.formatCredits(usage.last5h.credits))")
-                Text("·").foregroundStyle(.white.opacity(0.25))
-                Text("今日 \(KiroUsageScanner.formatCredits(usage.today.credits))")
+            VStack(alignment: .leading, spacing: 2) {
+                if let usage {
+                    let last5h = "\(l10n["usage_last_5h"]) \(format(usage.last5h.credits))"
+                    let today = "\(l10n["usage_today"]) \(format(usage.today.credits))"
+                    Text("\(l10n["kiro_local_usage"]) · \(last5h) · \(today) credits")
+                }
+                if let account {
+                    let label = l10n[isUsingCache ? "kiro_billing_cache" : "kiro_billing_usage"]
+                    let ratio = "\(format(account.currentUsage))/\(format(account.usageLimit))"
+                    let percentage = String(format: "%.1f%%", account.percentageUsed)
+                    Text("\(label) · \(ratio) credits · \(percentage)")
+                }
             }
             Spacer(minLength: 0)
         }
@@ -3617,7 +3628,6 @@ private struct KiroUsageFooterLine: View {
         .padding(.horizontal, 14)
         .padding(.top, 5)
         .padding(.bottom, 8)
-        .help("Kiro 本地活动 credits；账户周期来自 Kiro 本地缓存")
     }
 
     private func format(_ value: Double) -> String { String(format: "%.2f", value) }

@@ -217,6 +217,11 @@ enum SessionDiscovery {
         return roots
     }
 
+    static func kiroUsageWatchRoot() -> String? {
+        let path = NSHomeDirectory() + "/.kiro"
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
     static func isSubagentWorktree(_ cwd: String) -> Bool {
         cwd.contains("/.claude/worktrees/agent-") || cwd.contains("/.git/worktrees/agent-")
     }

@@ -58,7 +58,8 @@ public enum AnyCodableLike: Equatable {
         switch value {
         case nil: return .null
         case let v as NSNull: _ = v; return .null
-        case let v as Bool: return .bool(v)
+        case let v as NSNumber where CFGetTypeID(v) == CFBooleanGetTypeID():
+            return .bool(v.boolValue)
         case let v as Int: return .int(Int64(v))
         case let v as Int64: return .int(v)
         case let v as NSNumber:
@@ -169,6 +170,9 @@ public final class CodexAppServerClient: @unchecked Sendable {
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         let stdinPipe = Pipe()
+        // The child can exit before it reads a request. Let the write throw
+        // EPIPE without delivering SIGPIPE to the app.
+        _ = fcntl(stdinPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
         proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe
         proc.standardInput = stdinPipe

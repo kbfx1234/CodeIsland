@@ -2,6 +2,27 @@ import XCTest
 @testable import CodeIslandCore
 
 final class KiroAccountUsageTests: XCTestCase {
+    func testParsesACPUsageResult() throws {
+        let result: AnyCodableLike = .object([
+            "success": .bool(true),
+            "data": .object([
+                "billingCycleReset": .string("2026-12-01"),
+                "usageBreakdowns": .array([
+                    .object([
+                        "displayName": .string("Credits"),
+                        "used": .double(123.45),
+                        "limit": .int(100),
+                        "currentOverages": .double(23.45),
+                    ]),
+                ]),
+            ]),
+        ])
+        let snapshot = try XCTUnwrap(KiroAccountUsageParser.parseACPResult(result))
+        XCTAssertEqual(snapshot.currentUsage, 123.45, accuracy: 0.0001)
+        XCTAssertEqual(snapshot.usageLimit, 100, accuracy: 0.0001)
+        XCTAssertEqual(snapshot.currentOverages, 23.45, accuracy: 0.0001)
+    }
+
     func testParsesCreditBreakdownAndResetDate() throws {
         let data = try JSONSerialization.data(withJSONObject: [
             "kiro.resourceNotifications.usageState": [

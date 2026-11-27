@@ -1,13 +1,13 @@
 import Foundation
 
-/// Account-level Kiro billing cached by the Kiro IDE. This is separate from
+/// Account-level Kiro billing from ACP or the Kiro IDE cache. This is separate from
 /// local session activity and may include CLI, IDE, and web usage.
 public struct KiroAccountUsageSnapshot: Equatable, Sendable {
     public let currentUsage: Double
     public let usageLimit: Double
     public let percentageUsed: Double
     public let currentOverages: Double
-    public let resetAt: Date
+    public let resetAt: Date?
     public let sourceUpdatedAt: Date?
     public let fetchedAt: Date
 
@@ -16,7 +16,7 @@ public struct KiroAccountUsageSnapshot: Equatable, Sendable {
         usageLimit: Double,
         percentageUsed: Double,
         currentOverages: Double,
-        resetAt: Date,
+        resetAt: Date?,
         sourceUpdatedAt: Date? = nil,
         fetchedAt: Date
     ) {
@@ -33,6 +33,38 @@ public struct KiroAccountUsageSnapshot: Equatable, Sendable {
 }
 
 public enum KiroAccountUsageParser {
+    public static func parseACPResult(
+        _ result: AnyCodableLike?, fetchedAt: Date = Date()
+    ) -> KiroAccountUsageSnapshot? {
+        guard let result = result?.asObject, result["success"]?.asBool == true,
+              let data = result["data"]?.asObject,
+              case .array(let breakdowns) = data["usageBreakdowns"],
+              let credits = breakdowns.compactMap(\.asObject).first(where: {
+                  let name = $0["displayName"]?.asString?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                  return name == "credit" || name == "credits"
+              }),
+              let used = acpNumber(credits["used"]), used.isFinite, used >= 0,
+              let limit = acpNumber(credits["limit"]), limit.isFinite, limit > 0 else { return nil }
+
+        let reset = data["billingCycleReset"]?.asString
+        let resetAt = reset.flatMap { date($0.count == 10 ? $0 + "T00:00:00Z" : $0) }
+        let percentage = used / limit * 100
+        let overage = acpNumber(credits["currentOverages"]) ?? max(0, used - limit)
+        guard percentage.isFinite, overage.isFinite, overage >= 0 else { return nil }
+        return KiroAccountUsageSnapshot(
+            currentUsage: used, usageLimit: limit, percentageUsed: percentage,
+            currentOverages: overage, resetAt: resetAt, fetchedAt: fetchedAt
+        )
+    }
+
+    private static func acpNumber(_ value: AnyCodableLike?) -> Double? {
+        switch value {
+        case .int(let number): return Double(number)
+        case .double(let number): return number
+        default: return nil
+        }
+    }
+
     public static func parse(data: Data, fetchedAt: Date = Date()) -> KiroAccountUsageSnapshot? {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let state = root["kiro.resourceNotifications.usageState"] as? [String: Any],

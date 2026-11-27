@@ -5,26 +5,29 @@ import CodeIslandCore
 
 @MainActor
 final class KiroAccountUsageStore: ObservableObject {
-    static let shared = KiroAccountUsageStore()
+    static let shared = KiroAccountUsageStore(liveReader: { KiroAccountUsageClient.fetch() })
 
     typealias DataReader = @Sendable () -> Data?
+    typealias LiveReader = @Sendable () -> KiroAccountUsageSnapshot?
 
     @Published private(set) var snapshot: KiroAccountUsageSnapshot?
     @Published private(set) var error: String?
     @Published private(set) var isLoading = false
+    @Published private(set) var isUsingCache = false
     @Published private(set) var lastAttempt: Date?
 
     private let dataReader: DataReader
+    private let liveReader: LiveReader
     private var refreshTask: Task<Void, Never>?
-    private var pollTimer: Timer?
-    private var isStarted = false
 
     init(
         databasePathProvider: @escaping @Sendable () -> String = {
             NSHomeDirectory() + "/Library/Application Support/Kiro/User/globalStorage/state.vscdb"
         },
-        dataReader: DataReader? = nil
+        dataReader: DataReader? = nil,
+        liveReader: @escaping LiveReader = { nil }
     ) {
+        self.liveReader = liveReader
         if let dataReader {
             self.dataReader = dataReader
         } else {
@@ -33,44 +36,34 @@ final class KiroAccountUsageStore: ObservableObject {
     }
 
     deinit {
-        pollTimer?.invalidate()
         refreshTask?.cancel()
     }
 
-    func startAutoRefresh() {
-        guard !isStarted else { return }
-        isStarted = true
+    func refreshOnExpansion(now: Date = Date()) {
+        // Hovering back across the notch may open the list again right away.
+        if let lastAttempt, now.timeIntervalSince(lastAttempt) < 15 { return }
         refresh()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 5 * 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
-    }
-
-    func stopAutoRefresh() {
-        isStarted = false
-        pollTimer?.invalidate()
-        pollTimer = nil
-        refreshTask?.cancel()
-        refreshTask = nil
-        isLoading = false
     }
 
     func refresh() {
-        refreshTask?.cancel()
+        guard refreshTask == nil else { return }
         let reader = dataReader
+        let liveReader = liveReader
         lastAttempt = Date()
         isLoading = true
         refreshTask = Task { [weak self] in
-            let result: (KiroAccountUsageSnapshot?, String?) = await Task.detached(priority: .utility) {
-                guard let data = reader() else { return (nil, "Kiro account usage cache unavailable") }
+            let result: (KiroAccountUsageSnapshot?, String?, Bool) = await Task.detached(priority: .utility) {
+                if let live = liveReader() { return (live, nil, false) }
+                guard let data = reader() else { return (nil, "Kiro account usage cache unavailable", false) }
                 guard let snapshot = KiroAccountUsageParser.parse(data: data) else {
-                    return (nil, "Kiro account usage cache format not recognized")
+                    return (nil, "Kiro account usage cache format not recognized", false)
                 }
-                return (snapshot, nil)
+                return (snapshot, nil, true)
             }.value
             guard !Task.isCancelled, let self else { return }
             self.snapshot = result.0
             self.error = result.1
+            self.isUsingCache = result.2
             self.isLoading = false
             self.refreshTask = nil
         }
